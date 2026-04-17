@@ -134,6 +134,11 @@ services:
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
       FNVR_USE_DEEPSTREAM: "${FNVR_USE_DEEPSTREAM:-1}"
       FNVR_RECONCILE_SEC: "${FNVR_RECONCILE_SEC:-5}"
+      # splitmuxsink has a g_assert in check_completed_gop that aborts the
+      # entire process if the first buffer arrives without a GOP context.
+      # Unset G_DEBUG so fatal-warnings are off — without this, one bad
+      # camera can crash-kill all the others sharing the supervisor process.
+      G_DEBUG: ""
     devices:
       - /dev/video0   # V4L2 M2M — NVDEC
       - /dev/video1   # V4L2 M2M — NVENC

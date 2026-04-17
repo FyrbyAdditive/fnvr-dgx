@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <set>
 #include <thread>
+
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "db_reconciler.h"
 
@@ -67,9 +73,15 @@ void Supervisor::reconcileOnce() {
         }
     }
 
-    // Start newly-added cameras.
+    // Start newly-added cameras. Stagger starts by a couple seconds so
+    // simultaneous TRT engine builds don't race on the shared cache file.
+    bool first_start = true;
     for (const auto& cam : want) {
         if (workers_.find(cam.id) != workers_.end()) continue;
+        if (!first_start) {
+            std::this_thread::sleep_for(3s);
+        }
+        first_start = false;
         std::cerr << "supervisor: starting [" << cam.id << "] url=" << cam.url << "\n";
 
         auto w = std::make_unique<Worker>();
@@ -89,31 +101,76 @@ void Supervisor::workerMain(Worker* w) {
     int backoff_ms = 1000;
 
     while (!stop_ && !w->stop) {
-        SingleCameraPipeline p(w->cam, cfg_.recordings_dir, cfg_.inference_config,
-                               cfg_.use_deepstream, nats_);
-        if (!p.Start()) {
-            std::cerr << "worker[" << w->cam.id << "]: start failed, retry in "
-                      << backoff_ms << "ms\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));
+        // fork+exec the same binary in --worker mode. Per-camera process
+        // isolation: a splitmuxsink / nvinfer / gst assertion in one camera
+        // can't crash the parent supervisor or its sibling cameras.
+        pid_t pid = fork();
+        if (pid < 0) {
+            std::cerr << "worker[" << w->cam.id << "]: fork failed: "
+                      << strerror(errno) << "\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
             backoff_ms = std::min(backoff_ms * 2, 30'000);
             continue;
         }
-        backoff_ms = 1000;
+        if (pid == 0) {
+            // Child: exec the worker form. On exec failure, _exit so we
+            // don't run the supervisor destructor and double-close resources.
+            const char* argv0 = "/usr/local/bin/pipeline-supervisor";
+            const char* record_mode = w->cam.recording_mode.empty()
+                ? "continuous"
+                : w->cam.recording_mode.c_str();
+            execl(argv0, argv0, "--worker",
+                  w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
+                  (char*)nullptr);
+            std::cerr << "worker[" << w->cam.id << "]: execl failed: "
+                      << strerror(errno) << "\n";
+            _exit(127);
+        }
 
-        // Block until Faulted or external stop.
-        while (!stop_ && !w->stop && !p.Faulted()) {
+        // Parent: track the child PID so Stop() can kill it.
+        w->child_pid = pid;
+        std::cerr << "worker[" << w->cam.id << "]: spawned pid " << pid << "\n";
+
+        // Wait for the child to exit, polling so we can react to w->stop.
+        int status = 0;
+        while (!stop_ && !w->stop) {
+            pid_t got = waitpid(pid, &status, WNOHANG);
+            if (got == pid) break;
+            if (got < 0 && errno != EINTR) {
+                std::cerr << "worker[" << w->cam.id << "]: waitpid err: "
+                          << strerror(errno) << "\n";
+                break;
+            }
             std::this_thread::sleep_for(500ms);
         }
-        p.Stop();
 
-        if (w->stop || stop_) break;
+        if (w->stop || stop_) {
+            kill(pid, SIGTERM);
+            for (int i = 0; i < 20 && waitpid(pid, &status, WNOHANG) == 0; i++) {
+                std::this_thread::sleep_for(100ms);
+            }
+            if (waitpid(pid, &status, WNOHANG) == 0) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+            }
+            break;
+        }
 
-        std::cerr << "worker[" << w->cam.id << "]: faulted, reconnecting in "
-                  << backoff_ms << "ms\n";
+        // Child exited. Decode why.
+        if (WIFEXITED(status)) {
+            int rc = WEXITSTATUS(status);
+            std::cerr << "worker[" << w->cam.id << "]: exited rc=" << rc << "\n";
+            // rc == 0 means clean exit; still reconnect.
+        } else if (WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            std::cerr << "worker[" << w->cam.id << "]: killed by signal "
+                      << sig << " — likely gst assertion\n";
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));
         backoff_ms = std::min(backoff_ms * 2, 30'000);
     }
-    std::cerr << "worker[" << w->cam.id << "]: exited\n";
+    std::cerr << "worker[" << w->cam.id << "]: supervisor thread exiting\n";
 }
 
 }  // namespace fnvr

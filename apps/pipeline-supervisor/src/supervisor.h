@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 
+#include <sys/types.h>
+
 #include "config.h"
 #include "nats_publisher.h"
 #include "pipeline.h"
@@ -29,9 +31,10 @@ public:
 
 private:
     struct Worker {
-        CameraConfig      cam;
-        std::atomic<bool> stop{false};
-        std::thread       thread;
+        CameraConfig       cam;
+        std::atomic<bool>  stop{false};
+        std::thread        thread;
+        pid_t              child_pid{0};  // set by workerMain after fork
     };
 
     void reconcileOnce();

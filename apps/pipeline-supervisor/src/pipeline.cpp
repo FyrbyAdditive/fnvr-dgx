@@ -154,23 +154,35 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // fallback paths.
     if (is_v4l2) {
         // USB / local webcam emits raw frames; encode to H.264 first.
+        // idrinterval=30 + insert-sps-pps=1 ensures a keyframe with SPS/PPS
+        // every second; splitmuxsink asserts if the first buffer isn't
+        // on a GOP boundary. h264parse config-interval=1 also repeats the
+        // parameter sets so downstream decoders are always happy on join.
         if (use_deepstream_) {
             p << "v4l2src device=" << v4l2_dev << " ! videoconvert ! "
                  "video/x-raw,format=I420 ! nvvideoconvert ! "
                  "video/x-raw(memory:NVMM),format=NV12 ! "
-                 "nvv4l2h264enc insert-sps-pps=1 iframeinterval=30 ! "
-                 "h264parse ! ";
+                 "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 "
+                 "iframeinterval=30 ! "
+                 "h264parse config-interval=1 ! ";
         } else {
             p << "v4l2src device=" << v4l2_dev << " ! videoconvert ! "
                  "x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 "
-                 "key-int-max=60 ! h264parse ! ";
+                 "key-int-max=30 ! h264parse config-interval=1 ! ";
         }
     } else {
         p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
-             "rtph264depay ! h264parse ! ";
+             "rtph264depay ! h264parse config-interval=1 ! ";
     }
 
     // Main tee: recording branch + live-thumbnail branch.
+    // v4l2 encoders sometimes emit a P-frame before their first I-frame on
+    // startup. splitmuxsink hits a fatal g_assert(gop != NULL) if the first
+    // buffer isn't on a GOP boundary. Force a keyframe here: h264parse
+    // tolerates it and downstream splitmuxsink only sees valid GOPs.
+    if (is_v4l2) {
+        p << "identity sync=false drop-buffer-flags=delta-unit ! ";
+    }
     p << "tee name=t ";
 
     // --- Recording branch ---
@@ -185,21 +197,34 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
              "nvvideoconvert ! "
              "nvv4l2h265enc bitrate=6000000 insert-sps-pps=1 iframeinterval=30 ! "
-             "h265parse config-interval=-1 ! splitmuxsink "
+             "h265parse config-interval=-1 ! "
+             // Drop P-frames until the first keyframe. splitmuxsink's
+             // check_completed_gop g_asserts if the first buffer isn't
+             // a keyframe, which reliably happens for NVENC H.265 on USB
+             // sources.
+             "identity sync=false drop-buffer-flags=delta-unit ! "
+             "splitmuxsink "
              "  location=" << dir.string() << "/seg-%05d.mp4 "
-             "  max-size-time=60000000000 muxer=mp4mux ";
+             "  max-size-time=60000000000 muxer=mp4mux "
+             "  send-keyframe-requests=true ";
     } else {
         p << "splitmuxsink "
              "  location=" << dir.string() << "/seg-%05d.mp4 "
-             "  max-size-time=60000000000 muxer=mp4mux ";
+             "  max-size-time=60000000000 muxer=mp4mux "
+             "  send-keyframe-requests=true ";
     }
 
     // --- Live-thumbnail branch ---
     // Decode → downsample to 1 fps → JPEG → ring of 4 indexed files. The
-    // snapshot endpoint reads the newest *fully-written* one. Writing to
-    // the same fixed path would race readers with in-flight writes.
+    // snapshot endpoint reads the newest *fully-written* one. We use NVDEC
+    // (nvv4l2decoder) rather than avdec_h264 because (a) it's already in
+    // the image as part of DeepStream and (b) avdec_h264 in the gstreamer
+    // libav plugin requires libx265 which isn't reliably resolvable on
+    // this image. nvvideoconvert pulls the frame back into system memory
+    // for the software jpegenc.
     p << "t. ! queue max-size-buffers=10 leaky=downstream ! "
-         "h264parse ! avdec_h264 ! videoconvert ! videoscale ! "
+         "h264parse ! nvv4l2decoder ! nvvideoconvert ! "
+         "video/x-raw,format=I420 ! videoscale ! "
          "video/x-raw,width=480 ! videorate ! video/x-raw,framerate=1/1 ! "
          "jpegenc quality=75 ! "
          "multifilesink location=/var/lib/fnvr/live/" << cam_.id << ".%d.jpg "
