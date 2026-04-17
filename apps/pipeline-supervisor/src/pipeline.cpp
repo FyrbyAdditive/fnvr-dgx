@@ -153,20 +153,26 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // the live-JPEG branch taps. Common structure for both DeepStream and
     // fallback paths.
     if (is_v4l2) {
-        // USB / local webcam emits raw frames; encode to H.264 first.
+        // USB / local webcam. Prefer MJPEG on the wire (the C922 and most
+        // modern USB cams advertise it at full resolution; YUYV is often
+        // limited to 640x480). Decode → NVMM → H.264 NVENC encode.
         // idrinterval=30 + insert-sps-pps=1 ensures a keyframe with SPS/PPS
         // every second; splitmuxsink asserts if the first buffer isn't
         // on a GOP boundary. h264parse config-interval=1 also repeats the
         // parameter sets so downstream decoders are always happy on join.
         if (use_deepstream_) {
-            p << "v4l2src device=" << v4l2_dev << " ! videoconvert ! "
+            p << "v4l2src device=" << v4l2_dev << " io-mode=mmap ! "
+                 "image/jpeg,width=1280,height=720,framerate=30/1 ! "
+                 "jpegdec ! videoconvert ! "
                  "video/x-raw,format=I420 ! nvvideoconvert ! "
                  "video/x-raw(memory:NVMM),format=NV12 ! "
                  "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 "
                  "iframeinterval=30 ! "
                  "h264parse config-interval=1 ! ";
         } else {
-            p << "v4l2src device=" << v4l2_dev << " ! videoconvert ! "
+            p << "v4l2src device=" << v4l2_dev << " io-mode=mmap ! "
+                 "image/jpeg,width=1280,height=720,framerate=30/1 ! "
+                 "jpegdec ! videoconvert ! "
                  "x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 "
                  "key-int-max=30 ! h264parse config-interval=1 ! ";
         }
@@ -176,18 +182,34 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     }
 
     // Main tee: recording branch + live-thumbnail branch.
-    // v4l2 encoders sometimes emit a P-frame before their first I-frame on
-    // startup. splitmuxsink hits a fatal g_assert(gop != NULL) if the first
-    // buffer isn't on a GOP boundary. Force a keyframe here: h264parse
-    // tolerates it and downstream splitmuxsink only sees valid GOPs.
+    //
+    // For v4l2 (USB) sources we skip the recording branch entirely. The
+    // NVENC H.265 encoder emits a non-keyframe as its first buffer and
+    // splitmuxsink fatally asserts on that. A series of fixes (identity
+    // drop-buffer-flags=delta-unit, buffered queues, send-keyframe-requests)
+    // failed to dodge the assertion reliably. We get live JPEGs and
+    // detection events from the inference branch; continuous recording
+    // for USB cams lands when we solve the encoder-init race properly.
     if (is_v4l2) {
         p << "identity sync=false drop-buffer-flags=delta-unit ! ";
     }
     p << "tee name=t ";
 
-    // --- Recording branch ---
+    // --- Recording + inference branch ---
+    // For v4l2 sources we keep the inference (for live detection) but drop
+    // the splitmuxsink/recording portion — the NVENC H.265 encoder init race
+    // with splitmuxsink's check_completed_gop is unsolved. RTSP sources get
+    // the full recording path.
     p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
-    if (use_deepstream_) {
+    if (use_deepstream_ && is_v4l2) {
+        // Live detection only — send decoded frames through nvinfer to a
+        // fakesink. The probe on pgie's src pad publishes to NATS.
+        p << "nvv4l2decoder ! "
+             "mux.sink_0 nvstreammux name=mux batch-size=1 width=1920 height=1080 "
+             "  live-source=1 batched-push-timeout=40000 ! "
+             "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
+             "fakesink sync=false ";
+    } else if (use_deepstream_) {
         // DeepStream detection needs decoded frames; re-decode from the
         // elementary stream so it works from both source types. Memory
         // stays NVMM from nvv4l2decoder onward.
@@ -198,10 +220,12 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "nvvideoconvert ! "
              "nvv4l2h265enc bitrate=6000000 insert-sps-pps=1 iframeinterval=30 ! "
              "h265parse config-interval=-1 ! "
-             // Drop P-frames until the first keyframe. splitmuxsink's
-             // check_completed_gop g_asserts if the first buffer isn't
-             // a keyframe, which reliably happens for NVENC H.265 on USB
-             // sources.
+             // splitmuxsink's check_completed_gop g_asserts if the first
+             // buffer isn't a keyframe — biting NVENC H.265 on startup.
+             // A buffered queue gives the encoder time to emit its first
+             // IDR, and identity drops any lingering non-keyframes.
+             "queue max-size-buffers=300 max-size-time=2000000000 "
+             "  max-size-bytes=0 ! "
              "identity sync=false drop-buffer-flags=delta-unit ! "
              "splitmuxsink "
              "  location=" << dir.string() << "/seg-%05d.mp4 "
