@@ -1,0 +1,63 @@
+syntax = "proto3";
+package fnvr.pipeline.v1;
+
+// gRPC control surface for pipeline-supervisor.
+// api-server speaks this to add/remove cameras, reload models, change recording mode.
+service Pipeline {
+  rpc AddCamera    (AddCameraRequest)    returns (CameraStatus);
+  rpc RemoveCamera (RemoveCameraRequest) returns (CameraStatus);
+  rpc SetRecordingMode (SetRecordingModeRequest) returns (CameraStatus);
+  rpc ReloadModel  (ReloadModelRequest)  returns (ModelStatus);
+  rpc GetStats     (GetStatsRequest)     returns (Stats);
+}
+
+message AddCameraRequest {
+  string id = 1;
+  string url = 2;
+  string substream_url = 3;
+  string recording_mode = 4; // continuous | motion | event | scheduled | hybrid
+}
+
+message RemoveCameraRequest { string id = 1; }
+
+message SetRecordingModeRequest {
+  string id = 1;
+  string recording_mode = 2;
+}
+
+message CameraStatus {
+  string id = 1;
+  string state = 2; // connecting | running | reconnecting | error
+  string error = 3;
+}
+
+message ReloadModelRequest {
+  string slot = 1; // primary | secondary.plate | secondary.face | tracker
+  string engine_path = 2;
+  string precision = 3; // fp16 | int8 | fp32
+  string device = 4;    // gpu | dla0 | dla1
+}
+
+message ModelStatus {
+  string slot = 1;
+  string state = 2;
+  string error = 3;
+}
+
+message GetStatsRequest {}
+
+message Stats {
+  repeated CameraStats cameras = 1;
+  float gpu_util = 2;
+  float nvdec_util = 3;
+  float nvenc_util = 4;
+  float soc_temp_c = 5;
+}
+
+message CameraStats {
+  string id = 1;
+  float fps_analysis = 2;
+  float fps_record = 3;
+  int64 decoder_errors = 4;
+  int64 reconnect_count = 5;
+}

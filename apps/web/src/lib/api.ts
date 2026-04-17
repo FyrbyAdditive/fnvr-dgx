@@ -1,0 +1,111 @@
+const base = "/api/v1";
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (res.status === 401) {
+    // Session expired or never established — bounce to login.
+    if (typeof window !== "undefined" && !window.location.pathname.endsWith("/login")) {
+      window.location.href = "/login";
+    }
+    throw new ApiError(401, "unauthorized");
+  }
+  if (!res.ok) {
+    let body = "";
+    try { body = await res.text(); } catch { /* ignore */ }
+    throw new ApiError(res.status, body || `${res.status} ${res.statusText}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export type Camera = {
+  id: string;
+  name: string;
+  url: string;
+  substream?: string;
+  record_mode: string;
+  enabled: boolean;
+  created_at: string;
+};
+
+export type LocalDevice = { path: string; label: string; capabilities: string[] };
+
+export type Zone = {
+  id: string;
+  camera_id: string;
+  name: string;
+  kind: "polygon" | "line" | "tripwire";
+  geometry: { points: number[] };
+  created_at: string;
+};
+
+export type Rule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  definition: {
+    camera_id?: string;
+    classes: string[];
+    min_confidence: number;
+    zone_id?: string;
+    cooldown_sec: number;
+    severity: "info" | "warning" | "critical";
+    schedule?: { start_minute: number; end_minute: number; days: number[]; timezone?: string };
+  };
+  created_at: string;
+  updated_at: string;
+};
+
+export type Incident = {
+  id: string;
+  rule_id: string | null;
+  camera_id: string;
+  started_at: string;
+  ended_at: string | null;
+  severity: "info" | "warning" | "critical";
+  summary: string;
+  acknowledged: boolean;
+};
+
+export const api = {
+  systemInfo: () => req<{ version: string; milestone: string; time: string }>("/system/info"),
+
+  listLocalDevices: () => req<LocalDevice[]>("/system/local-devices"),
+
+  listCameras: () => req<Camera[]>("/cameras"),
+  createCamera: (c: Partial<Camera>) =>
+    req<Camera>("/cameras", { method: "POST", body: JSON.stringify(c) }),
+  deleteCamera: (id: string) =>
+    req<void>(`/cameras/${id}`, { method: "DELETE" }),
+
+  listZones: (cameraId?: string) =>
+    req<Zone[]>(`/zones${cameraId ? `?camera_id=${encodeURIComponent(cameraId)}` : ""}`),
+  createZone: (z: Partial<Zone>) =>
+    req<Zone>("/zones", { method: "POST", body: JSON.stringify(z) }),
+  deleteZone: (id: string) =>
+    req<void>(`/zones/${id}`, { method: "DELETE" }),
+
+  listRules: () => req<Rule[]>("/rules"),
+  createRule: (r: Partial<Rule>) =>
+    req<Rule>("/rules", { method: "POST", body: JSON.stringify(r) }),
+  deleteRule: (id: string) =>
+    req<void>(`/rules/${id}`, { method: "DELETE" }),
+  enableRule: (id: string) =>
+    req<void>(`/rules/${id}/enable`, { method: "POST" }),
+  disableRule: (id: string) =>
+    req<void>(`/rules/${id}/disable`, { method: "POST" }),
+
+  listIncidents: (limit = 100) => req<Incident[]>(`/incidents?limit=${limit}`),
+  ackIncident: (id: string) =>
+    req<void>(`/incidents/${id}/ack`, { method: "POST" }),
+};

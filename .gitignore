@@ -1,0 +1,46 @@
+# Build output
+dist/
+build/
+out/
+target/
+*.engine
+*.trt
+
+# Go
+bin/
+vendor/
+coverage.out
+
+# Node
+node_modules/
+.pnpm-store/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local config / secrets
+deploy/config/fnvr.yaml
+.env
+.env.*
+!.env.example
+
+# Data / runtime
+data/
+recordings/
+models/engines/
+*.sqlite
+*.db
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# CI artefacts
+.task/

@@ -1,0 +1,35 @@
+# fnvr sample config — copy to fnvr.yaml and edit.
+# Env vars take precedence over this file.
+
+http:
+  addr: ":8081"
+
+database:
+  url: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+
+nats:
+  url: "nats://nats:4222"
+
+redis:
+  url: "redis://redis:6379/0"
+
+data_dir: "/var/lib/fnvr"
+
+auth:
+  # M1: single local admin, bootstrapped by `fnvr-api seed`.
+  # Later milestones add OIDC, WebAuthn, TOTP.
+  session_ttl: "24h"
+  bcrypt_cost: 12
+
+storage:
+  recordings_dir: "/var/lib/fnvr/recordings"
+  # Retention is per-camera; these are defaults applied to new cameras.
+  default_retention_days: 14
+  per_camera_quota_gb: 200
+
+cameras: []
+  # - id: "front-door"
+  #   name: "Front door"
+  #   url: "rtsp://user:pass@10.0.0.42:554/Streaming/Channels/101"
+  #   substream: "rtsp://user:pass@10.0.0.42:554/Streaming/Channels/102"
+  #   record_mode: "continuous"   # continuous | motion | event | scheduled | hybrid

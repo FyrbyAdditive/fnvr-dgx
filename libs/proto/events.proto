@@ -1,0 +1,37 @@
+syntax = "proto3";
+package fnvr.events.v1;
+
+// Detection event — emitted by pipeline-supervisor for each inference hit.
+// NATS subject: fnvr.events.detection.<camera_id>
+message Detection {
+  string id = 1;
+  string camera_id = 2;
+  int64  ts_unix_nano = 3;
+  string class_name = 4;
+  float  confidence = 5;
+
+  // Normalised bounding box (0..1).
+  float x = 6;
+  float y = 7;
+  float w = 8;
+  float h = 9;
+
+  // Tracker ID — stable across frames within a single camera.
+  string track_id = 10;
+
+  // Optional secondary classifier outputs (colour, make, plate text, face embedding id).
+  map<string, string> attributes = 11;
+}
+
+// Incident = a correlated group of detections that matched a rule.
+// NATS subject: fnvr.events.incident.<camera_id>
+message Incident {
+  string id = 1;
+  string rule_id = 2;
+  string camera_id = 3;
+  int64  started_unix_nano = 4;
+  int64  ended_unix_nano = 5;
+  repeated string detection_ids = 6;
+  string severity = 7; // info | warning | critical
+  string summary = 8;
+}

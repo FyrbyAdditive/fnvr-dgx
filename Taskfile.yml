@@ -1,0 +1,75 @@
+version: "3"
+
+# fnvr task runner — one monorepo, many services.
+# Install Task: https://taskfile.dev/installation/
+
+vars:
+  COMPOSE: docker compose -f deploy/docker/docker-compose.yml
+
+tasks:
+  default:
+    desc: List tasks
+    cmds:
+      - task --list
+
+  dev:
+    desc: Bring the full stack up in dev mode (Jetson)
+    cmds:
+      - "{{.COMPOSE}} up -d"
+      - echo "UI at http://localhost:8080"
+
+  dev:lite:
+    desc: Bring the stack up WITHOUT the pipeline container (Mac / x86)
+    cmds:
+      - "{{.COMPOSE}} --profile lite up -d"
+      - echo "UI at http://localhost:8080"
+
+  down:
+    desc: Stop the stack
+    cmds:
+      - "{{.COMPOSE}} down"
+
+  logs:
+    desc: Tail logs
+    cmds:
+      - "{{.COMPOSE}} logs -f"
+
+  build:api:
+    desc: Build the api-server binary
+    dir: apps/api-server
+    cmds:
+      - go build -o ../../bin/fnvr-api ./cmd/api
+
+  build:web:
+    desc: Build the web bundle
+    dir: apps/web
+    cmds:
+      - npm ci
+      - npm run build
+
+  test:
+    desc: Run all tests
+    cmds:
+      - task: test:go
+      - task: test:web
+
+  test:go:
+    desc: Run Go tests
+    cmds:
+      - go test ./apps/api-server/... ./apps/event-processor/... ./apps/storage-manager/... ./apps/notification-dispatcher/... ./apps/webrtc-signaling/...
+
+  test:web:
+    desc: Run web tests
+    dir: apps/web
+    cmds:
+      - npm test
+
+  migrate:
+    desc: Apply DB migrations
+    cmds:
+      - "{{.COMPOSE}} run --rm api /fnvr-api migrate up"
+
+  seed:
+    desc: Seed the DB with an admin user
+    cmds:
+      - "{{.COMPOSE}} run --rm api /fnvr-api seed"

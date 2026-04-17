@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+#
+# pipeline-supervisor — GStreamer + DeepStream on Jetson.
+# Base image tracks the JetPack release on the host. JetPack 6.2 -> DeepStream 7.1.
+
+ARG DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream-l4t:7.1-samples-multiarch
+FROM ${DEEPSTREAM_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config git ca-certificates \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav gstreamer1.0-rtsp \
+    libglib2.0-dev \
+    libpq-dev \
+    libx264-163 libavcodec58 libvpx7 libmp3lame0 \
+  && rm -rf /var/lib/apt/lists/*
+
+# nats.c — header + static lib.
+ARG NATS_C_VERSION=v3.9.1
+RUN git clone --depth 1 --branch ${NATS_C_VERSION} https://github.com/nats-io/nats.c.git /tmp/nats.c \
+  && cmake -S /tmp/nats.c -B /tmp/nats.c/build -DNATS_BUILD_STREAMING=OFF -DNATS_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release \
+  && cmake --build /tmp/nats.c/build --parallel --target install \
+  && ldconfig \
+  && rm -rf /tmp/nats.c
+
+WORKDIR /src
+COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
+COPY libs /src/libs
+
+WORKDIR /src/apps/pipeline-supervisor
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  && cmake --build build --parallel \
+  && install -Dm755 build/pipeline-supervisor /usr/local/bin/pipeline-supervisor
+
+# Default nvinfer config, overridable via FNVR_INFER_CONFIG.
+COPY deploy/config/nvinfer /etc/fnvr/nvinfer
+
+# Default to trafficcamnet — it's bundled in the deepstream-l4t samples image,
+# so first boot "just works" without fetching model weights. Swap via
+# FNVR_INFER_CONFIG (e.g. /etc/fnvr/nvinfer/yolo11.txt once you've placed
+# the ONNX weights under /var/lib/fnvr/models/).
+# Re-install libx264 at the END of the build. The base image's layer layout
+# does something to our earlier apt install that leaves the file missing at
+# runtime (dpkg thinks it's installed, but find / doesn't see it). Doing it
+# last works.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    --reinstall libx264-163 libavcodec58 libavutil56 libavformat58 \
+    libswresample3 libswscale5 libvpx7 libmp3lame0 libflac8 libmpg123-0 \
+    udev libudev1 \
+    kmod \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/trafficcamnet.txt
+ENV FNVR_RECORDINGS_DIR=/var/lib/fnvr/recordings
+ENV FNVR_USE_DEEPSTREAM=1
+
+# On Jetson, the DeepStream-l4t image ships a dGPU-style libcuda under
+# /usr/lib/.../nvidia/ that lacks the CUDA_GPU_ID IOCTL used by
+# nvv4l2decoder. The correct Tegra libcuda is bind-mounted into
+# /usr/lib/aarch64-linux-gnu/tegra/ by nvidia-container-toolkit at container
+# start. Entrypoint writes a higher-priority ld.so.conf entry and re-runs
+# ldconfig so tegra wins over nvidia/.
+COPY deploy/docker/pipeline-entrypoint.sh /usr/local/bin/pipeline-entrypoint.sh
+RUN chmod +x /usr/local/bin/pipeline-entrypoint.sh
+
+# Tegra first (CUDA_GPU_ID IOCTL path), then standard system dirs so non-Tegra
+# libs (libx264.so.163, libavcodec.so.58, libFLAC, ...) installed via apt
+# remain resolvable.
+ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl:/usr/lib/aarch64-linux-gnu:/usr/local/lib
+
+ENTRYPOINT ["/usr/local/bin/pipeline-entrypoint.sh"]

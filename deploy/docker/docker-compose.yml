@@ -1,0 +1,198 @@
+# fnvr — M1 stack.
+#
+# Profiles:
+#   default  = pipeline-supervisor included (Jetson host, requires nvidia-container-toolkit)
+#   lite     = skips the pipeline container (Mac / x86 workstations)
+#
+# Usage:
+#   docker compose up -d                     # Jetson
+#   docker compose --profile lite up -d      # everywhere else
+
+name: fnvr
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fnvr
+      POSTGRES_PASSWORD: fnvr
+      POSTGRES_DB: fnvr
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fnvr -d fnvr"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222" # client
+      - "8222:8222" # monitoring
+
+  api:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      FNVR_HTTP_ADDR: ":8081"
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_NATS_URL: "nats://nats:4222"
+      FNVR_REDIS_URL: "redis://redis:6379/0"
+      FNVR_DATA_DIR: "/var/lib/fnvr"
+    volumes:
+      - fnvr-data:/var/lib/fnvr
+      # Surface host V4L2 device metadata for the /system/local-devices endpoint.
+      # Read-only. /sys/class/video4linux/videoN is a symlink into
+      # /sys/devices/..., so we need both for the {name,device_caps} reads.
+      - /sys/class/video4linux:/sys/class/video4linux:ro
+      - /sys/devices:/sys/devices:ro
+    ports:
+      - "8081:8081"
+
+  events:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.events
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_NATS_URL: "nats://nats:4222"
+
+  storage:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.storage
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
+    volumes:
+      - fnvr-data:/var/lib/fnvr
+
+  web:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      FNVR_API_UPSTREAM: "http://api:8081"
+    ports:
+      - "8080:80"
+
+  # Pipeline — runs on the Jetson host. Uses the nvidia-container runtime so
+  # DeepStream/NVDEC/NVENC/DLA access is wired automatically; we do not bind
+  # individual /dev/nvhost-* nodes (those vary per JetPack release).
+  pipeline:
+    profiles: ["!lite"]
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.pipeline
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    runtime: nvidia
+    # nvidia-container-toolkit exposes the GPU + /dev/nvhost-* nodes when
+    # NVIDIA_VISIBLE_DEVICES=all and NVIDIA_DRIVER_CAPABILITIES covers
+    # compute+video. On JetPack 6 the V4L2 M2M codec devices (NVDEC/NVENC)
+    # are NOT covered by that mechanism and must be bound explicitly.
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_NATS_URL: "nats://nats:4222"
+      FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
+      FNVR_USE_DEEPSTREAM: "${FNVR_USE_DEEPSTREAM:-1}"
+      FNVR_RECONCILE_SEC: "${FNVR_RECONCILE_SEC:-5}"
+    devices:
+      - /dev/video0   # V4L2 M2M — NVDEC
+      - /dev/video1   # V4L2 M2M — NVENC
+    # Docker masks /sys/firmware by default. The Tegra libv4l2 plugin reads
+    # /sys/firmware/devicetree/base/{compatible,chosen/ids} to identify the
+    # chip and take its fast-path (which skips the generic v4l2 capability
+    # query that fails on the /dev/v4l2-nvenc stub). Unmask it.
+    security_opt:
+      - "systempaths=unconfined"
+    volumes:
+      - fnvr-data:/var/lib/fnvr
+      - ../config:/etc/fnvr:ro
+      # Tegra libv4l2 plugin queries libudev for device properties on the
+      # /dev/v4l2-nv* nodes. Without /run/udev the lookup fails and the
+      # plugin falls back to a generic v4l2 path that issues VIDIOC_QUERYCAP
+      # on the stub node, which returns EINVAL.
+      - /run/udev:/run/udev:ro
+      # nvidia-l4t-gbm package (host-only) ships
+      # /usr/share/egl/egl_external_platform.d/nvidia_gbm.json. Without it
+      # libEGL fails to find the Tegra GBM vendor and falls back to Mesa,
+      # which in turn makes nvv4l2{enc,dec} take the dGPU /dev/nvidia0 path
+      # (EINVAL on VIDIOC_QUERYCAP).
+      - /usr/share/egl/egl_external_platform.d:/usr/share/egl/egl_external_platform.d:ro
+      # nvidia_icd.json and related glvnd vendor files live here on Jetson.
+      - /usr/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d:ro
+
+  # Synthetic RTSP source for dev & CI. Publishes a looped test pattern at
+  # rtsp://mediamtx:8554/test — add as a camera URL to exercise ingest/record
+  # without real hardware. Optional: copy your own clip to ./testclip.mp4 and
+  # it'll be served too.
+  mediamtx:
+    profiles: ["dev", "lite"]
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    environment:
+      MTX_RTSPTRANSPORTS: "tcp"
+      MTX_PATHS_TEST_SOURCE: "publisher"
+      MTX_PATHS_TEST_SOURCEONDEMAND: "no"
+    ports:
+      - "8554:8554" # rtsp
+      - "8889:8889" # webrtc (optional)
+
+  # Companion that pushes a synthetic looped stream into mediamtx.
+  testsrc:
+    profiles: ["dev", "lite"]
+    image: linuxserver/ffmpeg:latest
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        exec ffmpeg -re -stream_loop -1 \
+          -f lavfi -i "testsrc2=size=1920x1080:rate=30,drawtext=text='fnvr %{localtime}':fontsize=48:fontcolor=white:x=20:y=20" \
+          -f lavfi -i "sine=frequency=440" \
+          -c:v libx264 -preset veryfast -tune zerolatency -g 60 -b:v 4M \
+          -c:a aac -b:a 64k \
+          -f rtsp -rtsp_transport tcp rtsp://mediamtx:8554/test
+
+volumes:
+  postgres-data:
+  fnvr-data:

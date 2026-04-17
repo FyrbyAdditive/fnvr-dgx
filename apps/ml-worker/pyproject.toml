@@ -1,0 +1,10 @@
+[project]
+name = "fnvr-ml"
+version = "0.0.0"
+description = "fnvr training / active-learning worker"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,35 @@
+# DeepStream nvinfer config — YOLO11 (2025 release; latest stable YOLO line).
+# Supplied as ONNX, converted to .engine on first run.
+#
+# Provenance & conversion:
+#   - Source weights: Ultralytics YOLO11 (AGPL-3.0), e.g. yolo11s.pt
+#   - Export: `yolo export model=yolo11s.pt format=onnx imgsz=640 dynamic=False`
+#   - Place ONNX at /var/lib/fnvr/models/yolo11s.onnx before first run
+#     (or let ml-worker fetch + convert when that lands in M4).
+#
+# Custom parser is required for YOLO output tensor decode. nvdsinfer_custom_impl_Yolo
+# ships in DeepStream samples; compile it into /opt/nvidia/deepstream/.../lib.
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/yolo11s.onnx
+model-engine-file=/var/lib/fnvr/models/engines/yolo11s_fp16.engine
+labelfile-path=/etc/fnvr/nvinfer/coco.labels
+batch-size=1
+network-mode=2
+num-detected-classes=80
+interval=0
+gie-unique-id=3
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_Yolo.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.25
+nms-iou-threshold=0.45
+topk=100
