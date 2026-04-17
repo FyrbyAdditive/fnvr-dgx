@@ -47,10 +47,13 @@ COPY deploy/config/nvinfer /etc/fnvr/nvinfer
 # runtime (dpkg thinks it's installed, but find / doesn't see it). Doing it
 # last works.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    --reinstall libx264-163 libavcodec58 libavutil56 libavformat58 \
-    libswresample3 libswscale5 libvpx7 libmp3lame0 libflac8 libmpg123-0 \
     udev libudev1 \
     kmod \
+    ffmpeg libx265-199 libxvidcore4 \
+  && apt-get install -y --reinstall --no-install-recommends \
+    libx264-163 libx265-199 libxvidcore4 \
+    libavcodec58 libavutil56 libavformat58 \
+    libswresample3 libswscale5 libvpx7 libmp3lame0 libflac8 libmpg123-0 \
   && rm -rf /var/lib/apt/lists/*
 
 ENV FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/trafficcamnet.txt

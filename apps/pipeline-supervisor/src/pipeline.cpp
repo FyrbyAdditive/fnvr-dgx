@@ -7,6 +7,8 @@
 #include <sstream>
 #include <utility>
 
+#include "rtsp_probe.h"
+
 // DeepStream metadata. Only include when building for Jetson — these headers
 // come from the deepstream-l4t base image.
 #if __has_include(<gstnvdsmeta.h>)
@@ -177,8 +179,35 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                  "key-int-max=30 ! h264parse config-interval=1 ! ";
         }
     } else {
-        p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
-             "rtph264depay ! h264parse config-interval=1 ! ";
+        // RTSP source: probe the codec (h264 vs h265) so we pick the right
+        // depay + parse + decoder. Reolink cams in particular name their
+        // paths "h264Preview_…" but deliver HEVC on newer firmware. Default
+        // to H.264 when probing fails (the older common case).
+        std::string codec = ProbeRtspCodec(url);
+        if (codec.empty()) codec = "h264";
+        std::cerr << "pipeline[" << cam_.id << "]: probed codec=" << codec << "\n";
+
+        if (codec == "h265") {
+            p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
+                 "rtph265depay ! h265parse config-interval=1 ! "
+                 "video/x-h265,stream-format=byte-stream,alignment=au ! "
+                 // Re-mux H.265 into H.264 via NVDEC+NVENC so the rest of
+                 // the pipeline (recording + inference) only has to handle
+                 // one codec path. Decode on GPU → scale down (4K Reolinks
+                 // are common; 1080p is plenty for NVR) → re-encode on GPU.
+                 // Skipping the explicit scale makes the encoder produce
+                 // whatever the source is (e.g. 3840x2160), which then
+                 // breaks downstream videoscale stages that only constrain
+                 // width, producing wildly wrong aspect-ratio thumbnails.
+                 "nvv4l2decoder ! "
+                 "nvvideoconvert ! "
+                 "video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080 ! "
+                 "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
+                 "h264parse config-interval=1 ! ";
+        } else {
+            p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
+                 "rtph264depay ! h264parse config-interval=1 ! ";
+        }
     }
 
     // Main tee: recording branch + live-thumbnail branch.
@@ -246,10 +275,14 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // libav plugin requires libx265 which isn't reliably resolvable on
     // this image. nvvideoconvert pulls the frame back into system memory
     // for the software jpegenc.
+    // Explicit 480x270 output (16:9) because videoscale with a width-only
+    // caps filter doesn't reliably preserve aspect when the upstream
+    // reports a weird pixel-aspect-ratio or has no height in negotiation.
     p << "t. ! queue max-size-buffers=10 leaky=downstream ! "
          "h264parse ! nvv4l2decoder ! nvvideoconvert ! "
-         "video/x-raw,format=I420 ! videoscale ! "
-         "video/x-raw,width=480 ! videorate ! video/x-raw,framerate=1/1 ! "
+         "video/x-raw,format=I420 ! videoscale add-borders=true ! "
+         "video/x-raw,width=480,height=270,pixel-aspect-ratio=1/1 ! "
+         "videorate ! video/x-raw,framerate=1/1 ! "
          "jpegenc quality=75 ! "
          "multifilesink location=/var/lib/fnvr/live/" << cam_.id << ".%d.jpg "
          "  async=false sync=false post-messages=false max-files=4 index=0";
