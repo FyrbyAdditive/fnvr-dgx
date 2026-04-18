@@ -50,10 +50,31 @@ int main(int argc, char** argv) {
             std::cerr << "worker[" << cam.id << "]: start failed\n";
             return 2;
         }
-        // Run until parent signals us or the pipeline faults.
-        while (!g_stop && !p.Faulted()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
+
+        // Run a GMainLoop on the main thread. GStreamer bus watches
+        // (added via gst_bus_add_watch) dispatch only when the main
+        // context iterates. Without this the pipeline starves on state-
+        // change messages and never emits buffers past nvinfer — which
+        // is exactly what was making USB cams hang while standalone
+        // gst-launch (which auto-iterates) worked fine.
+        GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
+        guint watch_id = g_timeout_add(500, [](gpointer) -> gboolean {
+            if (g_stop) {
+                return FALSE;
+            }
+            return TRUE;
+        }, nullptr);
+        std::thread stop_watcher([&loop, &p] {
+            while (!g_stop && !p.Faulted()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            g_main_loop_quit(loop);
+        });
+        g_main_loop_run(loop);
+        g_source_remove(watch_id);
+        if (stop_watcher.joinable()) stop_watcher.join();
+        g_main_loop_unref(loop);
+
         p.Stop();
         gst_deinit();
         return p.Faulted() ? 3 : 0;

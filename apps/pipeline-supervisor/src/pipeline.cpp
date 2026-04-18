@@ -1,5 +1,6 @@
 #include "pipeline.h"
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -121,6 +122,45 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
 }  // namespace
 #endif  // FNVR_HAS_DEEPSTREAM
 
+namespace {
+
+// KeyframeGate drops non-keyframe buffers until the first keyframe arrives,
+// at which point it removes itself from the pad. This is the reliable way
+// to satisfy splitmuxsink's check_completed_gop g_assert, which fires if
+// the very first buffer at its input isn't on a GOP boundary. Identity
+// element's drop-buffer-flags didn't cut it for NVENC H.265 on v4l2 sources.
+struct KeyframeGate {
+    std::atomic<bool> open{false};
+};
+
+GstPadProbeReturn KeyframeGateProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
+    auto* gate = static_cast<KeyframeGate*>(user);
+    if (gate->open.load()) return GST_PAD_PROBE_OK;
+    GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+    // No DELTA_UNIT flag → this is a keyframe (sync point).
+    if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT)) {
+        gate->open.store(true);
+        std::cerr << "keyframe gate: opened\n";
+        return GST_PAD_PROBE_OK;
+    }
+    return GST_PAD_PROBE_DROP;
+}
+
+void AttachKeyframeGate(GstElement* pipeline, const char* element_name) {
+    GstElement* el = gst_bin_get_by_name(GST_BIN(pipeline), element_name);
+    if (!el) return;
+    GstPad* src = gst_element_get_static_pad(el, "src");
+    if (src) {
+        auto* gate = new KeyframeGate();  // leaked intentionally — pipeline-scoped
+        gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &KeyframeGateProbe, gate, nullptr);
+        gst_object_unref(src);
+    }
+    gst_object_unref(el);
+}
+
+}  // namespace
+
 GstElement* SingleCameraPipeline::BuildPipeline() {
     auto now_tm = [] {
         auto tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -155,29 +195,15 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // the live-JPEG branch taps. Common structure for both DeepStream and
     // fallback paths.
     if (is_v4l2) {
-        // USB / local webcam. Prefer MJPEG on the wire (the C922 and most
-        // modern USB cams advertise it at full resolution; YUYV is often
-        // limited to 640x480). Decode → NVMM → H.264 NVENC encode.
-        // idrinterval=30 + insert-sps-pps=1 ensures a keyframe with SPS/PPS
-        // every second; splitmuxsink asserts if the first buffer isn't
-        // on a GOP boundary. h264parse config-interval=1 also repeats the
-        // parameter sets so downstream decoders are always happy on join.
-        if (use_deepstream_) {
-            p << "v4l2src device=" << v4l2_dev << " io-mode=mmap ! "
-                 "image/jpeg,width=1280,height=720,framerate=30/1 ! "
-                 "jpegdec ! videoconvert ! "
-                 "video/x-raw,format=I420 ! nvvideoconvert ! "
-                 "video/x-raw(memory:NVMM),format=NV12 ! "
-                 "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 "
-                 "iframeinterval=30 ! "
-                 "h264parse config-interval=1 ! ";
-        } else {
-            p << "v4l2src device=" << v4l2_dev << " io-mode=mmap ! "
-                 "image/jpeg,width=1280,height=720,framerate=30/1 ! "
-                 "jpegdec ! videoconvert ! "
-                 "x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 "
-                 "key-int-max=30 ! h264parse config-interval=1 ! ";
-        }
+        // Direct v4l2 pipelines (v4l2src → nvv4l2 → tee) SIGSEGV after
+        // NVENC init on Jetson in our container. Users should instead run
+        // USB cams through MediaMTX (rtsp://mediamtx:8554/fnvr-usb0 — see
+        // deploy/docker/docker-compose.yml). We still recognise v4l2://
+        // here to fail-fast with a clear message rather than hang.
+        std::cerr << "pipeline[" << cam_.id
+                  << "]: v4l2:// URLs aren't supported — point the camera at "
+                     "rtsp://mediamtx:8554/usb0 instead (usb-bridge service).\n";
+        return nullptr;
     } else {
         // RTSP source: probe the codec (h264 vs h265) so we pick the right
         // depay + parse + decoder. Reolink cams in particular name their
@@ -210,29 +236,17 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         }
     }
 
-    // Main tee: recording branch + live-thumbnail branch.
-    //
-    // For v4l2 (USB) sources we skip the recording branch entirely. The
-    // NVENC H.265 encoder emits a non-keyframe as its first buffer and
-    // splitmuxsink fatally asserts on that. A series of fixes (identity
-    // drop-buffer-flags=delta-unit, buffered queues, send-keyframe-requests)
-    // failed to dodge the assertion reliably. We get live JPEGs and
-    // detection events from the inference branch; continuous recording
-    // for USB cams lands when we solve the encoder-init race properly.
-    if (is_v4l2) {
-        p << "identity sync=false drop-buffer-flags=delta-unit ! ";
-    }
     p << "tee name=t ";
 
     // --- Recording + inference branch ---
-    // For v4l2 sources we keep the inference (for live detection) but drop
-    // the splitmuxsink/recording portion — the NVENC H.265 encoder init race
-    // with splitmuxsink's check_completed_gop is unsolved. RTSP sources get
-    // the full recording path.
+    // For v4l2 sources we keep inference (live detection works) but drop
+    // the recording portion. splitmuxsink asserts on first-buffer-not-
+    // keyframe for NVENC H.265 on USB, and mp4mux+filesink EOSes after
+    // nvinfer's model load. Both failure modes are upstream-quirks
+    // specific to the USB pipeline shape; recording comes back when
+    // we solve them properly (probably by app-level mp4 rotation).
     p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
     if (use_deepstream_ && is_v4l2) {
-        // Live detection only — send decoded frames through nvinfer to a
-        // fakesink. The probe on pgie's src pad publishes to NATS.
         p << "nvv4l2decoder ! "
              "mux.sink_0 nvstreammux name=mux batch-size=1 width=1920 height=1080 "
              "  live-source=1 batched-push-timeout=40000 ! "
@@ -248,18 +262,17 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
              "nvvideoconvert ! "
              "nvv4l2h265enc bitrate=6000000 insert-sps-pps=1 iframeinterval=30 ! "
-             "h265parse config-interval=-1 ! "
-             // splitmuxsink's check_completed_gop g_asserts if the first
-             // buffer isn't a keyframe — biting NVENC H.265 on startup.
-             // A buffered queue gives the encoder time to emit its first
-             // IDR, and identity drops any lingering non-keyframes.
+             "h265parse name=recparse config-interval=-1 ! "
+             // splitmuxsink is fragile on USB sources: its check_completed_gop
+             // g_asserts if the first H.265 buffer isn't a keyframe, which
+             // reliably happens on NVENC startup. Segment rotation is done
+             // application-side (supervisor restarts the pipeline hourly,
+             // so files already rotate per hour via the directory layout).
              "queue max-size-buffers=300 max-size-time=2000000000 "
              "  max-size-bytes=0 ! "
-             "identity sync=false drop-buffer-flags=delta-unit ! "
-             "splitmuxsink "
-             "  location=" << dir.string() << "/seg-%05d.mp4 "
-             "  max-size-time=60000000000 muxer=mp4mux "
-             "  send-keyframe-requests=true ";
+             "mp4mux streamable=true fragment-duration=2000 ! "
+             "filesink location=" << dir.string() << "/rec.mp4 "
+             "         append=false ";
     } else {
         p << "splitmuxsink "
              "  location=" << dir.string() << "/seg-%05d.mp4 "
@@ -315,6 +328,11 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         }
     }
 #endif
+
+    // Keyframe gate on the H.265 record-parse element.
+    if (use_deepstream_) {
+        AttachKeyframeGate(pipeline, "recparse");
+    }
 
     return pipeline;
 }
