@@ -36,4 +36,20 @@ rm -f /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvcuvidvideocodec.so 
 # remembered those plugins as "failed to load".
 rm -rf /root/.cache/gstreamer-1.0 /tmp/gst-* 2>/dev/null || true
 
+# Seed the persistent model dir with the DeepStream samples on first boot.
+# nvinfer auto-writes the serialised TRT engine next to onnx-file using a
+# derived filename; if onnx-file lives in an ephemeral container dir the
+# engine is wiped on every container recreate and we burn 60-90s rebuilding
+# on every restart. Copying the assets onto the fnvr-data volume keeps the
+# compiled engine persistent.
+DS_SAMPLES=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector
+DEST=/var/lib/fnvr/models/primary_detector
+if [ -d "$DS_SAMPLES" ] && [ ! -f "$DEST/resnet18_trafficcamnet_pruned.onnx" ]; then
+    mkdir -p "$DEST"
+    cp "$DS_SAMPLES/resnet18_trafficcamnet_pruned.onnx" "$DEST/"
+    cp "$DS_SAMPLES/cal_trt.bin" "$DEST/"
+    cp "$DS_SAMPLES/labels.txt" "$DEST/"
+    echo "entrypoint: seeded $DEST from $DS_SAMPLES"
+fi
+
 exec /usr/local/bin/pipeline-supervisor "$@"
