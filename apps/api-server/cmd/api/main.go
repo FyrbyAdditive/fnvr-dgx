@@ -16,6 +16,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/db"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
+	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
@@ -146,9 +147,10 @@ func runServe() error {
 		Events:    bus,
 		Rules:     rules.NewStore(pool),
 		Snapshots: snapshot.New(cfg.DataDir + "/recordings"),
-		Segments:  segments.NewStore(pool),
-		Whep:      whepReg,
-		CamStates: camStates,
+		Segments:      segments.NewStore(pool),
+		Whep:          whepReg,
+		CamStates:     camStates,
+		Notifications: notifications.NewStore(pool),
 	})
 
 	httpSrv := &http.Server{

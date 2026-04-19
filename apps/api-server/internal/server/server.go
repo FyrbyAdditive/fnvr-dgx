@@ -17,6 +17,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/camera"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
+	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
@@ -37,20 +38,22 @@ type Server struct {
 	segments  *segments.Store
 	whep      *whep.Registry
 	camStates *camera.StateTracker
+	notifs    *notifications.Store
 }
 
 type Deps struct {
-	Config    *config.Config
-	Pool      *pgxpool.Pool
-	Auth      *auth.Store
-	Cameras   *camera.Store
-	Pipeline  pipeline.Client
-	Events    *events.Bus
-	Rules     *rules.Store
-	Snapshots *snapshot.Service
-	Segments  *segments.Store
-	Whep      *whep.Registry
-	CamStates *camera.StateTracker
+	Config        *config.Config
+	Pool          *pgxpool.Pool
+	Auth          *auth.Store
+	Cameras       *camera.Store
+	Pipeline      pipeline.Client
+	Events        *events.Bus
+	Rules         *rules.Store
+	Snapshots     *snapshot.Service
+	Segments      *segments.Store
+	Whep          *whep.Registry
+	CamStates     *camera.StateTracker
+	Notifications *notifications.Store
 }
 
 func New(d Deps) *Server {
@@ -66,6 +69,7 @@ func New(d Deps) *Server {
 		segments:  d.Segments,
 		whep:      d.Whep,
 		camStates: d.CamStates,
+		notifs:    d.Notifications,
 	}
 }
 
@@ -125,6 +129,20 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/detections", s.handleListDetections)
 		}
 
+		if s.notifs != nil {
+			protected.HandleFunc("GET /api/v1/notifications/channels", s.handleListChannels)
+			protected.HandleFunc("POST /api/v1/notifications/channels", s.handleCreateChannel)
+			protected.HandleFunc("DELETE /api/v1/notifications/channels/{id}", s.handleDeleteChannel)
+			protected.HandleFunc("POST /api/v1/notifications/channels/{id}/enable", s.handleEnableChannel)
+			protected.HandleFunc("POST /api/v1/notifications/channels/{id}/disable", s.handleDisableChannel)
+
+			protected.HandleFunc("GET /api/v1/notifications/subscriptions", s.handleListSubscriptions)
+			protected.HandleFunc("POST /api/v1/notifications/subscriptions", s.handleCreateSubscription)
+			protected.HandleFunc("DELETE /api/v1/notifications/subscriptions/{id}", s.handleDeleteSubscription)
+
+			protected.HandleFunc("GET /api/v1/notifications/deliveries", s.handleRecentDeliveries)
+		}
+
 		guarded := s.auth.Middleware(protected)
 		mux.Handle("/api/v1/auth/logout", guarded)
 		mux.Handle("/api/v1/me", guarded)
@@ -146,6 +164,13 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/segments", guarded)
 			mux.Handle("/api/v1/segments/", guarded)
 			mux.Handle("/api/v1/detections", guarded)
+		}
+		if s.notifs != nil {
+			mux.Handle("/api/v1/notifications/channels", guarded)
+			mux.Handle("/api/v1/notifications/channels/", guarded)
+			mux.Handle("/api/v1/notifications/subscriptions", guarded)
+			mux.Handle("/api/v1/notifications/subscriptions/", guarded)
+			mux.Handle("/api/v1/notifications/deliveries", guarded)
 		}
 	}
 

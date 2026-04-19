@@ -151,4 +151,52 @@ export const api = {
     if (opts.limit) p.set("limit", String(opts.limit));
     return req<HistoricDetection[]>(`/detections${p.size ? `?${p}` : ""}`);
   },
+
+  listChannels: () => req<NotificationChannel[]>("/notifications/channels"),
+  createChannel: (c: Partial<NotificationChannel>) =>
+    req<NotificationChannel>("/notifications/channels", { method: "POST", body: JSON.stringify(c) }),
+  deleteChannel: (id: string) =>
+    req<void>(`/notifications/channels/${id}`, { method: "DELETE" }),
+  enableChannel: (id: string) =>
+    req<void>(`/notifications/channels/${id}/enable`, { method: "POST" }),
+  disableChannel: (id: string) =>
+    req<void>(`/notifications/channels/${id}/disable`, { method: "POST" }),
+
+  listSubscriptions: (channelId?: string) =>
+    req<NotificationSubscription[]>(`/notifications/subscriptions${channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ""}`),
+  createSubscription: (s: Partial<NotificationSubscription>) =>
+    req<NotificationSubscription>("/notifications/subscriptions", { method: "POST", body: JSON.stringify(s) }),
+  deleteSubscription: (id: string) =>
+    req<void>(`/notifications/subscriptions/${id}`, { method: "DELETE" }),
+
+  recentDeliveries: (limit = 50) =>
+    req<NotificationDelivery[]>(`/notifications/deliveries?limit=${limit}`),
+};
+
+export type NotificationChannel = {
+  id: string;
+  name: string;
+  kind: "webhook" | "ntfy";
+  config: Record<string, unknown>;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type NotificationSubscription = {
+  id: string;
+  channel_id: string;
+  rule_id?: string;
+  camera_id?: string;
+  min_severity: "info" | "warning" | "critical";
+};
+
+export type NotificationDelivery = {
+  id: number;
+  incident_id: string;
+  channel_id: string;
+  attempted_at: string;
+  succeeded: boolean;
+  status_code?: number;
+  error?: string;
 };

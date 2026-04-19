@@ -86,6 +86,20 @@ services:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
       FNVR_NATS_URL: "nats://nats:4222"
 
+  notifications:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.notifications
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_NATS_URL: "nats://nats:4222"
+
   storage:
     build:
       context: ../../
