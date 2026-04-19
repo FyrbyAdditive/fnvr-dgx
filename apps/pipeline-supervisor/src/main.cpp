@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
         auto cfg = fnvr::LoadFromEnv();
         fnvr::NatsPublisher nats(cfg.nats_url);
         if (!nats.Connected()) return 1;
-        bool ok = nats.Publish(argv[2], argv[3]);
+        bool ok = nats.Publish(argv[2], argv[3], /*flush=*/true);
         return ok ? 0 : 2;
     }
 
@@ -88,11 +88,11 @@ int main(int argc, char** argv) {
         const std::string subj = "fnvr.state.camera." + cam.id;
         {
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"starting\"}";
-            nats.Publish(subj, payload);
+            nats.Publish(subj, payload, /*flush=*/true);
         }
         if (!p.Start()) {
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"failed\"}";
-            nats.Publish(subj, payload);
+            nats.Publish(subj, payload, /*flush=*/true);
             std::cerr << "worker[" << cam.id << "]: start failed\n";
             return 2;
         }
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
 
     std::thread ready_watcher;
     if (engine_path.empty() || std::filesystem::exists(engine_path)) {
-        nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+        nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}", /*flush=*/true);
     } else {
         std::cerr << "pipeline-supervisor: engine missing, watching "
                   << engine_path << " for ready signal\n";
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
             }
             if (!g_stop && std::filesystem::exists(engine_path)) {
                 std::cerr << "pipeline-supervisor: engine appeared — publishing ready\n";
-                nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+                nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}", /*flush=*/true);
             }
         });
     }

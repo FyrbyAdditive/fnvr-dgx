@@ -19,16 +19,20 @@ NatsPublisher::~NatsPublisher() {
     }
 }
 
-bool NatsPublisher::Publish(std::string_view subject, std::string_view payload) {
+bool NatsPublisher::Publish(std::string_view subject, std::string_view payload, bool flush) {
     if (!conn_) return false;
     std::string subj(subject);
     natsStatus s = natsConnection_Publish(conn_, subj.c_str(), payload.data(),
                                           static_cast<int>(payload.size()));
     if (s != NATS_OK) return false;
-    // Flush so short-lived callers (e.g. pipeline-supervisor --publish)
-    // don't drain-and-destroy the connection before the buffered message
-    // actually reaches the broker. 2s is plenty for a localhost bridge.
-    natsConnection_FlushTimeout(conn_, 2000);
+    if (flush) {
+        // Short-lived callers (e.g. pipeline-supervisor --publish) would
+        // Drain + Destroy before the async send reaches the broker
+        // without this. 2s is plenty for a localhost bridge. Long-lived
+        // callers (the probe) leave flush=false — otherwise every
+        // detection pays one round-trip and the streaming thread stalls.
+        natsConnection_FlushTimeout(conn_, 2000);
+    }
     return true;
 }
 

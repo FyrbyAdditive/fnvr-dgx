@@ -547,7 +547,7 @@ gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer use
                     // Last-value stream on api-server side — see state.go.
                     std::string subj = "fnvr.state.camera." + self->cam_.id;
                     std::string payload = "{\"camera_id\":\"" + self->cam_.id + "\",\"state\":\"running\"}";
-                    self->nats_->Publish(subj, payload);
+                    self->nats_->Publish(subj, payload, /*flush=*/true);
                 }
             }
             break;
@@ -590,7 +590,7 @@ bool SingleCameraPipeline::Start() {
                           "{\"camera_id\":\"%s\",\"port\":%d}",
                           cam_.id.c_str(), whep_->port());
             std::cerr << "pipeline[" << cam_.id << "]: publishing whep port=" << whep_->port() << "\n";
-            nats_->Publish("fnvr.whep.registry", payload);
+            nats_->Publish("fnvr.whep.registry", payload, /*flush=*/true);
         }
         gst_object_unref(rtp_tee);
     }

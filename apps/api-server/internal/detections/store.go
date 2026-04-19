@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -163,6 +164,9 @@ func (s *Store) queryPG(ctx context.Context, a ListArgs, from, to time.Time, lim
 		var r Row
 		if err := rows.Scan(&r.ID, &r.EventID, &r.CameraID, &r.TS, &r.ClassName,
 			&r.Kind, &r.Confidence, &r.BBox, &r.TrackID, &r.Attributes); err != nil {
+			// Schema drift or a bad row — log so the Timeline pin count
+			// mystery is debuggable rather than a silent undercount.
+			slog.Warn("detection scan", "err", err)
 			continue
 		}
 		r.BBox = normaliseBBox(r.BBox)
