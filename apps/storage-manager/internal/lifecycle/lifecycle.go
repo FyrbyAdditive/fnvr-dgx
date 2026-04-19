@@ -264,14 +264,25 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 		if err != nil {
 			return nil
 		}
-		// Upsert on the unique `path`. A file is tracked once and its `bytes`
-		// field updates as the file grows — the pipeline is still appending.
+		// Upsert on the unique `path`. A file is tracked once and its
+		// bytes / ended_at / duration_ms refresh as the file grows —
+		// the pipeline is still appending (mp4 + qtmux + filesink
+		// writes the moov back every ~1s so mtime tracks reality).
+		// `started_at` is locked in on first insert; only end-side
+		// fields move forward on subsequent scans.
+		mtime := st.ModTime()
 		_, err = m.pool.Exec(ctx, `
-			INSERT INTO segments (camera_id, path, started_at, bytes, codec, tier)
-			VALUES ($1, $2, $3, $4, 'h264', 'hot')
+			INSERT INTO segments (camera_id, path, started_at, ended_at,
+			                     bytes, codec, tier, duration_ms)
+			VALUES ($1, $2, $3, $4, $5, 'h264', 'hot',
+			        GREATEST(0, EXTRACT(EPOCH FROM ($4::timestamptz - $3::timestamptz))*1000)::int)
 			ON CONFLICT (path) DO UPDATE
-			  SET bytes = EXCLUDED.bytes, codec = EXCLUDED.codec`,
-			cameraID, path, st.ModTime(), st.Size())
+			  SET bytes       = EXCLUDED.bytes,
+			      codec       = EXCLUDED.codec,
+			      ended_at    = EXCLUDED.ended_at,
+			      duration_ms = GREATEST(0, EXTRACT(EPOCH FROM
+			                    (EXCLUDED.ended_at - segments.started_at))*1000)::int`,
+			cameraID, path, mtime, mtime, st.Size())
 		if err != nil && !strings.Contains(err.Error(), "foreign key") {
 			slog.Debug("segment insert", "err", err, "path", path)
 		}

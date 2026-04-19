@@ -644,11 +644,12 @@ function msToHHMM(ms: number): string {
   const m = totalMin % 60;
   return `${pad(h)}:${pad(m)}`;
 }
-// estimateDurMs is a fallback when segments haven't finalised — use bytes
-// with a rough h264/h265 bitrate assumption so the bar has *some* width.
-// 2 Mbps ≈ 250 KB/s so bytes/250000 ≈ seconds. Clamped to 1h max.
+// estimateDurMs is a last-resort fallback when a segment has neither
+// ended_at nor duration_ms (storage-manager now tracks both from file
+// mtime, so this almost never runs). Matches the pipeline's H.264
+// encoder bitrate — 6 Mbps ≈ 750 KB/s → bytes/750000 ≈ seconds.
 function estimateDurMs(s: Segment): number {
   if (!s.bytes) return 60_000;
-  const sec = Math.min(3600, Math.max(10, s.bytes / 250_000));
+  const sec = Math.min(3600, Math.max(10, s.bytes / 750_000));
   return sec * 1000;
 }
