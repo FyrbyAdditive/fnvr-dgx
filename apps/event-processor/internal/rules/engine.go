@@ -23,17 +23,21 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
+
+	"github.com/fnvr/fnvr/apps/event-processor/internal/sidecar"
 )
 
 type Config struct {
-	NATSURL     string
-	DatabaseURL string
+	NATSURL       string
+	DatabaseURL   string
+	RecordingsDir string
 }
 
 type Engine struct {
-	cfg  Config
-	nc   *nats.Conn
-	pool *pgxpool.Pool
+	cfg     Config
+	nc      *nats.Conn
+	pool    *pgxpool.Pool
+	sidecar *sidecar.Writer
 
 	mu    sync.RWMutex
 	rules []compiledRule
@@ -129,10 +133,15 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pg: %w", err)
 	}
+	var sw *sidecar.Writer
+	if cfg.RecordingsDir != "" {
+		sw = sidecar.New(sidecar.Config{Root: cfg.RecordingsDir}, pool)
+	}
 	return &Engine{
 		cfg:              cfg,
 		nc:               nc,
 		pool:             pool,
+		sidecar:          sw,
 		zones:            map[string][]Zone{},
 		enabledDetectors: map[string][]string{},
 		cooldowns:        map[string]time.Time{},
@@ -156,6 +165,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Reload rules every 30s — cheap, and avoids plumbing a change notifier
 	// into api-server for M2.
 	go e.periodicReload(ctx)
+
+	if e.sidecar != nil {
+		go func() {
+			if err := e.sidecar.Run(ctx); err != nil {
+				slog.Warn("sidecar writer exited", "err", err)
+			}
+		}()
+	}
 
 	_, err := e.nc.Subscribe("fnvr.events.detection.>", func(msg *nats.Msg) {
 		var d Detection
@@ -305,6 +322,22 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		mustJSON(d.BBox), nullIfEmpty(d.TrackID), mustJSON(d.Attributes),
 	); err != nil {
 		return err
+	}
+
+	// Mirror into the per-segment JSONL sidecar so older detections
+	// survive Postgres' hot-window pruning and travel with their mp4.
+	if e.sidecar != nil {
+		e.sidecar.Enqueue(sidecar.Detection{
+			ID:         d.ID,
+			CameraID:   d.CameraID,
+			TS:         d.TS,
+			ClassName:  d.ClassName,
+			Kind:       d.Kind,
+			Confidence: d.Confidence,
+			BBox:       d.BBox,
+			TrackID:    d.TrackID,
+			Attributes: d.Attributes,
+		})
 	}
 
 	for _, r := range rules {

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 )
 
@@ -106,117 +106,55 @@ func (s *Server) handleSegmentFile(w http.ResponseWriter, r *http.Request) {
 
 // handleListDetections: GET /api/v1/detections?camera_id=X&from=TS&to=TS&limit=N
 //
-// Returns historic detections from Postgres for rendering event pins on the
-// timeline. Live-streaming detections go through SSE — this is the archival
-// read path.
+// Thin adapter over detections.Store.List — the store merges Postgres
+// (recent) + per-segment JSONL sidecars (older) so the UI sees a single
+// unified result whether detections still live in PG or have aged out
+// to their rec.jsonl companion files.
 func (s *Server) handleListDetections(w http.ResponseWriter, r *http.Request) {
-	cameraID := r.URL.Query().Get("camera_id")
-	limit := 2000
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
-			limit = n
-		}
+	args := detectionArgsFromRequest(r)
+	if args.errResponse != "" {
+		http.Error(w, args.errResponse, http.StatusBadRequest)
+		return
 	}
-	var fromT, toT time.Time
-	if v := r.URL.Query().Get("from"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			http.Error(w, "bad 'from'", http.StatusBadRequest)
-			return
-		}
-		fromT = t
-	}
-	if v := r.URL.Query().Get("to"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			http.Error(w, "bad 'to'", http.StatusBadRequest)
-			return
-		}
-		toT = t
-	}
-
-	sql := `SELECT id, event_id, camera_id, ts, class_name, confidence, bbox, track_id
-	        FROM detections WHERE 1=1`
-	args := []any{}
-	argN := 0
-	add := func(v any) string {
-		argN++
-		args = append(args, v)
-		return "$" + strconv.Itoa(argN)
-	}
-	if cameraID != "" {
-		sql += " AND camera_id = " + add(cameraID)
-	}
-	if !fromT.IsZero() {
-		sql += " AND ts >= " + add(fromT)
-	}
-	if !toT.IsZero() {
-		sql += " AND ts < " + add(toT)
-	}
-	sql += " ORDER BY ts DESC LIMIT " + add(limit)
-
-	rows, err := s.pool.Query(r.Context(), sql, args...)
+	out, err := s.detections.List(r.Context(), args.list)
 	if err != nil {
 		slog.Error("list detections", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	type outRow struct {
-		ID         int64           `json:"id"`
-		EventID    string          `json:"event_id"`
-		CameraID   string          `json:"camera_id"`
-		TS         time.Time       `json:"ts"`
-		ClassName  string          `json:"class_name"`
-		Confidence float32         `json:"confidence"`
-		BBox       json.RawMessage `json:"bbox"`
-		TrackID    *string         `json:"track_id,omitempty"`
-	}
-	out := make([]outRow, 0, 256)
-	for rows.Next() {
-		var o outRow
-		if err := rows.Scan(&o.ID, &o.EventID, &o.CameraID, &o.TS, &o.ClassName,
-			&o.Confidence, &o.BBox, &o.TrackID); err != nil {
-			continue
-		}
-		// Older rows were written before the engine grew lowercase JSON
-		// tags — normalise keys here so the frontend sees a single shape.
-		o.BBox = normaliseBBox(o.BBox)
-		out = append(out, o)
-	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-// normaliseBBox rewrites {X,Y,W,H} keys to {x,y,w,h}. A no-op for already-
-// normalised rows. Cheap enough to run on every response.
-func normaliseBBox(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 {
-		return raw
-	}
-	var m map[string]float32
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return raw
-	}
-	needs := false
-	for k := range m {
-		if k == "X" || k == "Y" || k == "W" || k == "H" {
-			needs = true
-			break
+type detectionsReq struct {
+	list        detections.ListArgs
+	errResponse string
+}
+
+func detectionArgsFromRequest(r *http.Request) detectionsReq {
+	var req detectionsReq
+	req.list.CameraID = r.URL.Query().Get("camera_id")
+	req.list.Limit = 2000
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
+			req.list.Limit = n
 		}
 	}
-	if !needs {
-		return raw
+	if v := r.URL.Query().Get("from"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			req.errResponse = "bad 'from'"
+			return req
+		}
+		req.list.From = t
 	}
-	out := map[string]float32{
-		"x": m["X"] + m["x"],
-		"y": m["Y"] + m["y"],
-		"w": m["W"] + m["w"],
-		"h": m["H"] + m["h"],
+	if v := r.URL.Query().Get("to"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			req.errResponse = "bad 'to'"
+			return req
+		}
+		req.list.To = t
 	}
-	b, err := json.Marshal(out)
-	if err != nil {
-		return raw
-	}
-	return b
+	return req
 }
+

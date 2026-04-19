@@ -16,6 +16,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/auth"
 	"github.com/fnvr/fnvr/apps/api-server/internal/camera"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
+	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
@@ -43,6 +44,7 @@ type Server struct {
 	settings     *settings.Store
 	pipelineStat *pipeline.StateTracker
 	natsPublish  func(subject string, data []byte) error
+	detections   *detections.Store
 }
 
 type Deps struct {
@@ -61,6 +63,7 @@ type Deps struct {
 	Settings      *settings.Store
 	PipelineStat  *pipeline.StateTracker
 	NatsPublish   func(subject string, data []byte) error
+	Detections    *detections.Store
 }
 
 func New(d Deps) *Server {
@@ -80,6 +83,7 @@ func New(d Deps) *Server {
 		settings:     d.Settings,
 		pipelineStat: d.PipelineStat,
 		natsPublish:  d.NatsPublish,
+		detections:   d.Detections,
 	}
 }
 

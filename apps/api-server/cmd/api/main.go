@@ -15,6 +15,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/camera"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/db"
+	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
@@ -147,6 +148,7 @@ func runServe() error {
 		return fmt.Errorf("pipeline state start: %w", err)
 	}
 
+	segStore := segments.NewStore(pool)
 	srv := server.New(server.Deps{
 		Config:        cfg,
 		Pool:          pool,
@@ -156,13 +158,14 @@ func runServe() error {
 		Events:        bus,
 		Rules:         rules.NewStore(pool),
 		Snapshots:     snapshot.New(cfg.DataDir + "/recordings"),
-		Segments:      segments.NewStore(pool),
+		Segments:      segStore,
 		Whep:          whepReg,
 		CamStates:     camStates,
 		Notifications: notifications.NewStore(pool),
 		Settings:      settings.NewStore(pool),
 		PipelineStat:  pipelineStat,
 		NatsPublish:   pipelineStat.Publish,
+		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),
 	})
 
 	httpSrv := &http.Server{

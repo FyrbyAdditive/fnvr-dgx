@@ -12,6 +12,7 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -98,6 +99,79 @@ func (m *Manager) tick(ctx context.Context) error {
 	if err := m.applyDiskPressure(ctx); err != nil {
 		return err
 	}
+	if err := m.pruneHotDetections(ctx); err != nil {
+		slog.Warn("prune hot detections", "err", err)
+	}
+	return nil
+}
+
+// siblingJsonl maps a recording path to its detection sidecar path:
+// rec.mp4 → rec.jsonl, seg-00001.mp4 → seg-00001.jsonl, etc. The sidecar
+// is written by event-processor and must be removed whenever the mp4 is
+// retention-purged so detection metadata lifecycle matches the video's.
+func siblingJsonl(mp4Path string) string {
+	if !strings.HasSuffix(mp4Path, ".mp4") {
+		return mp4Path + ".jsonl"
+	}
+	return strings.TrimSuffix(mp4Path, ".mp4") + ".jsonl"
+}
+
+// removeSegmentFiles removes both the mp4 and its sidecar JSONL. ENOENT
+// on either is fine — the sidecar may legitimately not exist for an
+// hour that had zero detections.
+func removeSegmentFiles(mp4Path string) error {
+	if err := os.Remove(mp4Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(siblingJsonl(mp4Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// Non-fatal: segment is gone, orphaned sidecar will never be
+		// read (no matching segments row) and gets swept by a future
+		// background pass. Log and continue.
+		slog.Warn("sidecar remove", "path", siblingJsonl(mp4Path), "err", err)
+	}
+	return nil
+}
+
+// pruneHotDetections deletes rows from the detections table older than
+// settings.detections_hot_hours. Older detections stay available via
+// the per-segment .jsonl sidecar files, so this only affects the hot
+// path (SSE buffer, rules engine track-history, recent-historic UI).
+// Deletes in 10k batches to avoid long locks.
+func (m *Manager) pruneHotDetections(ctx context.Context) error {
+	var hotHoursRaw []byte
+	err := m.pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'detections.hot_hours'`).Scan(&hotHoursRaw)
+	if err != nil {
+		// Setting missing — don't prune (conservative). Happens during
+		// first boot before migration 0007 runs.
+		return nil
+	}
+	var hotHours int
+	if err := json.Unmarshal(hotHoursRaw, &hotHours); err != nil || hotHours <= 0 {
+		return nil
+	}
+	hotHoursStr := fmt.Sprintf("%d", hotHours)
+	total := 0
+	for i := 0; i < 50 && ctx.Err() == nil; i++ {
+		tag, err := m.pool.Exec(ctx, `
+			DELETE FROM detections
+			WHERE id IN (
+			  SELECT id FROM detections
+			  WHERE ts < NOW() - ($1 || ' hours')::interval
+			  LIMIT 10000
+			)`, hotHoursStr)
+		if err != nil {
+			return err
+		}
+		n := int(tag.RowsAffected())
+		total += n
+		if n < 10000 {
+			break
+		}
+	}
+	if total > 0 {
+		slog.Info("pruned hot detections", "count", total, "hot_hours", hotHours)
+	}
 	return nil
 }
 
@@ -137,7 +211,7 @@ func (m *Manager) applyDiskPressure(ctx context.Context) error {
 		if err := rows.Scan(&id, &path, &size); err != nil {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeSegmentFiles(path); err != nil {
 			continue
 		}
 		_, _ = m.pool.Exec(ctx, `DELETE FROM segments WHERE id=$1`, id)
@@ -224,7 +298,7 @@ func (m *Manager) applyRetention(ctx context.Context) error {
 		if err := rows.Scan(&id, &path); err != nil {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeSegmentFiles(path); err != nil {
 			continue
 		}
 		_, _ = m.pool.Exec(ctx, `DELETE FROM segments WHERE id=$1`, id)
@@ -272,7 +346,7 @@ func (m *Manager) applyQuota(ctx context.Context) error {
 			if total <= limit {
 				break
 			}
-			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := removeSegmentFiles(path); err != nil {
 				continue
 			}
 			_, _ = m.pool.Exec(ctx, `DELETE FROM segments WHERE id=$1`, id)

@@ -85,6 +85,12 @@ services:
     environment:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
       FNVR_NATS_URL: "nats://nats:4222"
+      FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
+    volumes:
+      # event-processor writes per-segment detection sidecar JSONL files
+      # next to each rec.mp4. Storage-manager deletes them in lockstep
+      # when a segment is purged, keeping Postgres small.
+      - fnvr-data:/var/lib/fnvr
 
   notifications:
     build:

@@ -15,8 +15,9 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	cfg := rules.Config{
-		NATSURL:     envOr("FNVR_NATS_URL", "nats://nats:4222"),
-		DatabaseURL: envOr("FNVR_DATABASE_URL", "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"),
+		NATSURL:       envOr("FNVR_NATS_URL", "nats://nats:4222"),
+		DatabaseURL:   envOr("FNVR_DATABASE_URL", "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"),
+		RecordingsDir: envOr("FNVR_RECORDINGS_DIR", "/var/lib/fnvr/recordings"),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
