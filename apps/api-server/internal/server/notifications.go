@@ -32,8 +32,8 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name, kind, config required", http.StatusBadRequest)
 		return
 	}
-	if c.Kind != "webhook" && c.Kind != "ntfy" {
-		http.Error(w, "kind must be webhook or ntfy", http.StatusBadRequest)
+	if c.Kind != "webhook" && c.Kind != "ntfy" && c.Kind != "mqtt" {
+		http.Error(w, "kind must be webhook, ntfy, or mqtt", http.StatusBadRequest)
 		return
 	}
 	out, err := s.notifs.CreateChannel(r.Context(), c)

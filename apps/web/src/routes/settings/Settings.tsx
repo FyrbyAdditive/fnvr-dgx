@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, APIToken, ClassMutes as ClassMutesT, DetectorSettings, NotificationChannel } from "@/lib/api";
+import { api, APIToken, ClassMutes as ClassMutesT, DetectorSettings, HAConfig, NotificationChannel } from "@/lib/api";
 import { loadCocoLabels, classCategory, CATEGORY_ORDER } from "@/lib/classes";
 import { useMe } from "@/lib/me";
 
@@ -14,6 +14,7 @@ export function Settings() {
       <ClassMutes />
 
       {me?.is_admin && <Users />}
+      {me?.is_admin && <HomeAssistant />}
 
       <section>
         <h2 className="text-lg font-semibold mb-2">System</h2>
@@ -475,11 +476,17 @@ function NotificationChannels() {
 }
 
 function NewChannelForm({ onCreated }: { onCreated: () => void }) {
-  const [kind, setKind] = useState<"webhook" | "ntfy">("webhook");
+  const [kind, setKind] = useState<"webhook" | "ntfy" | "mqtt">("webhook");
   const [name, setName] = useState("");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [ntfyServer, setNtfyServer] = useState("https://ntfy.sh");
   const [ntfyTopic, setNtfyTopic] = useState("");
+  const [mqttBroker, setMqttBroker] = useState("tcp://mosquitto:1883");
+  const [mqttUser, setMqttUser] = useState("");
+  const [mqttPass, setMqttPass] = useState("");
+  const [mqttTopic, setMqttTopic] = useState("alerts/{severity}/{camera_id}");
+  const [mqttQOS, setMqttQOS] = useState(1);
+  const [mqttRetain, setMqttRetain] = useState(false);
 
   const create = useMutation({
     mutationFn: api.createChannel,
@@ -488,15 +495,28 @@ function NewChannelForm({ onCreated }: { onCreated: () => void }) {
       setName("");
       setWebhookUrl("");
       setNtfyTopic("");
+      setMqttUser("");
+      setMqttPass("");
     },
   });
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const config =
-      kind === "webhook"
-        ? { url: webhookUrl }
-        : { server: ntfyServer, topic: ntfyTopic };
+    let config: Record<string, unknown>;
+    if (kind === "webhook") {
+      config = { url: webhookUrl };
+    } else if (kind === "ntfy") {
+      config = { server: ntfyServer, topic: ntfyTopic };
+    } else {
+      config = {
+        broker_url: mqttBroker,
+        username: mqttUser,
+        password: mqttPass,
+        topic: mqttTopic,
+        qos: mqttQOS,
+        retain: mqttRetain,
+      };
+    }
     create.mutate({ name, kind, config, enabled: true });
   };
 
@@ -512,10 +532,11 @@ function NewChannelForm({ onCreated }: { onCreated: () => void }) {
       <select
         className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
         value={kind}
-        onChange={(e) => setKind(e.target.value as "webhook" | "ntfy")}
+        onChange={(e) => setKind(e.target.value as "webhook" | "ntfy" | "mqtt")}
       >
         <option value="webhook">webhook</option>
         <option value="ntfy">ntfy</option>
+        <option value="mqtt">mqtt</option>
       </select>
       <div />
       {kind === "webhook" ? (
@@ -526,7 +547,7 @@ function NewChannelForm({ onCreated }: { onCreated: () => void }) {
           onChange={(e) => setWebhookUrl(e.target.value)}
           required
         />
-      ) : (
+      ) : kind === "ntfy" ? (
         <>
           <input
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
@@ -541,6 +562,50 @@ function NewChannelForm({ onCreated }: { onCreated: () => void }) {
             onChange={(e) => setNtfyTopic(e.target.value)}
             required
           />
+        </>
+      ) : (
+        <>
+          <input
+            className="col-span-2 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+            placeholder="broker URL (tcp://host:1883)"
+            value={mqttBroker}
+            onChange={(e) => setMqttBroker(e.target.value)}
+            required
+          />
+          <input
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+            placeholder="username (optional)"
+            value={mqttUser}
+            onChange={(e) => setMqttUser(e.target.value)}
+          />
+          <input
+            type="password"
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+            placeholder="password (optional)"
+            value={mqttPass}
+            onChange={(e) => setMqttPass(e.target.value)}
+          />
+          <input
+            className="col-span-2 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+            placeholder="topic (tokens: {camera_id} {severity} {rule_id})"
+            value={mqttTopic}
+            onChange={(e) => setMqttTopic(e.target.value)}
+            required
+          />
+          <select
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+            value={mqttQOS}
+            onChange={(e) => setMqttQOS(Number(e.target.value))}
+            title="QoS"
+          >
+            <option value={0}>QoS 0</option>
+            <option value={1}>QoS 1</option>
+            <option value={2}>QoS 2</option>
+          </select>
+          <label className="inline-flex items-center gap-1 text-xs text-neutral-400">
+            <input type="checkbox" checked={mqttRetain} onChange={(e) => setMqttRetain(e.target.checked)} />
+            retain
+          </label>
         </>
       )}
       <button
@@ -560,6 +625,12 @@ function formatChannelConfig(c: NotificationChannel): string {
   }
   if (c.kind === "ntfy") {
     return `${(c.config.server as string) ?? "https://ntfy.sh"}/${(c.config.topic as string) ?? ""}`;
+  }
+  if (c.kind === "mqtt") {
+    const broker = (c.config.broker_url as string) ?? "?";
+    const topic = (c.config.topic as string) ?? "?";
+    const user = (c.config.username as string) ?? "";
+    return `${user ? user + "@" : ""}${broker} → ${topic}`;
   }
   return JSON.stringify(c.config);
 }
@@ -895,5 +966,118 @@ function TokensPanel({ userID }: { userID: string }) {
         </ul>
       )}
     </div>
+  );
+}
+
+// Home Assistant bridge settings. Admin-only. Saving reloads the
+// dispatcher's bridge within ~30s (it polls ha.config that often);
+// no explicit restart button needed.
+function HomeAssistant() {
+  const qc = useQueryClient();
+  const { data: server } = useQuery({
+    queryKey: ["ha-config"],
+    queryFn: api.getHAConfig,
+  });
+
+  const [local, setLocal] = useState<HAConfig | null>(null);
+  useEffect(() => {
+    if (server && !local) setLocal(server);
+  }, [server, local]);
+
+  const save = useMutation({
+    mutationFn: (c: HAConfig) => api.updateHAConfig(c),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["ha-config"] }),
+  });
+
+  if (!local) {
+    return (
+      <section>
+        <h2 className="text-lg font-semibold mb-2">Home Assistant</h2>
+        <p className="text-sm text-neutral-500">Loading…</p>
+      </section>
+    );
+  }
+
+  const patch = (p: Partial<HAConfig>) => setLocal({ ...local, ...p });
+  const dirty = !!server && JSON.stringify(local) !== JSON.stringify(server);
+
+  return (
+    <section>
+      <h2 className="text-lg font-semibold mb-2">Home Assistant</h2>
+      <p className="text-sm text-neutral-500 mb-3">
+        Publishes every camera as a Home Assistant device via MQTT
+        auto-discovery. HA picks up motion, incident, last-class,
+        last-confidence, last-plate, and camera-state entities per
+        camera. Changes take effect within 30 seconds of Save.
+      </p>
+
+      <div className="grid gap-2 text-sm">
+        <label className="inline-flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={local.enabled}
+            onChange={(e) => patch({ enabled: e.target.checked })}
+          />
+          Enable bridge
+        </label>
+        <div className="grid grid-cols-[10rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">Broker URL</label>
+          <input
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={local.broker_url}
+            onChange={(e) => patch({ broker_url: e.target.value })}
+            placeholder="tcp://mosquitto:1883"
+          />
+        </div>
+        <div className="grid grid-cols-[10rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">Username</label>
+          <input
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={local.username}
+            onChange={(e) => patch({ username: e.target.value })}
+          />
+        </div>
+        <div className="grid grid-cols-[10rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">Password</label>
+          <input
+            type="password"
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={local.password}
+            onChange={(e) => patch({ password: e.target.value })}
+            placeholder="unchanged"
+          />
+        </div>
+        <div className="grid grid-cols-[10rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">Discovery prefix</label>
+          <input
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={local.discovery_prefix}
+            onChange={(e) => patch({ discovery_prefix: e.target.value })}
+          />
+        </div>
+        <div className="grid grid-cols-[10rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">Topic prefix</label>
+          <input
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={local.topic_prefix}
+            onChange={(e) => patch({ topic_prefix: e.target.value })}
+          />
+        </div>
+        <div>
+          <button
+            className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
+            disabled={!dirty || save.isPending}
+            onClick={() => save.mutate(local)}
+          >
+            {save.isPending ? "Saving…" : dirty ? "Save" : "No changes"}
+          </button>
+          {save.isError && (
+            <span className="text-red-400 text-xs ml-3">
+              {String((save.error as Error)?.message ?? "failed")}
+            </span>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }

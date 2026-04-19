@@ -116,6 +116,49 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	return s.Set(ctx, "detector.anpr_enabled", ab)
 }
 
+// HAConfig is the Home Assistant bridge config surfaced via /settings/ha.
+// The bridge runs inside notification-dispatcher; when `Enabled` is true
+// it connects to `BrokerURL` and publishes MQTT auto-discovery +
+// per-camera state. Password is stored plain in JSONB (same as the
+// notification-channel configs today — broker creds live in one row
+// for the operator to rotate).
+type HAConfig struct {
+	Enabled         bool   `json:"enabled"`
+	BrokerURL       string `json:"broker_url"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	DiscoveryPrefix string `json:"discovery_prefix"`
+	TopicPrefix     string `json:"topic_prefix"`
+}
+
+// GetHAConfig returns the stored HA config with sensible defaults
+// filled in for missing fields.
+func (s *Store) GetHAConfig(ctx context.Context) (HAConfig, error) {
+	cfg := HAConfig{
+		BrokerURL:       "tcp://mosquitto:1883",
+		DiscoveryPrefix: "homeassistant",
+		TopicPrefix:     "fnvr",
+	}
+	raw, err := s.Get(ctx, "ha.config")
+	if err == nil {
+		_ = json.Unmarshal(raw, &cfg)
+	} else if !errors.Is(err, ErrNotFound) {
+		return cfg, err
+	}
+	if cfg.DiscoveryPrefix == "" {
+		cfg.DiscoveryPrefix = "homeassistant"
+	}
+	if cfg.TopicPrefix == "" {
+		cfg.TopicPrefix = "fnvr"
+	}
+	return cfg, nil
+}
+
+func (s *Store) SetHAConfig(ctx context.Context, c HAConfig) error {
+	b, _ := json.Marshal(c)
+	return s.Set(ctx, "ha.config", b)
+}
+
 // ClassMutes is the three-bucket class-mute configuration applied by
 // event-processor: global covers every camera; indoor/outdoor apply on
 // top of global to cameras tagged with the matching location_kind.

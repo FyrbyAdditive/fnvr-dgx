@@ -257,6 +257,12 @@ export const api = {
   updateClassMutes: (body: ClassMutes) =>
     req<void>("/settings/class_mutes", { method: "PUT", body: JSON.stringify(body) }),
 
+  // Home Assistant bridge config. Password reads back masked; submit
+  // the masked string to keep the stored value.
+  getHAConfig: () => req<HAConfig>("/settings/ha"),
+  updateHAConfig: (body: HAConfig) =>
+    req<void>("/settings/ha", { method: "PUT", body: JSON.stringify(body) }),
+
   // Pipeline lifecycle.
   getPipelineState: () => req<PipelineStateResponse>("/system/pipeline/state"),
   restartPipeline: () =>
@@ -267,6 +273,16 @@ export type DetectorSettings = {
   yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
   yolo26_precision: "fp16" | "int8";
   anpr_enabled?: boolean;
+};
+
+export type HAConfig = {
+  enabled: boolean;
+  broker_url: string;
+  username: string;
+  /** Returned masked from GET; submit unchanged to keep stored value. */
+  password: string;
+  discovery_prefix: string;
+  topic_prefix: string;
 };
 
 export type PipelineState = {
@@ -285,7 +301,7 @@ export type PipelineStateResponse = {
 export type NotificationChannel = {
   id: string;
   name: string;
-  kind: "webhook" | "ntfy";
+  kind: "webhook" | "ntfy" | "mqtt";
   config: Record<string, unknown>;
   enabled: boolean;
   created_at: string;

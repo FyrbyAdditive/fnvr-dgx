@@ -39,6 +39,20 @@ services:
       - "4222:4222" # client
       - "8222:8222" # monitoring
 
+  # Optional MQTT broker for Home Assistant bridge + mqtt notification
+  # channels. Anonymous access allowed so a local dev can `up --profile
+  # mqtt` and be running in 5 seconds. In production, use an external
+  # broker (or at minimum edit mosquitto.conf below to require auth).
+  mosquitto:
+    profiles: ["mqtt"]
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
+    ports:
+      - "1883:1883" # MQTT
+    volumes:
+      - mosquitto-data:/mosquitto/data
+
   api:
     build:
       context: ../../
@@ -252,6 +266,7 @@ services:
 volumes:
   postgres-data:
   fnvr-data:
+  mosquitto-data:
   # tmpfs-backed named volume for the live JPEG ring. Shared across
   # pipeline (writer) + api + storage (readers). 128 MB is plenty:
   # multifilesink keeps max-files=4 per camera at ~50 KB each.

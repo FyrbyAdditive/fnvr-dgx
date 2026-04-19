@@ -180,6 +180,8 @@ func (s *Server) Handler() http.Handler {
 			protected.Handle("PUT /api/v1/settings/detector", auth.AdminFunc(s.handleUpdateDetector))
 			protected.HandleFunc("GET /api/v1/settings/class_mutes", s.handleGetClassMutes)
 			protected.Handle("PUT /api/v1/settings/class_mutes", auth.AdminFunc(s.handleUpdateClassMutes))
+			protected.HandleFunc("GET /api/v1/settings/ha", s.handleGetHAConfig)
+			protected.Handle("PUT /api/v1/settings/ha", auth.AdminFunc(s.handleUpdateHAConfig))
 		}
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
@@ -229,6 +231,7 @@ func (s *Server) Handler() http.Handler {
 		if s.settings != nil {
 			mux.Handle("/api/v1/settings/detector", guarded)
 			mux.Handle("/api/v1/settings/class_mutes", guarded)
+			mux.Handle("/api/v1/settings/ha", guarded)
 		}
 		if s.pipelineStat != nil {
 			mux.Handle("/api/v1/system/pipeline/state", guarded)

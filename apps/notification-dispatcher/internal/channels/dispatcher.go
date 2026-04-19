@@ -12,11 +12,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
+
+	"github.com/fnvr/fnvr/apps/notification-dispatcher/internal/mqtthub"
 )
 
 type Config struct {
@@ -29,6 +32,7 @@ type Dispatcher struct {
 	pool  *pgxpool.Pool
 	nc    *nats.Conn
 	httpc *http.Client
+	hub   *mqtthub.Hub // shared MQTT connection pool
 }
 
 func New(ctx context.Context, cfg Config) (*Dispatcher, error) {
@@ -50,10 +54,24 @@ func New(ctx context.Context, cfg Config) (*Dispatcher, error) {
 		pool:  pool,
 		nc:    nc,
 		httpc: &http.Client{Timeout: 10 * time.Second},
+		hub:   mqtthub.New(),
 	}, nil
 }
 
+// Hub exposes the shared MQTT connection pool so main.go can hand it
+// to the HA bridge, which wants to share one TCP session with any
+// matching mqtt-kind channels.
+func (d *Dispatcher) Hub() *mqtthub.Hub { return d.hub }
+
+// Pool and NATS accessors so main.go can plumb the HA bridge without
+// opening parallel connections.
+func (d *Dispatcher) Pool() *pgxpool.Pool { return d.pool }
+func (d *Dispatcher) NATS() *nats.Conn    { return d.nc }
+
 func (d *Dispatcher) Close() {
+	if d.hub != nil {
+		d.hub.Close()
+	}
 	if d.nc != nil {
 		_ = d.nc.Drain()
 	}
@@ -151,6 +169,8 @@ func (d *Dispatcher) deliver(ctx context.Context, inc Incident, channelID, kind 
 		status, delErr = d.sendWebhook(ctx, inc, config)
 	case "ntfy":
 		status, delErr = d.sendNtfy(ctx, inc, config)
+	case "mqtt":
+		status, delErr = d.sendMQTT(ctx, inc, config)
 	default:
 		delErr = fmt.Errorf("unknown channel kind %q", kind)
 	}
@@ -258,6 +278,69 @@ func (d *Dispatcher) sendNtfy(ctx context.Context, inc Incident, raw json.RawMes
 		return resp.StatusCode, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	return resp.StatusCode, nil
+}
+
+// --- mqtt ---
+
+type mqttConfig struct {
+	BrokerURL string `json:"broker_url"`
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	Topic     string `json:"topic"`
+	QOS       int    `json:"qos"`
+	Retain    bool   `json:"retain"`
+}
+
+// sendMQTT publishes the incident JSON to the configured broker. The
+// topic template supports three substitutions: {camera_id},
+// {severity}, {rule_id}. Returns the MQTT connect-return-code shape
+// (0 success; wrapped errors on failure) so the deliveries log stays
+// consistent with the HTTP channels.
+func (d *Dispatcher) sendMQTT(ctx context.Context, inc Incident, raw json.RawMessage) (int, error) {
+	var cfg mqttConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return 0, fmt.Errorf("config: %w", err)
+	}
+	if cfg.BrokerURL == "" {
+		return 0, errors.New("mqtt broker_url empty")
+	}
+	if cfg.Topic == "" {
+		return 0, errors.New("mqtt topic empty")
+	}
+	topic := renderMQTTTopic(cfg.Topic, inc)
+	body, _ := json.Marshal(inc)
+	client, release, err := d.hub.Acquire(cfg.BrokerURL, cfg.Username, cfg.Password)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	qos := byte(cfg.QOS)
+	if qos > 2 {
+		qos = 1
+	}
+	token := client.Publish(topic, qos, cfg.Retain, body)
+	// Bound the wait so a broker hang doesn't stall the goroutine.
+	if !token.WaitTimeout(5 * time.Second) {
+		_ = ctx
+		return 0, errors.New("mqtt publish timeout")
+	}
+	if perr := token.Error(); perr != nil {
+		return 0, perr
+	}
+	return 0, nil // 0 = success for the deliveries log
+}
+
+// renderMQTTTopic fills in {camera_id}, {severity}, {rule_id} in the
+// configured topic template. Missing fields become empty strings —
+// the operator can always see the rendered topic in their broker
+// logs if something looks off.
+func renderMQTTTopic(tpl string, inc Incident) string {
+	r := strings.NewReplacer(
+		"{camera_id}", inc.CameraID,
+		"{severity}", inc.Severity,
+		"{rule_id}", inc.RuleID,
+	)
+	return r.Replace(tpl)
 }
 
 func severityToNtfy(s string) string {
