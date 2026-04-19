@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Camera } from "@/lib/api";
+import { ZoneEditor } from "./ZoneEditor";
 
 type Kind = "rtsp" | "v4l2" | "rtmp" | "http";
 
@@ -46,7 +47,7 @@ export function Cameras() {
   }
 
   return (
-    <div className="p-4 space-y-6 max-w-3xl">
+    <div className="p-4 space-y-6 max-w-4xl">
       <section>
         <h2 className="text-lg font-semibold mb-2">Add camera</h2>
 
@@ -103,16 +104,11 @@ export function Cameras() {
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800">
             {cameras.map((c: Camera) => (
-              <li key={c.id} className="p-3 flex items-center gap-3 text-sm">
-                <div className="flex-1 min-w-0">
-                  <div className="font-medium">{c.name}</div>
-                  <div className="text-xs text-neutral-500 truncate">
-                    {c.id} · {c.url}
-                  </div>
-                </div>
-                <button className="text-xs text-red-400 hover:underline"
-                  onClick={() => remove.mutate(c.id)}>delete</button>
-              </li>
+              <CameraRow
+                key={c.id}
+                camera={c}
+                onDelete={() => remove.mutate(c.id)}
+              />
             ))}
           </ul>
         )}
@@ -123,6 +119,40 @@ export function Cameras() {
         )}
       </section>
     </div>
+  );
+}
+
+function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <li className="text-sm">
+      <div className="p-3 flex items-center gap-3">
+        <button
+          className="text-neutral-500 hover:text-white text-xs w-4"
+          onClick={() => setExpanded((v) => !v)}
+          title={expanded ? "hide zones" : "edit zones"}
+        >
+          {expanded ? "▾" : "▸"}
+        </button>
+        <div className="flex-1 min-w-0">
+          <div className="font-medium">{camera.name}</div>
+          <div className="text-xs text-neutral-500 truncate">
+            {camera.id} · {camera.url}
+          </div>
+        </div>
+        <button
+          className="text-xs text-red-400 hover:underline"
+          onClick={onDelete}
+        >
+          delete
+        </button>
+      </div>
+      {expanded && (
+        <div className="px-3 pb-3">
+          <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
+        </div>
+      )}
+    </li>
   );
 }
 
