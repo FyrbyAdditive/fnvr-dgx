@@ -77,6 +77,29 @@ export type Incident = {
   acknowledged: boolean;
 };
 
+export type Segment = {
+  id: number;
+  camera_id: string;
+  started_at: string;
+  ended_at?: string;
+  duration_ms?: number;
+  bytes?: number;
+  codec: string;
+  protected: boolean;
+  tier: "hot" | "warm" | "cold";
+};
+
+export type HistoricDetection = {
+  id: number;
+  event_id: string;
+  camera_id: string;
+  ts: string;
+  class_name: string;
+  confidence: number;
+  bbox: { x: number; y: number; w: number; h: number };
+  track_id?: string;
+};
+
 export const api = {
   systemInfo: () => req<{ version: string; milestone: string; time: string }>("/system/info"),
 
@@ -108,4 +131,23 @@ export const api = {
   listIncidents: (limit = 100) => req<Incident[]>(`/incidents?limit=${limit}`),
   ackIncident: (id: string) =>
     req<void>(`/incidents/${id}/ack`, { method: "POST" }),
+
+  listSegments: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.cameraId) p.set("camera_id", opts.cameraId);
+    if (opts.from) p.set("from", opts.from.toISOString());
+    if (opts.to) p.set("to", opts.to.toISOString());
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return req<Segment[]>(`/segments${p.size ? `?${p}` : ""}`);
+  },
+  segmentFileUrl: (id: number) => `${base}/segments/${id}/file`,
+
+  listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.cameraId) p.set("camera_id", opts.cameraId);
+    if (opts.from) p.set("from", opts.from.toISOString());
+    if (opts.to) p.set("to", opts.to.toISOString());
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return req<HistoricDetection[]>(`/detections${p.size ? `?${p}` : ""}`);
+  },
 };

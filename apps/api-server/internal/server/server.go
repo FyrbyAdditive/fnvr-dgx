@@ -19,6 +19,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
+	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/system"
 	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
@@ -33,6 +34,7 @@ type Server struct {
 	events   *events.Bus
 	rules    *rules.Store
 	snaps    *snapshot.Service
+	segments *segments.Store
 	whep     *whep.Registry
 }
 
@@ -45,6 +47,7 @@ type Deps struct {
 	Events    *events.Bus
 	Rules     *rules.Store
 	Snapshots *snapshot.Service
+	Segments  *segments.Store
 	Whep      *whep.Registry
 }
 
@@ -58,6 +61,7 @@ func New(d Deps) *Server {
 		events:   d.Events,
 		rules:    d.Rules,
 		snaps:    d.Snapshots,
+		segments: d.Segments,
 		whep:     d.Whep,
 	}
 }
@@ -112,6 +116,12 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/events/stream", s.events.SSEHandler)
 		}
 
+		if s.segments != nil {
+			protected.HandleFunc("GET /api/v1/segments", s.handleListSegments)
+			protected.HandleFunc("GET /api/v1/segments/{id}/file", s.handleSegmentFile)
+			protected.HandleFunc("GET /api/v1/detections", s.handleListDetections)
+		}
+
 		guarded := s.auth.Middleware(protected)
 		mux.Handle("/api/v1/auth/logout", guarded)
 		mux.Handle("/api/v1/me", guarded)
@@ -128,6 +138,11 @@ func (s *Server) Handler() http.Handler {
 		}
 		if s.events != nil {
 			mux.Handle("/api/v1/events/stream", guarded)
+		}
+		if s.segments != nil {
+			mux.Handle("/api/v1/segments", guarded)
+			mux.Handle("/api/v1/segments/", guarded)
+			mux.Handle("/api/v1/detections", guarded)
 		}
 	}
 

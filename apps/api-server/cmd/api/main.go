@@ -18,6 +18,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
+	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/server"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
@@ -137,6 +138,7 @@ func runServe() error {
 		Events:    bus,
 		Rules:     rules.NewStore(pool),
 		Snapshots: snapshot.New(cfg.DataDir + "/recordings"),
+		Segments:  segments.NewStore(pool),
 		Whep:      whepReg,
 	})
 

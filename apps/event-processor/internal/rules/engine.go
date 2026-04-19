@@ -54,7 +54,12 @@ type Detection struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
-type BBox struct{ X, Y, W, H float32 }
+type BBox struct {
+	X float32 `json:"x"`
+	Y float32 `json:"y"`
+	W float32 `json:"w"`
+	H float32 `json:"h"`
+}
 
 type Zone struct {
 	ID       string    `json:"id"`
