@@ -106,9 +106,28 @@ int main(int argc, char** argv) {
             }
             g_main_loop_quit(loop);
         });
+
+        // Heartbeat: republish "running" every 30s so the api-server's
+        // per-camera state stays fresh in the 10-minute window. The
+        // initial "running" publish in pipeline.cpp on GST_STATE_PLAYING
+        // kicks off the heartbeat loop; if the pipeline faults we stop
+        // heartbeating so the state naturally expires to "unknown".
+        std::thread heartbeat([&p, &nats, &cam, subj] {
+            // Wait briefly for the pipeline to reach PLAYING before the
+            // first heartbeat (the state-change publish will have fired).
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            while (!g_stop && !p.Faulted()) {
+                std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"running\"}";
+                nats.Publish(subj, payload);
+                for (int i = 0; i < 60 && !g_stop && !p.Faulted(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+        });
         g_main_loop_run(loop);
         g_source_remove(watch_id);
         if (stop_watcher.joinable()) stop_watcher.join();
+        if (heartbeat.joinable()) heartbeat.join();
         g_main_loop_unref(loop);
 
         p.Stop();

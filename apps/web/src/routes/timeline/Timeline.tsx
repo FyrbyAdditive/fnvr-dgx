@@ -1,18 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { api, HistoricDetection, Segment } from "@/lib/api";
 
-// The timeline shows one day (local time) for one camera. Segments render as
-// solid bars across a 24h ruler; detections as coloured pins underneath.
-// Clicking the ruler seeks the video player to that moment; the player
-// auto-selects the segment that contains the clicked instant.
+// Timeline: one day (local time) for one camera. Segments render as solid
+// bars across the 24h ruler; detections as coloured pins underneath.
+// Features: click anywhere on ruler to seek; drag to zoom into a window;
+// double-click to reset; click the green "now" marker to jump to /live;
+// click a detection pin to seek to that exact moment; auto-advance to
+// the next segment when a clip ends; segment + detection lists refresh
+// every 10s so the active recording grows visibly in place.
+
+const ZOOM_DRAG_THRESHOLD_PX = 6;
 
 export function Timeline() {
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const [cameraId, setCameraId] = useState<string>("");
   const [dayKey, setDayKey] = useState<string>(() => todayKey());
 
-  // Default to first camera once we know them.
   useEffect(() => {
     if (!cameraId && cameras.length > 0) setCameraId(cameras[0].id);
   }, [cameras, cameraId]);
@@ -23,18 +28,24 @@ export function Timeline() {
     queryKey: ["segments", cameraId, dayKey],
     queryFn: () => api.listSegments({ cameraId, from, to, limit: 1000 }),
     enabled: !!cameraId,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
 
   const { data: detections = [] } = useQuery({
     queryKey: ["detections", cameraId, dayKey],
     queryFn: () => api.listDetectionsHistoric({ cameraId, from, to, limit: 5000 }),
     enabled: !!cameraId,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
 
   const [cursorMs, setCursorMs] = useState<number | null>(null);
 
-  // When the user clicks, find the segment containing that ms and set it
-  // as the active clip — player swaps source + seeks to the offset within.
+  // Zoom as fractions of the day (0..1). Full day = {0, 1}.
+  const [zoom, setZoom] = useState<{ from: number; to: number }>({ from: 0, to: 1 });
+  const resetZoom = () => setZoom({ from: 0, to: 1 });
+
   const activeClip = useMemo(() => {
     if (cursorMs == null) return null;
     const cursor = new Date(from.getTime() + cursorMs);
@@ -49,6 +60,25 @@ export function Timeline() {
     }
     return null;
   }, [cursorMs, segments, from]);
+
+  // Auto-advance: when a clip ends, seek to the start of the next
+  // segment by started_at (if gap is reasonable).
+  const handleClipEnded = () => {
+    if (!activeClip) return;
+    const curStart = new Date(activeClip.segment.started_at).getTime();
+    const curEnd = activeClip.segment.ended_at
+      ? new Date(activeClip.segment.ended_at).getTime()
+      : curStart + (activeClip.segment.duration_ms ?? estimateDurMs(activeClip.segment));
+    const next = segments
+      .filter((s) => new Date(s.started_at).getTime() >= curEnd)
+      .sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime())[0];
+    if (!next) return;
+    const nextStart = new Date(next.started_at).getTime();
+    if (nextStart - curEnd > 10 * 60 * 1000) return; // gap > 10 min, don't leap
+    setCursorMs(nextStart - from.getTime() + 1);
+  };
+
+  const zoomed = zoom.from > 0 || zoom.to < 1;
 
   return (
     <div className="p-4 grid grid-rows-[auto_1fr_auto] gap-3 h-full min-h-0">
@@ -70,6 +100,15 @@ export function Timeline() {
           value={dayKey}
           onChange={(e) => setDayKey(e.target.value)}
         />
+        {zoomed && (
+          <button
+            onClick={resetZoom}
+            className="text-xs text-neutral-400 hover:text-white bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            title="Reset zoom (also: double-click the ruler)"
+          >
+            zoom: {msToHHMM(zoom.from * dayRangeMs(from, to))} – {msToHHMM(zoom.to * dayRangeMs(from, to))} ⟳
+          </button>
+        )}
         <div className="flex items-center gap-3 text-xs text-neutral-500 ml-auto">
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block w-3 h-2 bg-blue-600/60 rounded-sm" />
@@ -81,13 +120,13 @@ export function Timeline() {
           </span>
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block w-0.5 h-3 bg-emerald-400" />
-            now
+            now (click → live)
           </span>
         </div>
       </header>
 
       <div className="rounded bg-neutral-900 overflow-hidden relative">
-        <Player clip={activeClip} />
+        <Player clip={activeClip} onEnded={handleClipEnded} />
       </div>
 
       <TimelineRuler
@@ -97,16 +136,25 @@ export function Timeline() {
         detections={detections}
         cursorMs={cursorMs}
         onSeek={setCursorMs}
+        zoom={zoom}
+        onZoom={setZoom}
+        onResetZoom={resetZoom}
+        cameraId={cameraId}
       />
     </div>
   );
 }
 
-function Player({ clip }: { clip: { segment: Segment; offsetSec: number } | null }) {
+function Player({
+  clip,
+  onEnded,
+}: {
+  clip: { segment: Segment; offsetSec: number } | null;
+  onEnded: () => void;
+}) {
   const ref = useRef<HTMLVideoElement>(null);
   const url = clip ? api.segmentFileUrl(clip.segment.id) : "";
 
-  // Seek within the current source once metadata loads.
   useEffect(() => {
     if (!clip || !ref.current) return;
     const v = ref.current;
@@ -132,13 +180,14 @@ function Player({ clip }: { clip: { segment: Segment; offsetSec: number } | null
       controls
       autoPlay
       playsInline
+      onEnded={onEnded}
       className="w-full h-full object-contain bg-black"
     />
   );
 }
 
 function TimelineRuler({
-  from, to, segments, detections, cursorMs, onSeek,
+  from, to, segments, detections, cursorMs, onSeek, zoom, onZoom, onResetZoom, cameraId,
 }: {
   from: Date;
   to: Date;
@@ -146,36 +195,112 @@ function TimelineRuler({
   detections: HistoricDetection[];
   cursorMs: number | null;
   onSeek: (ms: number) => void;
+  zoom: { from: number; to: number };
+  onZoom: (z: { from: number; to: number }) => void;
+  onResetZoom: () => void;
+  cameraId: string;
 }) {
+  const navigate = useNavigate();
   const dayMs = to.getTime() - from.getTime();
   const ref = useRef<HTMLDivElement>(null);
 
-  // "Now" marker — shown only when the currently-viewed day window
-  // contains the present time. Ticks every 10s, which is finer than the
-  // ruler can visibly resolve at 24h wide.
+  // Visible window as a fraction of the day.
+  const visFromMs = zoom.from * dayMs;
+  const visToMs = zoom.to * dayMs;
+  const visMs = visToMs - visFromMs;
+
+  // Now marker ticks every 10s.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const h = setInterval(() => setNow(Date.now()), 10_000);
     return () => clearInterval(h);
   }, []);
-  const nowInWindow = now >= from.getTime() && now < to.getTime();
-  const nowPct = nowInWindow ? ((now - from.getTime()) / dayMs) * 100 : 0;
+  const nowMsInDay = now - from.getTime();
+  const nowInWindow = nowMsInDay >= visFromMs && nowMsInDay < visToMs;
+  const nowPct = nowInWindow ? ((nowMsInDay - visFromMs) / visMs) * 100 : 0;
 
-  const pct = (d: Date) => ((d.getTime() - from.getTime()) / dayMs) * 100;
-
-  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const r = ref.current!.getBoundingClientRect();
-    const frac = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    onSeek(frac * dayMs);
+  // Map a Date to a percentage across the visible window (returns null
+  // if outside — caller skips rendering).
+  const pctOf = (d: Date): number | null => {
+    const t = d.getTime() - from.getTime();
+    if (t < visFromMs || t > visToMs) return null;
+    return ((t - visFromMs) / visMs) * 100;
   };
 
-  const hours = Array.from({ length: 25 }, (_, i) => i);
+  // Drag-to-zoom state.
+  const dragAnchorRef = useRef<number | null>(null); // clientX at mousedown
+  const [dragRange, setDragRange] = useState<{ startX: number; endX: number } | null>(null);
+
+  const clientXToVisFrac = (clientX: number) => {
+    const r = ref.current!.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+  };
+
+  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    dragAnchorRef.current = e.clientX;
+    setDragRange({ startX: e.clientX, endX: e.clientX });
+    // Ensure mouseup fires even if the user drags off the element.
+    ref.current?.setPointerCapture?.((e as any).pointerId ?? 1);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (dragAnchorRef.current == null) return;
+    setDragRange({ startX: dragAnchorRef.current, endX: e.clientX });
+  };
+
+  const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+    const anchor = dragAnchorRef.current;
+    dragAnchorRef.current = null;
+    setDragRange(null);
+    if (anchor == null) return;
+    const delta = Math.abs(e.clientX - anchor);
+    if (delta < ZOOM_DRAG_THRESHOLD_PX) {
+      // Treat as plain click → seek.
+      const frac = clientXToVisFrac(e.clientX);
+      onSeek(visFromMs + frac * visMs);
+      return;
+    }
+    // Real drag → zoom.
+    const a = clientXToVisFrac(anchor);
+    const b = clientXToVisFrac(e.clientX);
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    // Map visible fraction back to day fraction.
+    onZoom({
+      from: zoom.from + lo * (zoom.to - zoom.from),
+      to: zoom.from + hi * (zoom.to - zoom.from),
+    });
+  };
+
+  const handleDoubleClick = () => onResetZoom();
+
+  // Hour labels — only show hours that fall in the visible window, and
+  // prune density if zoomed tight (e.g. < 2h visible shows every minute).
+  const hourTicks = useMemo(() => {
+    const out: { ms: number; label: string }[] = [];
+    // Always show 25 hours worth (00..24). Filter out those outside the
+    // visible window.
+    for (let h = 0; h <= 24; h++) {
+      const ms = h * 3600_000;
+      if (ms < visFromMs || ms > visToMs) continue;
+      out.push({ ms, label: h.toString().padStart(2, "0") });
+    }
+    return out;
+  }, [visFromMs, visToMs]);
+
+  const jumpToLive = () => {
+    navigate(`/live?camera=${encodeURIComponent(cameraId)}`);
+  };
 
   return (
     <div className="select-none">
       <div
         ref={ref}
-        onClick={handleClick}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
         className="relative h-28 bg-neutral-900 rounded cursor-crosshair"
       >
         {/* row labels */}
@@ -186,52 +311,90 @@ function TimelineRuler({
           detections
         </div>
         {/* hour grid */}
-        {hours.map((h) => (
-          <div key={h}
-               className="absolute top-0 bottom-3 border-l border-neutral-800 text-[10px] text-neutral-600 pl-1"
-               style={{ left: `${(h / 24) * 100}%` }}>
-            {h.toString().padStart(2, "0")}
-          </div>
-        ))}
-        {/* segments — top half */}
+        {hourTicks.map((tick) => {
+          const p = ((tick.ms - visFromMs) / visMs) * 100;
+          return (
+            <div
+              key={tick.ms}
+              className="absolute top-0 bottom-3 border-l border-neutral-800 text-[10px] text-neutral-600 pl-1 pointer-events-none"
+              style={{ left: `${p}%` }}
+            >
+              {tick.label}
+            </div>
+          );
+        })}
+        {/* segments */}
         {segments.map((s) => {
           const start = new Date(s.started_at);
-          const end = s.ended_at ? new Date(s.ended_at) : new Date(start.getTime() + (s.duration_ms ?? estimateDurMs(s)));
-          const left = Math.max(0, pct(start));
-          const right = Math.min(100, pct(end));
-          const width = right - left;
-          if (width <= 0) return null;
+          const end = s.ended_at
+            ? new Date(s.ended_at)
+            : new Date(start.getTime() + (s.duration_ms ?? estimateDurMs(s)));
+          const startMs = start.getTime() - from.getTime();
+          const endMs = end.getTime() - from.getTime();
+          // Clip to visible window
+          const clipLo = Math.max(startMs, visFromMs);
+          const clipHi = Math.min(endMs, visToMs);
+          if (clipHi <= clipLo) return null;
+          const left = ((clipLo - visFromMs) / visMs) * 100;
+          const right = ((clipHi - visFromMs) / visMs) * 100;
           return (
             <div
               key={s.id}
-              className="absolute bg-blue-600/60 hover:bg-blue-500/80"
-              style={{ left: `${left}%`, width: `${width}%`, top: "18%", height: "22%" }}
+              className="absolute bg-blue-600/60 hover:bg-blue-500/80 pointer-events-none"
+              style={{ left: `${left}%`, width: `${right - left}%`, top: "18%", height: "22%" }}
               title={`${start.toLocaleTimeString()} → ${end.toLocaleTimeString()}`}
             />
           );
         })}
-        {/* detection pins — bottom half */}
+        {/* detection pins — now clickable */}
         {detections.map((d) => {
           const t = new Date(d.ts);
-          const p = pct(t);
-          if (p < 0 || p > 100) return null;
+          const p = pctOf(t);
+          if (p == null) return null;
+          const offsetMs = t.getTime() - from.getTime();
           return (
-            <div
+            <button
               key={d.id}
-              className="absolute w-0.5 bg-amber-400/80"
-              style={{ left: `${p}%`, top: "60%", height: "25%" }}
-              title={`${t.toLocaleTimeString()} · ${d.class_name} ${(d.confidence * 100).toFixed(0)}%`}
-            />
+              type="button"
+              onMouseDown={(e) => e.stopPropagation()}
+              onMouseUp={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSeek(offsetMs);
+              }}
+              className="absolute p-0 border-0 bg-transparent cursor-pointer"
+              style={{ left: `${p}%`, top: "60%", height: "25%", width: "6px", transform: "translateX(-3px)" }}
+              title={`${t.toLocaleTimeString()} · ${d.class_name} ${(d.confidence * 100).toFixed(0)}% — click to seek`}
+            >
+              <span className="block mx-auto w-0.5 h-full bg-amber-400/80 hover:bg-amber-300" />
+            </button>
           );
         })}
         {/* cursor */}
-        {cursorMs != null && (
-          <div
-            className="absolute top-0 bottom-0 w-px bg-red-500 pointer-events-none"
-            style={{ left: `${(cursorMs / dayMs) * 100}%` }}
-          />
-        )}
-        {/* "now" marker — green full-height line with a small time chip */}
+        {cursorMs != null && (() => {
+          if (cursorMs < visFromMs || cursorMs > visToMs) return null;
+          const p = ((cursorMs - visFromMs) / visMs) * 100;
+          return (
+            <div
+              className="absolute top-0 bottom-0 w-px bg-red-500 pointer-events-none"
+              style={{ left: `${p}%` }}
+            />
+          );
+        })()}
+        {/* drag-to-zoom selection rectangle */}
+        {dragRange && (() => {
+          const r = ref.current?.getBoundingClientRect();
+          if (!r) return null;
+          const lo = Math.min(dragRange.startX, dragRange.endX) - r.left;
+          const hi = Math.max(dragRange.startX, dragRange.endX) - r.left;
+          return (
+            <div
+              className="absolute top-0 bottom-0 bg-blue-400/20 border-x border-blue-400/60 pointer-events-none"
+              style={{ left: `${lo}px`, width: `${hi - lo}px` }}
+            />
+          );
+        })()}
+        {/* "now" marker — clickable; navigates to /live */}
         {nowInWindow && (
           <>
             <div
@@ -239,12 +402,20 @@ function TimelineRuler({
               style={{ left: `${nowPct}%` }}
               title={`now · ${new Date(now).toLocaleTimeString()}`}
             />
-            <div
-              className="absolute top-0 text-[10px] bg-emerald-500/80 text-black px-1 rounded-sm pointer-events-none -translate-x-1/2 tabular-nums"
+            <button
+              type="button"
+              onMouseDown={(e) => e.stopPropagation()}
+              onMouseUp={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                jumpToLive();
+              }}
+              className="absolute top-0 text-[10px] bg-emerald-500/90 hover:bg-emerald-400 text-black px-1 rounded-sm -translate-x-1/2 tabular-nums cursor-pointer border-0"
               style={{ left: `${nowPct}%` }}
+              title="Click to open the live view for this camera"
             >
-              now
-            </div>
+              now ▸
+            </button>
           </>
         )}
       </div>
@@ -262,6 +433,16 @@ function dayRange(key: string): { from: Date; to: Date } {
   const from = new Date(y, m - 1, d, 0, 0, 0, 0);
   const to = new Date(y, m - 1, d + 1, 0, 0, 0, 0);
   return { from, to };
+}
+function dayRangeMs(from: Date, to: Date): number {
+  return to.getTime() - from.getTime();
+}
+// Render an ms-into-day value as HH:MM local. Used in the zoom chip.
+function msToHHMM(ms: number): string {
+  const totalMin = Math.floor(ms / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${pad(h)}:${pad(m)}`;
 }
 // estimateDurMs is a fallback when segments haven't finalised — use bytes
 // with a rough h264/h265 bitrate assumption so the bar has *some* width.

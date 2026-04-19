@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
 
@@ -9,6 +10,11 @@ export function Live() {
     queryFn: api.listCameras,
     refetchInterval: 3_000,
   });
+
+  // ?camera=<id> — from Timeline's "now" click. Scroll + briefly
+  // highlight that tile so the user sees where they landed.
+  const [searchParams] = useSearchParams();
+  const focusCameraId = searchParams.get("camera") ?? "";
   // Larger buffer so the FPS overlay has enough history for a smooth
   // rolling rate (~5s at 30fps worst case).
   const events = useRecentDetections(400);
@@ -93,6 +99,7 @@ export function Live() {
               detections={boxesByCamera.get(c.id) ?? []}
               inferenceFps={fpsByCamera.get(c.id) ?? 0}
               showStats={showStats}
+              focus={focusCameraId === c.id}
             />
           ))}
         </div>
@@ -101,14 +108,27 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, state, detections, inferenceFps, showStats }: {
+function CameraTile({ id, name, state, detections, inferenceFps, showStats, focus }: {
   id: string;
   name: string;
   state?: "starting" | "running" | "failed" | "unknown";
   detections: DetectionEvent[];
   inferenceFps: number;
   showStats: boolean;
+  focus?: boolean;
 }) {
+  // When opened from Timeline's "now" click, scroll this tile into
+  // view and run a short highlight animation so the user sees where
+  // they landed without hunting the grid.
+  const tileRef = useRef<HTMLDivElement>(null);
+  const [highlight, setHighlight] = useState(false);
+  useEffect(() => {
+    if (!focus) return;
+    tileRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setHighlight(true);
+    const t = setTimeout(() => setHighlight(false), 2500);
+    return () => clearTimeout(t);
+  }, [focus]);
   // WebRTC live view. Falls back to the 1-fps JPEG snapshot below if the
   // peer connection can't be established (camera not streaming, browser
   // blocks insecure getUserMedia, etc.).
@@ -229,7 +249,12 @@ function CameraTile({ id, name, state, detections, inferenceFps, showStats }: {
   const [aspect, setAspect] = useState(16 / 9);
 
   return (
-    <div className="bg-neutral-900 rounded aspect-video relative overflow-hidden flex items-center justify-center">
+    <div
+      ref={tileRef}
+      className={`bg-neutral-900 rounded aspect-video relative overflow-hidden flex items-center justify-center transition-shadow ${
+        highlight ? "ring-2 ring-emerald-400 shadow-[0_0_24px_rgba(52,211,153,0.55)]" : ""
+      }`}
+    >
       <div
         className="relative max-w-full max-h-full"
         style={{ aspectRatio: aspect, width: aspect >= 16 / 9 ? "100%" : "auto", height: aspect < 16 / 9 ? "100%" : "auto" }}
