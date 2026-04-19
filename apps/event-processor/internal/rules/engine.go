@@ -38,6 +38,10 @@ type Engine struct {
 	mu    sync.RWMutex
 	rules []compiledRule
 	zones map[string][]Zone // camera_id → zones
+	// Per-camera detector whitelist. Empty slice (or camera absent from
+	// the map) means "all detectors enabled" — the friendly default so
+	// new cameras keep behaving like they always did.
+	enabledDetectors map[string][]string
 
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
@@ -114,11 +118,12 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("pg: %w", err)
 	}
 	return &Engine{
-		cfg:       cfg,
-		nc:        nc,
-		pool:      pool,
-		zones:     map[string][]Zone{},
-		cooldowns: map[string]time.Time{},
+		cfg:              cfg,
+		nc:               nc,
+		pool:             pool,
+		zones:            map[string][]Zone{},
+		enabledDetectors: map[string][]string{},
+		cooldowns:        map[string]time.Time{},
 	}, nil
 }
 
@@ -221,11 +226,36 @@ func (e *Engine) reload(ctx context.Context) error {
 		compiled = append(compiled, compiledRule{Rule: r, classes: cls})
 	}
 
+	// Per-camera detector whitelist. Empty array on disk = "all enabled";
+	// we preserve that meaning in memory by leaving the key out of the map
+	// (absent ⇒ allow-all in the gate).
+	crows, err := e.pool.Query(ctx, `SELECT id, enabled_detectors FROM cameras`)
+	if err != nil {
+		return err
+	}
+	enabled := map[string][]string{}
+	for crows.Next() {
+		var id string
+		var kinds []string
+		if err := crows.Scan(&id, &kinds); err != nil {
+			crows.Close()
+			return err
+		}
+		if len(kinds) > 0 {
+			enabled[id] = kinds
+		}
+	}
+	crows.Close()
+
 	e.mu.Lock()
 	e.rules = compiled
 	e.zones = zones
+	e.enabledDetectors = enabled
 	e.mu.Unlock()
-	slog.Info("rules reloaded", "rules", len(compiled), "zone_cameras", len(zones))
+	slog.Info("rules reloaded",
+		"rules", len(compiled),
+		"zone_cameras", len(zones),
+		"detector_filtered_cameras", len(enabled))
 	return nil
 }
 
@@ -233,7 +263,16 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	e.mu.RLock()
 	rules := e.rules
 	zones := e.zones[d.CameraID]
+	allowed := e.enabledDetectors[d.CameraID]
 	e.mu.RUnlock()
+
+	// Per-camera detector whitelist — e.g. ANPR is pointless on indoor
+	// cameras. Empty (or absent) whitelist means "all detectors enabled".
+	// Detections whose kind isn't listed are dropped before persistence,
+	// same as a zone-wide kind-mute.
+	if len(allowed) > 0 && !kindIn(d.Kind, allowed) {
+		return nil
+	}
 
 	// Zone mute gate — runs before persistence so muted detections stay out
 	// of the timeline entirely. A detection is muted if its bbox centre
@@ -355,6 +394,20 @@ func inSchedule(s Schedule, t time.Time) bool {
 	}
 	// wraps midnight
 	return mins >= s.StartMinute || mins <= s.EndMinute
+}
+
+// kindIn reports whether a detection kind is in the given whitelist.
+// Empty kind is normalised to "object" so legacy workers keep working.
+func kindIn(kind string, allowed []string) bool {
+	if kind == "" {
+		kind = "object"
+	}
+	for _, k := range allowed {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // isMuted returns true when the detection's bbox centre falls inside any

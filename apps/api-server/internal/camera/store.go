@@ -23,8 +23,12 @@ type Camera struct {
 	RetentionDays int       `json:"retention_days"`
 	QuotaGB       int       `json:"quota_gb"`
 	GroupID       string    `json:"group_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// EnabledDetectors is a whitelist of detector kinds (e.g. ["object"]) —
+	// empty array means "every detector" (the friendly default so legacy
+	// rows behave like they always did).
+	EnabledDetectors []string  `json:"enabled_detectors"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type Store struct {
@@ -36,7 +40,8 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 func (s *Store) List(ctx context.Context) ([]Camera, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
-		       retention_days, quota_gb, group_id, created_at, updated_at
+		       retention_days, quota_gb, group_id, enabled_detectors,
+		       created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -47,7 +52,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		var c Camera
 		if err := rows.Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode,
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
-			&c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.EnabledDetectors, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -59,14 +64,34 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 	var c Camera
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
-		       retention_days, quota_gb, group_id, created_at, updated_at
+		       retention_days, quota_gb, group_id, enabled_detectors,
+		       created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
-			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.CreatedAt, &c.UpdatedAt)
+			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
+			&c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
 	return c, err
+}
+
+// SetEnabledDetectors replaces the camera's detector whitelist. Nil = "all
+// enabled" (empty array on disk). Returns ErrNotFound for unknown id.
+func (s *Store) SetEnabledDetectors(ctx context.Context, id string, kinds []string) error {
+	if kinds == nil {
+		kinds = []string{}
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE cameras SET enabled_detectors=$2, updated_at=NOW() WHERE id=$1`,
+		id, kinds)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) Create(ctx context.Context, c Camera) (Camera, error) {

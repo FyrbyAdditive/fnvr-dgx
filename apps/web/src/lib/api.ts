@@ -35,6 +35,7 @@ export type Camera = {
   substream?: string;
   record_mode: string;
   enabled: boolean;
+  enabled_detectors?: string[];
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
 };
@@ -113,6 +114,8 @@ export const api = {
     req<Camera>("/cameras", { method: "POST", body: JSON.stringify(c) }),
   deleteCamera: (id: string) =>
     req<void>(`/cameras/${id}`, { method: "DELETE" }),
+  updateCameraDetectors: (id: string, body: { enabled_detectors: string[] }) =>
+    req<void>(`/cameras/${id}/detectors`, { method: "PATCH", body: JSON.stringify(body) }),
 
   listZones: (cameraId?: string) =>
     req<Zone[]>(`/zones${cameraId ? `?camera_id=${encodeURIComponent(cameraId)}` : ""}`),

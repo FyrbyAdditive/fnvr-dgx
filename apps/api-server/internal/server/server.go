@@ -96,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 		protected.HandleFunc("POST /api/v1/cameras", s.handleCreateCamera)
 		protected.HandleFunc("GET /api/v1/cameras/{id}", s.handleGetCamera)
 		protected.HandleFunc("DELETE /api/v1/cameras/{id}", s.handleDeleteCamera)
+		protected.HandleFunc("PATCH /api/v1/cameras/{id}/detectors", s.handleUpdateCameraDetectors)
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -276,18 +277,19 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			}
 		}
 		out = append(out, map[string]any{
-			"id":             c.ID,
-			"name":           c.Name,
-			"url":            c.URL,
-			"substream":      c.Substream,
-			"record_mode":    c.RecordMode,
-			"enabled":        c.Enabled,
-			"retention_days": c.RetentionDays,
-			"quota_gb":       c.QuotaGB,
-			"group_id":       c.GroupID,
-			"created_at":     c.CreatedAt,
-			"updated_at":     c.UpdatedAt,
-			"state":          state,
+			"id":                c.ID,
+			"name":              c.Name,
+			"url":               c.URL,
+			"substream":         c.Substream,
+			"record_mode":       c.RecordMode,
+			"enabled":           c.Enabled,
+			"retention_days":    c.RetentionDays,
+			"quota_gb":          c.QuotaGB,
+			"group_id":          c.GroupID,
+			"enabled_detectors": c.EnabledDetectors,
+			"created_at":        c.CreatedAt,
+			"updated_at":        c.UpdatedAt,
+			"state":             state,
 		})
 	}
 	return out
@@ -349,6 +351,28 @@ func (s *Server) handleDeleteCamera(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.pipeline.RemoveCamera(ctxWithTimeout(r.Context()), id); err != nil {
 		slog.Warn("pipeline.RemoveCamera failed", "id", id, "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateCameraDetectors(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		EnabledDetectors []string `json:"enabled_detectors"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	err := s.cameras.SetEnabledDetectors(r.Context(), id, body.EnabledDetectors)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.Error("update camera detectors", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

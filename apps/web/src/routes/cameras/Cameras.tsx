@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Camera } from "@/lib/api";
 import { ZoneEditor } from "./ZoneEditor";
 
+
 type Kind = "rtsp" | "v4l2" | "rtmp" | "http";
 
 export function Cameras() {
@@ -148,11 +149,64 @@ function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void 
         </button>
       </div>
       {expanded && (
-        <div className="px-3 pb-3">
+        <div className="px-3 pb-3 space-y-3">
+          <DetectorToggle camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
         </div>
       )}
     </li>
+  );
+}
+
+const DETECTOR_KINDS: { value: string; label: string }[] = [
+  { value: "object", label: "object detection" },
+  { value: "anpr", label: "number plates (ANPR)" },
+  { value: "face", label: "face ID" },
+];
+
+function DetectorToggle({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const allEnabled = !camera.enabled_detectors || camera.enabled_detectors.length === 0;
+  const current = new Set(camera.enabled_detectors ?? DETECTOR_KINDS.map((k) => k.value));
+
+  const update = useMutation({
+    mutationFn: (kinds: string[]) => api.updateCameraDetectors(camera.id, { enabled_detectors: kinds }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+  });
+
+  const toggle = (kind: string) => {
+    const next = new Set(current);
+    if (next.has(kind)) next.delete(kind);
+    else next.add(kind);
+    // If every known kind is selected, store [] = "all" so the semantics
+    // stay sensible when we add a new detector family later.
+    const arr =
+      next.size === DETECTOR_KINDS.length
+        ? []
+        : Array.from(next);
+    update.mutate(arr);
+  };
+
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800">
+      <div className="text-xs text-neutral-400 mb-1">
+        Detectors enabled on this camera
+        {allEnabled && <span className="text-neutral-600"> · all</span>}
+      </div>
+      <div className="flex flex-wrap gap-3 text-xs">
+        {DETECTOR_KINDS.map((k) => (
+          <label key={k.value} className="inline-flex items-center gap-1">
+            <input
+              type="checkbox"
+              checked={current.has(k.value)}
+              disabled={update.isPending}
+              onChange={() => toggle(k.value)}
+            />
+            {k.label}
+          </label>
+        ))}
+      </div>
+    </div>
   );
 }
 
