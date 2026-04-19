@@ -49,11 +49,18 @@ export function Timeline() {
 
   const { from, to } = useMemo(() => dayRange(dayKey), [dayKey]);
 
+  // A past day's segments + detections are immutable. Only poll for
+  // live updates when the selected day is today — otherwise we'd
+  // re-scan every rec.jsonl sidecar server-side every 10s for no
+  // reason. Cold-day view is a one-shot fetch.
+  const isToday = dayKey === todayKey();
+  const pollMs = isToday ? 10_000 : false;
+
   const { data: segments = [] } = useQuery({
     queryKey: ["segments", cameraId, dayKey],
     queryFn: () => api.listSegments({ cameraId, from, to, limit: 1000 }),
     enabled: !!cameraId,
-    refetchInterval: 10_000,
+    refetchInterval: pollMs,
     refetchIntervalInBackground: false,
   });
 
@@ -61,7 +68,7 @@ export function Timeline() {
     queryKey: ["detections", cameraId, dayKey],
     queryFn: () => api.listDetectionsHistoric({ cameraId, from, to, limit: 5000 }),
     enabled: !!cameraId,
-    refetchInterval: 10_000,
+    refetchInterval: pollMs,
     refetchIntervalInBackground: false,
   });
 
