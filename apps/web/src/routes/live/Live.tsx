@@ -126,33 +126,52 @@ function CameraTile({ id, name, detections }: {
 
   const latest = detections[0];
 
-  return (
-    <div className="bg-neutral-900 rounded aspect-video relative overflow-hidden">
-      {rtcLive ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          className="absolute inset-0 w-full h-full object-cover"
-        />
-      ) : imgOk ? (
-        <img
-          src={src}
-          alt={name}
-          className="absolute inset-0 w-full h-full object-cover"
-          onError={() => setImgOk(false)}
-        />
-      ) : (
-        <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm">
-          No recording yet
-        </div>
-      )}
+  // Source aspect ratio — starts at 16:9 and refines once the media loads
+  // its real dimensions. The inner frame always matches this so non-16:9
+  // cameras letterbox inside the tile and bbox overlays stay aligned to
+  // the visible pixels (not to the empty letterbox area).
+  const [aspect, setAspect] = useState(16 / 9);
 
-      {/* bbox overlay — coords are normalised 0..1 of the source frame */}
-      {detections.map((d) => (
-        <BBox key={d.id} d={d} />
-      ))}
+  return (
+    <div className="bg-neutral-900 rounded aspect-video relative overflow-hidden flex items-center justify-center">
+      <div
+        className="relative max-w-full max-h-full"
+        style={{ aspectRatio: aspect, width: aspect >= 16 / 9 ? "100%" : "auto", height: aspect < 16 / 9 ? "100%" : "auto" }}
+      >
+        {rtcLive ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            onLoadedMetadata={(e) => {
+              const v = e.currentTarget;
+              if (v.videoWidth && v.videoHeight) setAspect(v.videoWidth / v.videoHeight);
+            }}
+            className="absolute inset-0 w-full h-full"
+          />
+        ) : imgOk ? (
+          <img
+            src={src}
+            alt={name}
+            onLoad={(e) => {
+              const im = e.currentTarget;
+              if (im.naturalWidth && im.naturalHeight) setAspect(im.naturalWidth / im.naturalHeight);
+            }}
+            className="absolute inset-0 w-full h-full"
+            onError={() => setImgOk(false)}
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm">
+            No recording yet
+          </div>
+        )}
+
+        {/* bbox overlay — coords are normalised 0..1 of the source frame */}
+        {detections.map((d) => (
+          <BBox key={d.id} d={d} />
+        ))}
+      </div>
 
       <div className="absolute bottom-2 left-2 text-xs bg-black/60 px-2 py-0.5 rounded">
         {name}
