@@ -170,6 +170,24 @@ if [ "$PRECISION" = "int8" ]; then
 fi
 
 ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
+ONNX_FILE="$YOLO_DEST/${VARIANT}.onnx"
+
+# Detect stale / corrupt engines so they get rebuilt on next startup:
+#   - zero-byte: killed mid-build
+#   - smaller than 1 MB: almost certainly truncated or wrong layout
+#   - older than its ONNX: ONNX re-exported since last build
+# Anything matching → remove, so the block below treats it as missing.
+if [ -f "$ENGINE_FILE" ]; then
+    ENGINE_SIZE=$(stat -c %s "$ENGINE_FILE" 2>/dev/null || echo 0)
+    if [ "$ENGINE_SIZE" -lt 1048576 ]; then
+        echo "entrypoint: engine $ENGINE_FILE is ${ENGINE_SIZE} bytes (suspiciously small) — removing for rebuild"
+        rm -f "$ENGINE_FILE"
+    elif [ -f "$ONNX_FILE" ] && [ "$ONNX_FILE" -nt "$ENGINE_FILE" ]; then
+        echo "entrypoint: engine older than its ONNX ($ONNX_FILE newer than $ENGINE_FILE) — removing for rebuild"
+        rm -f "$ENGINE_FILE"
+    fi
+fi
+
 if [ ! -f "$ENGINE_FILE" ]; then
     publish_state "compiling_engine" "Building TensorRT engine for $VARIANT ($PRECISION). This variant + precision combo hasn't been built before on this device; can take a few minutes."
     echo "entrypoint: engine $ENGINE_FILE missing — nvinfer will build it on first worker start"

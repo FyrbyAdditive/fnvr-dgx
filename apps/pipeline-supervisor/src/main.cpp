@@ -162,42 +162,47 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Announce ready to the pipeline-state stream so the UI banner
-    // clears — but only if the engine file actually exists, otherwise
-    // we'd clobber the entrypoint's "compiling_engine" state while the
-    // first worker is still compiling.
-    // Just set an env-hint — the supervisor's first worker will publish
-    // ready itself on reaching PLAYING via the per-worker state path,
-    // but we also want the global pipeline-state to flip. Easiest: let
-    // workers' camera-state "running" publishes double as a proxy for
-    // pipeline-ready, and have the supervisor publish ready once the
-    // reconcile loop has successfully spawned at least one worker. For
-    // now, the simplest correct behaviour: do not publish ready here if
-    // FNVR_INFER_CONFIG points at a file that references a missing
-    // engine. If unsure, default to publishing ready (backwards-
-    // compatible with the old single-config path).
-    {
-        bool publish_ready = true;
+    // Announce ready to the pipeline-state stream, once the engine
+    // exists. If it already exists at startup, publish immediately.
+    // Otherwise spawn a watcher thread that polls until the first
+    // worker's nvinfer writes the engine to disk, then publishes — so
+    // the UI banner flips from "compiling_engine" to "ready" as soon as
+    // the compile actually finishes, rather than being stuck forever.
+    auto engine_path = [&]() -> std::string {
         const char* cfg_env = std::getenv("FNVR_INFER_CONFIG");
-        if (cfg_env && *cfg_env) {
-            std::ifstream cf(cfg_env);
-            std::string line;
-            while (std::getline(cf, line)) {
-                const char* KEY = "model-engine-file=";
-                auto pos = line.find(KEY);
-                if (pos == std::string::npos) continue;
-                std::string val = line.substr(pos + std::strlen(KEY));
-                while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' '))
-                    val.pop_back();
-                if (!val.empty() && !std::filesystem::exists(val)) {
-                    publish_ready = false;
-                }
-                break;
+        if (!cfg_env || !*cfg_env) return {};
+        std::ifstream cf(cfg_env);
+        std::string line;
+        while (std::getline(cf, line)) {
+            const char* KEY = "model-engine-file=";
+            auto pos = line.find(KEY);
+            if (pos == std::string::npos) continue;
+            std::string val = line.substr(pos + std::strlen(KEY));
+            while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' '))
+                val.pop_back();
+            return val;
+        }
+        return {};
+    }();
+
+    std::thread ready_watcher;
+    if (engine_path.empty() || std::filesystem::exists(engine_path)) {
+        nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+    } else {
+        std::cerr << "pipeline-supervisor: engine missing, watching "
+                  << engine_path << " for ready signal\n";
+        ready_watcher = std::thread([&nats, engine_path]() {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(30);
+            while (!g_stop &&
+                   std::chrono::steady_clock::now() < deadline &&
+                   !std::filesystem::exists(engine_path)) {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
             }
-        }
-        if (publish_ready) {
-            nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
-        }
+            if (!g_stop && std::filesystem::exists(engine_path)) {
+                std::cerr << "pipeline-supervisor: engine appeared — publishing ready\n";
+                nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+            }
+        });
     }
 
     fnvr::Supervisor sup(cfg, &nats);
@@ -210,6 +215,7 @@ int main(int argc, char** argv) {
     if (restart_conn) natsConnection_Destroy(restart_conn);
     sup.Stop();
     if (runner.joinable()) runner.join();
+    if (ready_watcher.joinable()) ready_watcher.join();
     gst_deinit();
     return 0;
 }
