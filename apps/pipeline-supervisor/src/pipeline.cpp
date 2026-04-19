@@ -262,13 +262,18 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  live-source=1 batched-push-timeout=40000 ! "
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
              "nvvideoconvert ! "
-             "nvv4l2h265enc bitrate=6000000 insert-sps-pps=1 iframeinterval=30 ! "
-             "h265parse name=recparse config-interval=-1 ! "
-             // splitmuxsink is fragile on USB sources: its check_completed_gop
-             // g_asserts if the first H.265 buffer isn't a keyframe, which
-             // reliably happens on NVENC startup. Segment rotation is done
-             // application-side (supervisor restarts the pipeline hourly,
-             // so files already rotate per hour via the directory layout).
+             // H.264 (not H.265) for the recording branch: browsers play
+             // H.264-in-MP4 universally; H.265-in-MP4 works only in Safari
+             // and some Chrome-on-Apple-Silicon builds, so clips looked
+             // "corrupt" in the timeline player. 6 Mbps at 1080p keeps
+             // bitrate budget within shouting distance of the old H.265.
+             "nvv4l2h264enc bitrate=6000000 insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
+             "h264parse name=recparse config-interval=-1 ! "
+             // splitmuxsink is fragile on USB sources: it g_asserts if the
+             // first buffer isn't a keyframe, which happens on NVENC start.
+             // Segment rotation is done application-side (supervisor
+             // restarts the pipeline hourly, so files already rotate per
+             // hour via the directory layout).
              "queue max-size-buffers=300 max-size-time=2000000000 "
              "  max-size-bytes=0 ! "
              "mp4mux streamable=true fragment-duration=2000 ! "

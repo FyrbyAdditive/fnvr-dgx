@@ -196,7 +196,7 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 			INSERT INTO segments (camera_id, path, started_at, bytes, codec, tier)
 			VALUES ($1, $2, $3, $4, 'h264', 'hot')
 			ON CONFLICT (path) DO UPDATE
-			  SET bytes = EXCLUDED.bytes`,
+			  SET bytes = EXCLUDED.bytes, codec = EXCLUDED.codec`,
 			cameraID, path, st.ModTime(), st.Size())
 		if err != nil && !strings.Contains(err.Error(), "foreign key") {
 			slog.Debug("segment insert", "err", err, "path", path)
