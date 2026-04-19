@@ -59,6 +59,11 @@ services:
       FNVR_DATA_DIR: "/var/lib/fnvr"
     volumes:
       - fnvr-data:/var/lib/fnvr
+      # 1-fps JPEG preview ring lives on tmpfs — small, constantly
+      # overwritten, regenerated on pipeline restart; no reason to burn
+      # SSD cycles on it. Shared named volume so pipeline writer and api
+      # reader see the same backing store.
+      - fnvr-live:/var/lib/fnvr/live
       # Surface host V4L2 device metadata for the /system/local-devices endpoint.
       # Read-only. /sys/class/video4linux/videoN is a symlink into
       # /sys/devices/..., so we need both for the {name,device_caps} reads.
@@ -94,6 +99,7 @@ services:
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
     volumes:
       - fnvr-data:/var/lib/fnvr
+      - fnvr-live:/var/lib/fnvr/live
 
   web:
     build:
@@ -150,6 +156,7 @@ services:
       - "systempaths=unconfined"
     volumes:
       - fnvr-data:/var/lib/fnvr
+      - fnvr-live:/var/lib/fnvr/live
       - ../config:/etc/fnvr:ro
       # Tegra libv4l2 plugin queries libudev for device properties on the
       # /dev/v4l2-nv* nodes. Without /run/udev the lookup fails and the
@@ -225,3 +232,11 @@ services:
 volumes:
   postgres-data:
   fnvr-data:
+  # tmpfs-backed named volume for the live JPEG ring. Shared across
+  # pipeline (writer) + api + storage (readers). 128 MB is plenty:
+  # multifilesink keeps max-files=4 per camera at ~50 KB each.
+  fnvr-live:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=128m,mode=0755"
