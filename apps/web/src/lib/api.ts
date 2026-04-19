@@ -62,6 +62,8 @@ export type Rule = {
     classes: string[];
     min_confidence: number;
     zone_id?: string;
+    /** For line/tripwire zones: "in" | "out" | "" for both. */
+    direction?: "in" | "out" | "";
     cooldown_sec: number;
     severity: "info" | "warning" | "critical";
     schedule?: { start_minute: number; end_minute: number; days: number[]; timezone?: string };

@@ -45,6 +45,18 @@ type Engine struct {
 
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
+
+	// Per-track last-known centre and timestamp. Key is
+	// "<camera_id>|<track_id>". Used by line-crossing evaluation to
+	// decide whether a tripwire was crossed between consecutive
+	// observations of the same track. Entries older than 30s are
+	// pruned on insert so the map doesn't grow forever for ghost tracks.
+	tracks map[string]trackEntry
+}
+
+type trackEntry struct {
+	CX, CY   float32
+	Stamped  time.Time
 }
 
 type Detection struct {
@@ -124,6 +136,7 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		zones:            map[string][]Zone{},
 		enabledDetectors: map[string][]string{},
 		cooldowns:        map[string]time.Time{},
+		tracks:           map[string]trackEntry{},
 	}, nil
 }
 
@@ -309,8 +322,29 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if !inSchedule(r.Definition.Schedule, d.TS) {
 			continue
 		}
-		if r.Definition.ZoneID != "" && !bboxInZone(d.BBox, r.Definition.ZoneID, zones) {
-			continue
+		if r.Definition.ZoneID != "" {
+			zone := findZone(r.Definition.ZoneID, zones)
+			if zone == nil {
+				continue
+			}
+			if zone.Kind == "polygon" {
+				if !pointInPolygon(d.BBox.X+d.BBox.W/2,
+					d.BBox.Y+d.BBox.H/2, zone.Geometry) {
+					continue
+				}
+			} else {
+				// line / tripwire. Skip unless the track crossed it
+				// between this frame and the previous one, and the
+				// crossing direction matches the rule (if specified).
+				crossed, dir := e.lineCrossed(d, zone)
+				if !crossed {
+					continue
+				}
+				wantDir := r.Definition.Direction
+				if wantDir != "" && wantDir != dir {
+					continue
+				}
+			}
 		}
 		if !e.cooldownOK(r.ID, r.Definition.CooldownSec, d.TS) {
 			continue
@@ -319,6 +353,11 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 			slog.Warn("fire incident", "rule", r.ID, "err", err)
 		}
 	}
+
+	// Record this frame's centre on the track so the NEXT detection on
+	// the same track has a previous-position to compare against for
+	// line-crossing evaluation.
+	e.rememberTrack(d)
 	return nil
 }
 
@@ -445,19 +484,128 @@ func isMuted(d Detection, zones []Zone) bool {
 	return false
 }
 
+func findZone(zoneID string, zones []Zone) *Zone {
+	for i := range zones {
+		if zones[i].ID == zoneID {
+			return &zones[i]
+		}
+	}
+	return nil
+}
+
+// bboxInZone is used only by the zone-mute path where the semantics
+// are "bbox centre inside polygon". Retained for that caller; rules
+// use findZone + pointInPolygon / lineCrossed directly.
 func bboxInZone(b BBox, zoneID string, zones []Zone) bool {
 	cx, cy := b.X+b.W/2, b.Y+b.H/2
-	for _, z := range zones {
-		if z.ID != zoneID {
-			continue
+	z := findZone(zoneID, zones)
+	if z == nil || z.Kind != "polygon" {
+		return false
+	}
+	return pointInPolygon(cx, cy, z.Geometry)
+}
+
+// rememberTrack updates the last-known centre for a detection's track.
+// No-op if the detection has no track_id (sentinel UINT64_MAX from
+// un-tracked nvinfer output).
+func (e *Engine) rememberTrack(d Detection) {
+	if d.TrackID == "" || d.TrackID == "18446744073709551615" {
+		return
+	}
+	key := d.CameraID + "|" + d.TrackID
+	cx, cy := d.BBox.X+d.BBox.W/2, d.BBox.Y+d.BBox.H/2
+	e.mu.Lock()
+	e.tracks[key] = trackEntry{CX: cx, CY: cy, Stamped: d.TS}
+	// Opportunistic GC of entries older than 30s. A real pass can be a
+	// background goroutine later; doing it inline here is fine at
+	// expected detection volumes.
+	if len(e.tracks) > 2000 {
+		cutoff := d.TS.Add(-30 * time.Second)
+		for k, v := range e.tracks {
+			if v.Stamped.Before(cutoff) {
+				delete(e.tracks, k)
+			}
 		}
-		if z.Kind != "polygon" {
-			// For M2, line/tripwire need track history; handle in a later pass.
-			return false
-		}
-		return pointInPolygon(cx, cy, z.Geometry)
+	}
+	e.mu.Unlock()
+}
+
+// lineCrossed reports whether the track (identified by d.TrackID) moved
+// across the line zone `z` between its previous observation and the
+// current detection. Returns (true, "in"|"out") on crossing, where "in"
+// = left-to-right of the line when traversing its first endpoint to its
+// second (the order the UI wrote them in). Returns (false, "") if no
+// crossing happened or the track has no previous observation yet.
+func (e *Engine) lineCrossed(d Detection, z *Zone) (bool, string) {
+	if d.TrackID == "" || d.TrackID == "18446744073709551615" {
+		return false, ""
+	}
+	if len(z.Geometry) < 4 {
+		return false, ""
+	}
+	ax, ay := z.Geometry[0], z.Geometry[1] // line endpoint A
+	bx, by := z.Geometry[2], z.Geometry[3] // line endpoint B
+
+	key := d.CameraID + "|" + d.TrackID
+	e.mu.RLock()
+	prev, ok := e.tracks[key]
+	e.mu.RUnlock()
+	if !ok {
+		return false, ""
+	}
+	// Drop stale history; missed frames > 2s is not a continuous track.
+	if d.TS.Sub(prev.Stamped) > 2*time.Second {
+		return false, ""
+	}
+	cx, cy := d.BBox.X+d.BBox.W/2, d.BBox.Y+d.BBox.H/2
+	if !segmentsIntersect(prev.CX, prev.CY, cx, cy, ax, ay, bx, by) {
+		return false, ""
+	}
+	// Determine direction by the sign of the cross product (B-A) × (P-A)
+	// evaluated at prev vs curr. A positive-to-negative flip = "in"
+	// (crossing left-to-right relative to the A→B direction), negative-
+	// to-positive = "out".
+	sidePrev := cross(bx-ax, by-ay, prev.CX-ax, prev.CY-ay)
+	sideCurr := cross(bx-ax, by-ay, cx-ax, cy-ay)
+	if sidePrev >= 0 && sideCurr < 0 {
+		return true, "in"
+	}
+	if sidePrev < 0 && sideCurr >= 0 {
+		return true, "out"
+	}
+	// Exact collinear or grazing case — count it as "in" rather than
+	// losing the event.
+	return true, "in"
+}
+
+// segmentsIntersect returns true iff segment p1→p2 crosses segment
+// p3→p4. Uses the standard orientation method.
+func segmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4 float32) bool {
+	o1 := orient(x1, y1, x2, y2, x3, y3)
+	o2 := orient(x1, y1, x2, y2, x4, y4)
+	o3 := orient(x3, y3, x4, y4, x1, y1)
+	o4 := orient(x3, y3, x4, y4, x2, y2)
+	if o1 != o2 && o3 != o4 {
+		return true
 	}
 	return false
+}
+
+// orient returns the sign of the cross product of (p1→p2) × (p1→p3):
+// 1 = CCW, -1 = CW, 0 = collinear.
+func orient(x1, y1, x2, y2, x3, y3 float32) int {
+	v := (x2-x1)*(y3-y1) - (y2-y1)*(x3-x1)
+	if v > 0 {
+		return 1
+	}
+	if v < 0 {
+		return -1
+	}
+	return 0
+}
+
+func cross(ax, ay, bx, by float32) float32 {
+	return ax*by - ay*bx
 }
 
 // Standard ray-cast PIP. geometry is [x0,y0,x1,y1,...]; treated as closed.

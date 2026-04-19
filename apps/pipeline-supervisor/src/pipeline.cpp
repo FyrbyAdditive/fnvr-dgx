@@ -293,6 +293,14 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  width=" << mux_w << " height=" << mux_h
              << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
+             // NvDCF tracker gives us stable per-object track_ids.
+             // Required for tripwire line-crossing evaluation (which
+             // needs to see an object on both sides of the line across
+             // consecutive frames) and for future cross-camera ReID.
+             "nvtracker name=tracker "
+             "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
+             "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
+             "  tracker-width=960 tracker-height=544 ! "
              "fakesink sync=false ";
     } else if (use_deepstream_) {
         // DeepStream detection needs decoded frames; re-decode from the
@@ -303,6 +311,14 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  width=" << mux_w << " height=" << mux_h
              << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
+             // NvDCF tracker gives us stable per-object track_ids.
+             // Required for tripwire line-crossing evaluation (which
+             // needs to see an object on both sides of the line across
+             // consecutive frames) and for future cross-camera ReID.
+             "nvtracker name=tracker "
+             "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
+             "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
+             "  tracker-width=960 tracker-height=544 ! "
              "nvvideoconvert ! "
              // H.264 (not H.265) for the recording branch: browsers play
              // H.264-in-MP4 universally; H.265-in-MP4 works only in Safari
@@ -379,7 +395,12 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
 
 #if FNVR_HAS_DEEPSTREAM
     if (use_deepstream_ && nats_) {
-        GstElement* pgie = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        // Attach the detection probe to the tracker src pad if present
+        // (so we see assigned track_ids), falling back to the nvinfer
+        // src pad otherwise — v4l2 / non-deepstream paths have no
+        // tracker element.
+        GstElement* pgie = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
+        if (!pgie) pgie = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
         if (pgie) {
             GstPad* src = gst_element_get_static_pad(pgie, "src");
             if (src) {

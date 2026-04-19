@@ -32,8 +32,14 @@ export function Rules() {
   const [classes, setClasses] = useState("person");
   const [minConf, setMinConf] = useState(0.5);
   const [zoneID, setZoneID] = useState("");
+  const [direction, setDirection] = useState<"" | "in" | "out">("");
   const [severity, setSeverity] = useState<"info" | "warning" | "critical">("warning");
   const [cooldown, setCooldown] = useState(30);
+
+  // Direction only meaningful for line/tripwire zones; reset when the
+  // selected zone isn't one.
+  const selectedZone = zones.find((z) => z.id === zoneID);
+  const isLineLike = selectedZone?.kind === "line" || selectedZone?.kind === "tripwire";
 
   function submit(e: FormEvent) {
     e.preventDefault();
@@ -45,6 +51,7 @@ export function Rules() {
         classes: classes.split(",").map((c) => c.trim()).filter(Boolean),
         min_confidence: minConf,
         zone_id: zoneID || undefined,
+        direction: isLineLike && direction ? direction : undefined,
         cooldown_sec: cooldown,
         severity,
       },
@@ -71,8 +78,19 @@ export function Rules() {
             <option value="">— any zone —</option>
             {zones
               .filter((z) => !cameraID || z.camera_id === cameraID)
-              .map((z) => <option key={z.id} value={z.id}>{z.name} ({z.camera_id})</option>)}
+              .map((z) => <option key={z.id} value={z.id}>{z.name} ({z.kind}) · {z.camera_id}</option>)}
           </select>
+
+          {isLineLike ? (
+            <select className="bg-neutral-900 rounded px-3 py-2"
+              value={direction}
+              onChange={(e) => setDirection(e.target.value as "" | "in" | "out")}
+              title="Which direction of crossing fires this rule">
+              <option value="">both directions</option>
+              <option value="in">crossing in (A → B)</option>
+              <option value="out">crossing out (B → A)</option>
+            </select>
+          ) : <div />}
 
           <input className="bg-neutral-900 rounded px-3 py-2" placeholder="classes (comma-sep)"
             value={classes} onChange={(e) => setClasses(e.target.value)} />
@@ -156,6 +174,7 @@ function RuleRow({ rule, channels, subscriptions, onToggle, onDelete }: {
             {(rule.definition.classes ?? []).join(", ")}
             {rule.definition.camera_id && ` · ${rule.definition.camera_id}`}
             {` · ≥${Math.round((rule.definition.min_confidence ?? 0) * 100)}%`}
+            {rule.definition.direction && ` · crossing ${rule.definition.direction}`}
             {` · ${rule.definition.severity ?? "info"}`}
           </div>
         </div>
