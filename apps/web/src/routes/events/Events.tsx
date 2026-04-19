@@ -9,7 +9,11 @@ export function Events() {
   const navigate = useNavigate();
   const { data: me } = useMe();
   const isAdmin = !!me?.is_admin;
-  const detections = useRecentDetections(200);
+  // Ring buffer cap — keeps the tab responsive on long sessions since
+  // each event renders a row. At ~30 detections/sec this is ~30s of
+  // history; older events drop off the bottom.
+  const LIVE_LIMIT = 1000;
+  const detections = useRecentDetections(LIVE_LIMIT);
   const { data: incidents = [] } = useQuery({
     queryKey: ["incidents"],
     queryFn: () => api.listIncidents(50),
@@ -89,7 +93,10 @@ export function Events() {
 
       <section>
         <h2 className="text-lg font-semibold mb-2">
-          Live detections <span className="text-neutral-500 text-sm">({detections.length})</span>
+          Live detections{" "}
+          <span className="text-neutral-500 text-sm">
+            (last {LIVE_LIMIT} · showing {detections.length})
+          </span>
         </h2>
         {detections.length === 0 ? (
           <p className="text-neutral-500 text-sm">Listening on SSE…</p>
