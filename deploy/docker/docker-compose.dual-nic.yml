@@ -1,0 +1,38 @@
+# Optional overlay for dual-NIC deployments. Compose with:
+#   docker compose \
+#     -f deploy/docker/docker-compose.yml \
+#     -f deploy/docker/docker-compose.dual-nic.yml \
+#     up -d
+#
+# Required env:
+#   FNVR_USER_NIC_IP   host IP on the user/LAN side (e.g. 192.168.1.10)
+#
+# What this does (and does not):
+#   - Binds web/api/NATS-monitoring host ports to FNVR_USER_NIC_IP only,
+#     so cameras on the other NIC can't reach the UI.
+#   - Withdraws NATS 4222 (client) and mediamtx 8554/8889 from host
+#     exposure entirely — usb-bridge + pipeline reach mediamtx via docker
+#     DNS, and the current web UI uses WHEP via api-server rather than
+#     mediamtx's WebRTC port.
+#   - Does NOT steer outbound RTSP onto the camera NIC — that's a host
+#     routing concern; see docs/deployment/dual-nic.md.
+#   - Does NOT block inter-NIC forwarding through the docker bridge —
+#     add DOCKER-USER iptables rules per the same doc.
+
+name: fnvr
+
+services:
+  nats:
+    ports:
+      - "${FNVR_USER_NIC_IP:?FNVR_USER_NIC_IP unset}:8222:8222"
+
+  api:
+    ports:
+      - "${FNVR_USER_NIC_IP:?FNVR_USER_NIC_IP unset}:8081:8081"
+
+  web:
+    ports:
+      - "${FNVR_USER_NIC_IP:?FNVR_USER_NIC_IP unset}:8080:80"
+
+  mediamtx:
+    ports: []
