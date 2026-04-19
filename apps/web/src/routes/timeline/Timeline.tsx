@@ -374,7 +374,11 @@ function PlayerOverlay({
 }
 
 function OverlayBox({ d }: { d: HistoricDetection }) {
-  const color = overlayColor(d.class_name);
+  const isPlate = d.kind === "anpr";
+  const color = isPlate ? "#22c55e" : overlayColor(d.class_name);
+  const label = isPlate
+    ? d.attributes?.plate ?? "plate"
+    : `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
   return (
     <div
       className="absolute"
@@ -388,14 +392,14 @@ function OverlayBox({ d }: { d: HistoricDetection }) {
       }}
     >
       <div
-        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight"
+        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight tabular-nums"
         style={{
           background: color,
           color: "#000",
           transform: "translateY(-100%)",
         }}
       >
-        {d.class_name} {(d.confidence * 100).toFixed(0)}%
+        {label}
       </div>
     </div>
   );

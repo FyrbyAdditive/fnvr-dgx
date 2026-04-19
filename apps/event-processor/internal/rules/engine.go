@@ -402,10 +402,14 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	}
 
 	// Persist raw detection — the timeline reads from here.
+	kind := d.Kind
+	if kind == "" {
+		kind = "object"
+	}
 	if _, err := e.pool.Exec(ctx, `
-		INSERT INTO detections (event_id, camera_id, ts, class_name, confidence, bbox, track_id, attributes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		d.ID, d.CameraID, d.TS, d.ClassName, d.Confidence,
+		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
 		mustJSON(d.BBox), nullIfEmpty(d.TrackID), mustJSON(d.Attributes),
 	); err != nil {
 		return err

@@ -48,9 +48,14 @@ type Row struct {
 	CameraID   string          `json:"camera_id"`
 	TS         time.Time       `json:"ts"`
 	ClassName  string          `json:"class_name"`
+	// Kind is "object" | "anpr" | "face". Old rows default to "object".
+	Kind       string          `json:"kind,omitempty"`
 	Confidence float32         `json:"confidence"`
 	BBox       json.RawMessage `json:"bbox"`
 	TrackID    *string         `json:"track_id,omitempty"`
+	// Attributes carries plate text ("plate") for ANPR rows, and any
+	// future per-kind metadata. JSONB in PG.
+	Attributes json.RawMessage `json:"attributes,omitempty"`
 }
 
 type ListArgs struct {
@@ -129,7 +134,7 @@ func (s *Store) hotHours(ctx context.Context) (int, error) {
 }
 
 func (s *Store) queryPG(ctx context.Context, a ListArgs, from, to time.Time, limit int) ([]Row, error) {
-	sql := `SELECT id, event_id, camera_id, ts, class_name, confidence, bbox, track_id
+	sql := `SELECT id, event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes
 	        FROM detections WHERE 1=1`
 	args := []any{}
 	addArg := func(v any) string {
@@ -157,7 +162,7 @@ func (s *Store) queryPG(ctx context.Context, a ListArgs, from, to time.Time, lim
 	for rows.Next() {
 		var r Row
 		if err := rows.Scan(&r.ID, &r.EventID, &r.CameraID, &r.TS, &r.ClassName,
-			&r.Confidence, &r.BBox, &r.TrackID); err != nil {
+			&r.Kind, &r.Confidence, &r.BBox, &r.TrackID, &r.Attributes); err != nil {
 			continue
 		}
 		r.BBox = normaliseBBox(r.BBox)
@@ -254,14 +259,20 @@ func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap i
 		if id == 0 {
 			id = 1
 		}
+		kind := ev.Kind
+		if kind == "" {
+			kind = "object"
+		}
 		r := Row{
 			ID:         -id,
 			EventID:    ev.ID,
 			CameraID:   ev.CameraID,
 			TS:         ev.TS,
 			ClassName:  ev.ClassName,
+			Kind:       kind,
 			Confidence: ev.Confidence,
 			BBox:       ev.BBox,
+			Attributes: ev.Attributes,
 		}
 		if ev.TrackID != "" {
 			tid := ev.TrackID
@@ -305,6 +316,7 @@ type sidecarEvent struct {
 	Confidence float32         `json:"confidence"`
 	BBox       json.RawMessage `json:"bbox"`
 	TrackID    string          `json:"track_id,omitempty"`
+	Attributes json.RawMessage `json:"attributes,omitempty"`
 }
 
 // sidecarPath derives the JSONL sidecar path from an mp4 path.

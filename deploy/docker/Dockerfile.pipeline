@@ -114,6 +114,53 @@ RUN set -eux; \
       rm -f "${v}.pt"; \
     done
 
+# ANPR: NVIDIA TAO LPDNet (plate detector) + LPRNet (OCR).
+# - Weights are pulled from NGC archived-model URLs (no auth required).
+# - The custom LPRNet classifier parser lives in deepstream_tao_apps;
+#   compile its .so so nvinfer can pull plate text via CTC decode.
+# LPDNet/LPRNet use the NVIDIA model licence ("ready for commercial
+# use", locked to NVIDIA hardware/runtimes) — NOT OSI-open; we ship
+# only a downloader step so the shipped image includes the weights
+# but the repo doesn't.
+# LPDNet pruned_v2.3 is the current stable version (2.3.1 was withdrawn).
+# LPRNet deployable_onnx_v1.1 is the ONNX release — avoids needing
+# tlt-model-key and the .etlt → .onnx conversion at runtime.
+ARG LPDNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lpdnet/versions/pruned_v2.3/files/LPDNet_usa_pruned_tao5.onnx
+ARG LPRNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lprnet/versions/deployable_onnx_v1.1/files/us_lprnet_baseline18_deployable.onnx
+ARG LPRNET_LABELS_URL=https://raw.githubusercontent.com/NVIDIA-AI-IOT/deepstream_tao_apps/release/tao_ds7.1ga/configs/lpr_tao5/labels_us.txt
+RUN set -eux; \
+    mkdir -p /opt/fnvr/anpr; \
+    wget -q "${LPDNET_URL}" -O /opt/fnvr/anpr/LPDNet_usa.onnx; \
+    wget -q "${LPRNET_URL}" -O /opt/fnvr/anpr/LPRNet_usa.onnx; \
+    wget -q "${LPRNET_LABELS_URL}" -O /etc/fnvr/nvinfer/lprnet.labels 2>/dev/null || true
+
+# TAO custom parsers (.so) — provides NvDsInferParseCustomNVPlate, the
+# CTC decoder that turns LPRNet logits into the plate string surfaced
+# via NvDsClassifierMeta. Source lives in deepstream_tao_apps; the
+# build step mirrors the repo's own README.
+ARG DS_TAO_COMMIT=release/tao_ds7.1ga
+# Two separate .so builds from the deepstream_tao_apps repo:
+# - post_processor: generic bbox parsers (used by LPDNet)
+# - nvinfer_custom_lpr_parser: CTC decoder for LPRNet plate text,
+#   exports NvDsInferParseCustomNVPlate
+# Both Makefiles derive DS_VERSION by running `deepstream-app -v`
+# which fails on the triton-multiarch build image (missing libnvdla);
+# patch both to hard-code 7.1.
+RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
+        https://github.com/NVIDIA-AI-IOT/deepstream_tao_apps.git /tmp/ds-tao \
+  && for dir in post_processor apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser; do \
+        sed -i 's|^DS_VER = .*|DS_VER = 7.1|' /tmp/ds-tao/$dir/Makefile || true; \
+     done \
+  && cd /tmp/ds-tao/post_processor \
+  && CUDA_VER=12.6 make \
+  && install -Dm755 libnvds_infercustomparser_tao.so \
+        /opt/nvidia/deepstream/deepstream/lib/libnvds_infercustomparser_tao.so \
+  && cd /tmp/ds-tao/apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser \
+  && CUDA_VER=12.6 make \
+  && install -Dm755 libnvdsinfer_custom_impl_lpr.so \
+        /opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_lpr.so \
+  && ldconfig
+
 WORKDIR /src
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs

@@ -47,18 +47,24 @@ function Detector() {
 
   const [variant, setVariant] = useState<DetectorSettings["yolo26_variant"]>("yolo26x");
   const [precision, setPrecision] = useState<DetectorSettings["yolo26_precision"]>("fp16");
+  const [anpr, setAnpr] = useState<boolean>(false);
 
   // Seed local state from server once.
   useEffect(() => {
     if (current) {
       setVariant(current.yolo26_variant);
       setPrecision(current.yolo26_precision);
+      setAnpr(!!current.anpr_enabled);
     }
   }, [current]);
 
   const save = useMutation({
     mutationFn: async () => {
-      await api.updateDetectorSettings({ yolo26_variant: variant, yolo26_precision: precision });
+      await api.updateDetectorSettings({
+        yolo26_variant: variant,
+        yolo26_precision: precision,
+        anpr_enabled: anpr,
+      });
       await api.restartPipeline();
     },
     onSuccess: () => {
@@ -70,7 +76,9 @@ function Detector() {
 
   const dirty =
     !!current &&
-    (variant !== current.yolo26_variant || precision !== current.yolo26_precision);
+    (variant !== current.yolo26_variant ||
+      precision !== current.yolo26_precision ||
+      anpr !== !!current.anpr_enabled);
 
   return (
     <section>
@@ -113,6 +121,21 @@ function Detector() {
               INT8 (temporarily disabled)
             </label>
           </div>
+        </div>
+
+        <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
+          <label className="text-neutral-400">ANPR</label>
+          <label
+            className="inline-flex items-center gap-2"
+            title="Adds NVIDIA TAO LPDNet + LPRNet after the object detector. Reads licence plates on vehicles (US charset). Toggling restarts the pipeline."
+          >
+            <input
+              type="checkbox"
+              checked={anpr}
+              onChange={(e) => setAnpr(e.target.checked)}
+            />
+            <span>Read licence plates (LPDNet + LPRNet)</span>
+          </label>
         </div>
 
         <div>

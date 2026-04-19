@@ -70,20 +70,28 @@ export function Events() {
           <p className="text-neutral-500 text-sm">Listening on SSE…</p>
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm max-h-[70vh] overflow-auto">
-            {detections.map((e) => (
-              <li key={e.id} className="p-2 grid grid-cols-[8rem_1fr_6rem] gap-2">
-                <span className="text-neutral-500 tabular-nums">
-                  {new Date(e.ts).toLocaleTimeString()}
-                </span>
-                <span>
-                  <span className="font-medium">{e.class_name}</span>
-                  <span className="text-neutral-500"> · {e.camera_id}</span>
-                </span>
-                <span className="text-right tabular-nums text-neutral-400">
-                  {(e.confidence * 100).toFixed(0)}%
-                </span>
-              </li>
-            ))}
+            {detections.map((e) => {
+              const isPlate = e.kind === "anpr";
+              const primary = isPlate
+                ? e.attributes?.plate ?? "plate"
+                : e.class_name;
+              return (
+                <li key={e.id} className="p-2 grid grid-cols-[8rem_1fr_6rem] gap-2">
+                  <span className="text-neutral-500 tabular-nums">
+                    {new Date(e.ts).toLocaleTimeString()}
+                  </span>
+                  <span>
+                    <span className={`font-medium ${isPlate ? "text-emerald-400" : ""}`}>
+                      {primary}
+                    </span>
+                    <span className="text-neutral-500"> · {e.camera_id}</span>
+                  </span>
+                  <span className="text-right tabular-nums text-neutral-400">
+                    {(e.confidence * 100).toFixed(0)}%
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>

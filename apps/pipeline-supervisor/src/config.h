@@ -24,6 +24,9 @@ struct Config {
     std::string recordings_dir;   // e.g. "/var/lib/fnvr/recordings"
     std::string inference_config; // path to nvinfer config file
     bool        use_deepstream;   // false on non-Jetson dev (record-only)
+    // Inserts the LPDNet + LPRNet SGIE chain after the tracker. When
+    // off, the pipeline is unchanged from the object-only shape.
+    bool        use_anpr;
     int         reconcile_interval_sec;
 };
 

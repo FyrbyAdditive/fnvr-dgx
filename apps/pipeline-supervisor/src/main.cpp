@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         }
 
         fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
-                                      cfg.use_deepstream, &nats);
+                                      cfg.use_deepstream, cfg.use_anpr, &nats);
 
         // Announce "starting" before Start() so the UI can show progress
         // during the TRT engine build (first run after cache wipe: 60-90s).

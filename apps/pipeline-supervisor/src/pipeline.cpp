@@ -25,11 +25,13 @@ namespace fs = std::filesystem;
 
 SingleCameraPipeline::SingleCameraPipeline(CameraConfig cam, std::string recordings_dir,
                                            std::string infer_config, bool use_deepstream,
+                                           bool use_anpr,
                                            NatsPublisher* nats)
     : cam_(std::move(cam)),
       recordings_dir_(std::move(recordings_dir)),
       infer_config_(std::move(infer_config)),
       use_deepstream_(use_deepstream),
+      use_anpr_(use_anpr),
       nats_(nats) {}
 
 SingleCameraPipeline::~SingleCameraPipeline() { Stop(); }
@@ -70,8 +72,46 @@ std::string json_escape(std::string_view s) {
     return out;
 }
 
-// Called for every batched frame leaving the nvinfer element. We iterate the
-// per-frame object metadata, map pixel bboxes to 0..1, and publish to NATS.
+// LPDNet is attached as gie-unique-id=2 in lpdnet.txt. Any obj_meta
+// with this component id is a plate crop, not a primary-detector
+// object. Pgie (YOLO26) = 1; LPRNet (classifier) only updates
+// classifier_meta on the plate's obj_meta — it doesn't add new objs.
+constexpr unsigned LPDNET_GIE_ID = 2;
+
+// extractPlateText pulls the plate string from the obj_meta's
+// classifier_meta_list, as populated by the LPRNet CTC parser
+// (NvDsInferParseCustomNVPlate in libnvds_infercustomparser_tao.so).
+// Returns empty string if no classifier meta is attached (low-
+// confidence OCR skip / chain not run).
+std::string extractPlateText(NvDsObjectMeta* obj) {
+    for (NvDsMetaList* cl = obj->classifier_meta_list; cl; cl = cl->next) {
+        auto* cmeta = static_cast<NvDsClassifierMeta*>(cl->data);
+        if (!cmeta) continue;
+        for (NvDsMetaList* ll = cmeta->label_info_list; ll; ll = ll->next) {
+            auto* label = static_cast<NvDsLabelInfo*>(ll->data);
+            if (label && label->result_label[0]) {
+                return std::string(label->result_label);
+            }
+        }
+    }
+    return {};
+}
+
+// parentVehicleClass reads the upstream vehicle's label (car, truck,
+// bus, motorcycle) off a plate's parent obj_meta. Useful context in
+// the published detection so the UI / rules engine can show "car
+// AB12CDE" without a follow-up lookup.
+std::string parentVehicleClass(NvDsObjectMeta* obj) {
+    if (obj->parent && obj->parent->obj_label[0]) {
+        return std::string(obj->parent->obj_label);
+    }
+    return {};
+}
+
+// Called for every batched frame leaving the last nvinfer (LPRNet
+// when ANPR is enabled, tracker otherwise). Emits two payload
+// shapes — kind="object" for pgie detections, kind="anpr" for
+// plates with decoded text.
 GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     auto* ctx = static_cast<ProbeCtx*>(user);
     GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
@@ -81,6 +121,12 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     if (!batch) return GST_PAD_PROBE_OK;
 
     gint64 ts_ns = g_get_real_time() * 1000;  // µs → ns
+    auto iso = [ts_ns]{
+        std::time_t t = ts_ns / 1'000'000'000;
+        std::tm tm{}; gmtime_r(&t, &tm);
+        char b[32]; std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tm);
+        return std::string(b);
+    }();
 
     for (NvDsMetaList* fl = batch->frame_meta_list; fl; fl = fl->next) {
         auto* frame = static_cast<NvDsFrameMeta*>(fl->data);
@@ -97,7 +143,10 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             float w = obj->rect_params.width  / float(W);
             float h = obj->rect_params.height / float(H);
 
-            const char* label = obj->obj_label[0] ? obj->obj_label : "object";
+            const bool is_plate = (obj->unique_component_id == LPDNET_GIE_ID);
+            const char* label = is_plate
+                ? "plate"
+                : (obj->obj_label[0] ? obj->obj_label : "object");
 
             // Class-mute gate at source. Drops before NATS publish so
             // muted classes don't reach Live bboxes, SSE, or event-
@@ -109,26 +158,41 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 continue;
             }
 
+            // ANPR branch: only publish when we have a decoded plate
+            // string — a plate crop with no OCR output is noise.
+            std::string plate, parent;
+            if (is_plate) {
+                plate = extractPlateText(obj);
+                if (plate.empty()) continue;
+                parent = parentVehicleClass(obj);
+            }
+            const char* kind = is_plate ? "anpr" : "object";
+            // Plate inherits its vehicle's track_id so the rules
+            // engine can correlate plate ↔ car without extra state.
+            const uint64_t track_id = (is_plate && obj->parent)
+                ? obj->parent->object_id
+                : obj->object_id;
+
             std::ostringstream js;
             js << "{"
                << "\"id\":\""         << short_id() << "\","
                << "\"camera_id\":\""  << json_escape(ctx->camera_id) << "\","
-               << "\"ts\":\""         << [ts_ns]{
-                        std::time_t t = ts_ns / 1'000'000'000;
-                        std::tm tm{}; gmtime_r(&t, &tm);
-                        char b[32]; std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tm);
-                        return std::string(b);
-                  }()                                         << "\","
+               << "\"ts\":\""         << iso                  << "\","
                << "\"class_name\":\"" << json_escape(label)   << "\","
-               // Detector kind — today everything here is object detection
-               // via nvinfer. ANPR / face get their own kinds later so the
-               // zone-mute gate can silence them independently.
-               << "\"kind\":\"object\","
+               << "\"kind\":\""       << kind                 << "\","
                << "\"confidence\":"   << obj->confidence      << ","
                << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
                <<          ",\"w\":"  << w << ",\"h\":" << h << "},"
-               << "\"track_id\":\""   << obj->object_id       << "\""
-               << "}";
+               << "\"track_id\":\""   << track_id             << "\"";
+            if (is_plate) {
+                js << ",\"attributes\":{"
+                   << "\"plate\":\""         << json_escape(plate)  << "\"";
+                if (!parent.empty()) {
+                    js << ",\"parent_class\":\"" << json_escape(parent) << "\"";
+                }
+                js << "}";
+            }
+            js << "}";
             std::string payload = js.str();
             std::string subj = std::string("fnvr.events.detection.") + ctx->camera_id;
             if (ctx->nats) ctx->nats->Publish(subj, payload);
@@ -300,6 +364,19 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     int mux_w = rec_width_ > 0 ? rec_width_ : 1920;
     int mux_h = rec_height_ > 0 ? rec_height_ : 1080;
 
+    // ANPR SGIE chain — LPDNet (plate detector) + LPRNet (OCR) run
+    // after the tracker so they see vehicles with stable track_ids.
+    // gie-unique-id values (2 + 3) are wired into lpdnet.txt /
+    // lprnet.txt so the probe can distinguish plate obj_meta from
+    // pgie obj_meta via unique_component_id. Empty string when ANPR
+    // is off — the primary chain is unchanged.
+    std::string anpr_chain;
+    if (use_anpr_) {
+        anpr_chain =
+            "nvinfer name=lpdnet config-file-path=/etc/fnvr/nvinfer/lpdnet.txt ! "
+            "nvinfer name=lprnet config-file-path=/etc/fnvr/nvinfer/lprnet.txt ! ";
+    }
+
     if (use_deepstream_ && is_v4l2) {
         p << "nvv4l2decoder ! "
              "mux.sink_0 nvstreammux name=mux batch-size=1 "
@@ -314,7 +391,8 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
              "  tracker-width=960 tracker-height=544 ! "
-             "fakesink sync=false ";
+          << anpr_chain
+          << "fakesink sync=false ";
     } else if (use_deepstream_) {
         // DeepStream detection needs decoded frames; re-decode from the
         // elementary stream so it works from both source types. Memory
@@ -332,7 +410,8 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
              "  tracker-width=960 tracker-height=544 ! "
-             "nvvideoconvert ! "
+          << anpr_chain
+          << "nvvideoconvert ! "
              // H.264 (not H.265) for the recording branch: browsers play
              // H.264-in-MP4 universally; H.265-in-MP4 works only in Safari
              // and some Chrome-on-Apple-Silicon builds, so clips looked
@@ -408,14 +487,16 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
 
 #if FNVR_HAS_DEEPSTREAM
     if (use_deepstream_ && nats_) {
-        // Attach the detection probe to the tracker src pad if present
-        // (so we see assigned track_ids), falling back to the nvinfer
-        // src pad otherwise — v4l2 / non-deepstream paths have no
-        // tracker element.
-        GstElement* pgie = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
-        if (!pgie) pgie = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
-        if (pgie) {
-            GstPad* src = gst_element_get_static_pad(pgie, "src");
+        // Attach the detection probe to the last nvinfer in the chain:
+        //   lprnet (ANPR on)  →  tracker  →  pgie
+        // So the probe sees classifier_meta populated by LPRNet when
+        // ANPR is enabled, track_ids from NvDCF otherwise, and at
+        // worst pgie's bare output.
+        GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
+        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
+        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        if (attach) {
+            GstPad* src = gst_element_get_static_pad(attach, "src");
             if (src) {
                 // Leaked on purpose: lifetime matches the pipeline, cleaned up
                 // when the process exits. Fine for M2, tighten when we have
@@ -424,7 +505,7 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                 gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe, ctx, nullptr);
                 gst_object_unref(src);
             }
-            gst_object_unref(pgie);
+            gst_object_unref(attach);
         }
     }
 #endif

@@ -65,6 +65,11 @@ var validPrecisions = map[string]struct{}{
 type Detector struct {
 	YoloVariant   string `json:"yolo26_variant"`
 	YoloPrecision string `json:"yolo26_precision"`
+	// AnprEnabled toggles the LPDNet + LPRNet SGIE chain in the
+	// pipeline. Off by default so the two extra nvinfer stages don't
+	// eat GPU on installs that don't care about plates. Takes effect
+	// on pipeline restart (Settings UI does this automatically).
+	AnprEnabled bool `json:"anpr_enabled"`
 }
 
 // GetDetector reads the detector settings, falling back to defaults if a
@@ -82,6 +87,11 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
+	if raw, err := s.Get(ctx, "detector.anpr_enabled"); err == nil {
+		_ = json.Unmarshal(raw, &d.AnprEnabled)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
 	return d, nil
 }
 
@@ -96,10 +106,14 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	}
 	vb, _ := json.Marshal(d.YoloVariant)
 	pb, _ := json.Marshal(d.YoloPrecision)
+	ab, _ := json.Marshal(d.AnprEnabled)
 	if err := s.Set(ctx, "detector.yolo26_variant", vb); err != nil {
 		return err
 	}
-	return s.Set(ctx, "detector.yolo26_precision", pb)
+	if err := s.Set(ctx, "detector.yolo26_precision", pb); err != nil {
+		return err
+	}
+	return s.Set(ctx, "detector.anpr_enabled", ab)
 }
 
 // ClassMutes is the three-bucket class-mute configuration applied by

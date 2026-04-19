@@ -110,9 +110,12 @@ export type HistoricDetection = {
   camera_id: string;
   ts: string;
   class_name: string;
+  /** "object" | "anpr" | "face". Absent on older rows (treat as "object"). */
+  kind?: "object" | "anpr" | "face";
   confidence: number;
   bbox: { x: number; y: number; w: number; h: number };
   track_id?: string;
+  attributes?: Record<string, string>;
 };
 
 export const api = {
@@ -217,6 +220,7 @@ export const api = {
 export type DetectorSettings = {
   yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
   yolo26_precision: "fp16" | "int8";
+  anpr_enabled?: boolean;
 };
 
 export type PipelineState = {

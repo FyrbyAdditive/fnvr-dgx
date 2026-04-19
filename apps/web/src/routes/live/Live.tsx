@@ -339,7 +339,10 @@ function StateBadge({ state }: { state: "starting" | "failed" | "unknown" | stri
 }
 
 function BBox({ d }: { d: DetectionEvent }) {
-  const color = colorForClass(d.class_name);
+  const isPlate = d.kind === "anpr";
+  // Plates get a fixed green border + the decoded text as label so
+  // they visually stand apart from the busy COCO palette.
+  const color = isPlate ? "#22c55e" : colorForClass(d.class_name);
   const style: React.CSSProperties = {
     position: "absolute",
     left: `${d.bbox.x * 100}%`,
@@ -350,13 +353,16 @@ function BBox({ d }: { d: DetectionEvent }) {
     boxShadow: `0 0 0 1px rgba(0,0,0,0.5)`,
     pointerEvents: "none",
   };
+  const label = isPlate
+    ? d.attributes?.plate ?? "plate"
+    : `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
   return (
     <div style={style}>
       <div
-        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight"
+        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight tabular-nums"
         style={{ background: color, color: "#000", transform: "translateY(-100%)" }}
       >
-        {d.class_name} {(d.confidence * 100).toFixed(0)}%
+        {label}
       </div>
     </div>
   );

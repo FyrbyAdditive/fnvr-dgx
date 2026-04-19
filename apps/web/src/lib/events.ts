@@ -5,6 +5,8 @@ export type DetectionEvent = {
   camera_id: string;
   ts: string;
   class_name: string;
+  /** "object" | "anpr" | "face". Absent on legacy payloads (treat as "object"). */
+  kind?: "object" | "anpr" | "face";
   confidence: number;
   bbox: { x: number; y: number; w: number; h: number };
   track_id?: string;

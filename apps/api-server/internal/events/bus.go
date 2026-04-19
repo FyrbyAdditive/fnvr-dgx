@@ -17,15 +17,18 @@ import (
 // Detection mirrors the shape of fnvr.events.v1.Detection on the wire.
 // JSON for now — we'll switch to protobuf-over-NATS once the codegen lands.
 type Detection struct {
-	ID         string            `json:"id"`
-	CameraID   string            `json:"camera_id"`
-	TS         time.Time         `json:"ts"`
-	ClassName  string            `json:"class_name"`
-	Confidence float32           `json:"confidence"`
-	X, Y, W, H float32           `json:"-"`
+	ID         string             `json:"id"`
+	CameraID   string             `json:"camera_id"`
+	TS         time.Time          `json:"ts"`
+	ClassName  string             `json:"class_name"`
+	// Kind is "object" | "anpr" | "face". Empty on the wire is legacy
+	// pre-ANPR pipelines; consumers treat as "object".
+	Kind       string             `json:"kind,omitempty"`
+	Confidence float32            `json:"confidence"`
+	X, Y, W, H float32            `json:"-"`
 	BBox       map[string]float32 `json:"bbox"`
-	TrackID    string            `json:"track_id,omitempty"`
-	Attributes map[string]string `json:"attributes,omitempty"`
+	TrackID    string             `json:"track_id,omitempty"`
+	Attributes map[string]string  `json:"attributes,omitempty"`
 }
 
 type Bus struct {

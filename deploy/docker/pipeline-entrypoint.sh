@@ -75,6 +75,11 @@ if [ -d "$YOLO_SRC" ]; then
     echo "entrypoint: yolo26 weights ready under $YOLO_DEST"
 fi
 
+# ANPR: persistent engine cache directory. nvinfer writes the LPDNet +
+# LPRNet .engine files here on first run; bind-mounting keeps them
+# across container restarts so we don't eat a rebuild every time.
+mkdir -p /var/lib/fnvr/models/anpr
+
 # ---- Resolve detector settings & render nvinfer config ----
 #
 # Reads settings from the api via FNVR_SETTINGS_URL. If unreachable (api
@@ -99,12 +104,18 @@ if command -v curl >/dev/null 2>&1; then
     if [ -n "$SETTINGS_JSON" ]; then
         V=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_variant":"\([^"]*\)".*/\1/p')
         P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
+        A=$(echo "$SETTINGS_JSON" | sed -n 's/.*"anpr_enabled":\(true\|false\).*/\1/p')
         [ -n "$V" ] && VARIANT="$V"
         [ -n "$P" ] && PRECISION="$P"
+        if [ "$A" = "true" ]; then
+            export FNVR_USE_ANPR=1
+        else
+            export FNVR_USE_ANPR=0
+        fi
     fi
 fi
 
-echo "entrypoint: detector variant=$VARIANT precision=$PRECISION"
+echo "entrypoint: detector variant=$VARIANT precision=$PRECISION anpr=${FNVR_USE_ANPR:-0}"
 
 # Fetch the current camera list and publish a "starting" state for each
 # one so the Live tiles don't show "pipeline offline" during the long
