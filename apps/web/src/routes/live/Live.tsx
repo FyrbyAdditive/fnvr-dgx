@@ -9,7 +9,19 @@ export function Live() {
     queryFn: api.listCameras,
     refetchInterval: 3_000,
   });
-  const events = useRecentDetections(100);
+  // Larger buffer so the FPS overlay has enough history for a smooth
+  // rolling rate (~5s at 30fps worst case).
+  const events = useRecentDetections(400);
+
+  // Persisted overlay toggle — localStorage so it survives reloads.
+  const [showStats, setShowStats] = useState<boolean>(() => {
+    try { return localStorage.getItem("fnvr.live.showStats") === "1"; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fnvr.live.showStats", showStats ? "1" : "0"); }
+    catch { /* sandboxed iframe, no-op */ }
+  }, [showStats]);
 
   // Group detections by camera, keeping only the freshest few per cam so
   // stale bboxes don't pile up. The SSE stream is already filtered to
@@ -26,6 +38,27 @@ export function Live() {
     return m;
   }, [events]);
 
+  // Inference FPS per camera. Unique-timestamps-per-5s-window heuristic:
+  // one inference frame publishes N events sharing the same ts, so the
+  // count of distinct timestamps in the last 5s ≈ frames/s × 5.
+  const fpsByCamera = useMemo(() => {
+    const now = Date.now();
+    const WINDOW_MS = 5000;
+    const perCam = new Map<string, Set<string>>();
+    for (const e of events) {
+      const t = new Date(e.ts).getTime();
+      if (now - t > WINDOW_MS) continue;
+      let s = perCam.get(e.camera_id);
+      if (!s) { s = new Set(); perCam.set(e.camera_id, s); }
+      s.add(e.ts);
+    }
+    const out = new Map<string, number>();
+    for (const [cam, set] of perCam) {
+      out.set(cam, set.size / (WINDOW_MS / 1000));
+    }
+    return out;
+  }, [events]);
+
   const grid =
     cameras.length <= 1 ? "grid-cols-1" :
     cameras.length <= 4 ? "grid-cols-2" :
@@ -33,11 +66,24 @@ export function Live() {
     "grid-cols-4";
 
   return (
-    <div className="p-4 h-full">
+    <div className="p-4 h-full flex flex-col gap-2">
+      <div className="flex justify-end">
+        <button
+          onClick={() => setShowStats((v) => !v)}
+          className={`text-xs px-2 py-1 rounded ${
+            showStats
+              ? "bg-neutral-800 text-white"
+              : "bg-neutral-900 text-neutral-400 hover:text-white"
+          }`}
+          title="Toggle detection-FPS overlay on each tile"
+        >
+          {showStats ? "hide stats" : "show stats"}
+        </button>
+      </div>
       {cameras.length === 0 ? (
         <EmptyState />
       ) : (
-        <div className={`grid gap-2 ${grid} h-full`}>
+        <div className={`grid gap-2 ${grid} flex-1 min-h-0`}>
           {cameras.map((c) => (
             <CameraTile
               key={c.id}
@@ -45,6 +91,8 @@ export function Live() {
               name={c.name}
               state={c.state}
               detections={boxesByCamera.get(c.id) ?? []}
+              inferenceFps={fpsByCamera.get(c.id) ?? 0}
+              showStats={showStats}
             />
           ))}
         </div>
@@ -53,11 +101,13 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, state, detections }: {
+function CameraTile({ id, name, state, detections, inferenceFps, showStats }: {
   id: string;
   name: string;
   state?: "starting" | "running" | "failed" | "unknown";
   detections: DetectionEvent[];
+  inferenceFps: number;
+  showStats: boolean;
 }) {
   // WebRTC live view. Falls back to the 1-fps JPEG snapshot below if the
   // peer connection can't be established (camera not streaming, browser
@@ -130,6 +180,46 @@ function CameraTile({ id, name, state, detections }: {
   const [imgOk, setImgOk] = useState(true);
   useEffect(() => { setImgOk(true); }, [id]);
 
+  // Preview FPS — tracked by counting successful image loads in the last
+  // 5s. For WebRTC we register a requestVideoFrameCallback. Both feed
+  // the same displayed number ("preview fps") so the user sees the
+  // effective on-screen refresh rate regardless of which path renders.
+  const previewTicksRef = useRef<number[]>([]);
+  const [previewFps, setPreviewFps] = useState(0);
+  const tickPreview = () => {
+    const now = Date.now();
+    previewTicksRef.current.push(now);
+    // Keep only last 5s.
+    while (previewTicksRef.current.length > 0 &&
+           now - previewTicksRef.current[0] > 5000) {
+      previewTicksRef.current.shift();
+    }
+  };
+  useEffect(() => {
+    const h = setInterval(() => {
+      const arr = previewTicksRef.current;
+      setPreviewFps(arr.length / 5);
+    }, 500);
+    return () => clearInterval(h);
+  }, []);
+
+  // Hook rVFC for WebRTC frames when the track is live.
+  useEffect(() => {
+    if (!rtcLive || !videoRef.current) return;
+    const v = videoRef.current as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+    };
+    if (!v.requestVideoFrameCallback) return;
+    let cancelled = false;
+    const step = () => {
+      if (cancelled) return;
+      tickPreview();
+      v.requestVideoFrameCallback!(step);
+    };
+    v.requestVideoFrameCallback(step);
+    return () => { cancelled = true; };
+  }, [rtcLive]);
+
   const latest = detections[0];
 
   // Source aspect ratio — starts at 16:9 and refines once the media loads
@@ -161,6 +251,7 @@ function CameraTile({ id, name, state, detections }: {
             src={src}
             alt={name}
             onLoad={(e) => {
+              tickPreview();
               const im = e.currentTarget;
               if (im.naturalWidth && im.naturalHeight) setAspect(im.naturalWidth / im.naturalHeight);
             }}
@@ -188,6 +279,17 @@ function CameraTile({ id, name, state, detections }: {
         </div>
       )}
       {state && state !== "running" && <StateBadge state={state} />}
+      {showStats && (
+        <div className="absolute bottom-2 right-2 text-[10px] font-mono bg-black/70 text-neutral-200 px-2 py-0.5 rounded space-x-2">
+          <span title="Preview refresh (JPEG img onLoad or WebRTC rVFC)">
+            preview {previewFps.toFixed(1)} fps
+          </span>
+          <span className="opacity-60">·</span>
+          <span title="Inference frames per second (unique detection timestamps /s)">
+            infer {inferenceFps.toFixed(1)} fps
+          </span>
+        </div>
+      )}
     </div>
   );
 }
