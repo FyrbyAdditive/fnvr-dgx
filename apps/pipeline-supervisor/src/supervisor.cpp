@@ -131,6 +131,14 @@ void Supervisor::workerMain(Worker* w) {
         w->child_pid = pid;
         std::cerr << "worker[" << w->cam.id << "]: spawned pid " << pid << "\n";
 
+        // Remember the hour we started in; we force a restart at the top
+        // of the next hour so the child writes into the new YYYY/MM/DD/HH
+        // directory. Without this, a worker that's up for 24h writes a
+        // 100+ GB rec.mp4 into its birth hour's folder.
+        auto start_hour = std::chrono::time_point_cast<std::chrono::hours>(
+            std::chrono::system_clock::now());
+        bool hourly_rotate = false;
+
         // Wait for the child to exit, polling so we can react to w->stop.
         int status = 0;
         while (!stop_ && !w->stop) {
@@ -139,6 +147,22 @@ void Supervisor::workerMain(Worker* w) {
             if (got < 0 && errno != EINTR) {
                 std::cerr << "worker[" << w->cam.id << "]: waitpid err: "
                           << strerror(errno) << "\n";
+                break;
+            }
+            auto now_hour = std::chrono::time_point_cast<std::chrono::hours>(
+                std::chrono::system_clock::now());
+            if (now_hour > start_hour) {
+                std::cerr << "worker[" << w->cam.id
+                          << "]: hourly rotation — restarting pid " << pid << "\n";
+                hourly_rotate = true;
+                kill(pid, SIGTERM);
+                for (int i = 0; i < 50 && waitpid(pid, &status, WNOHANG) == 0; i++) {
+                    std::this_thread::sleep_for(100ms);
+                }
+                if (waitpid(pid, &status, WNOHANG) == 0) {
+                    kill(pid, SIGKILL);
+                    waitpid(pid, &status, 0);
+                }
                 break;
             }
             std::this_thread::sleep_for(500ms);
@@ -165,6 +189,12 @@ void Supervisor::workerMain(Worker* w) {
             int sig = WTERMSIG(status);
             std::cerr << "worker[" << w->cam.id << "]: killed by signal "
                       << sig << " — likely gst assertion\n";
+        }
+
+        if (hourly_rotate) {
+            // Healthy restart; don't back off.
+            backoff_ms = 1000;
+            continue;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));

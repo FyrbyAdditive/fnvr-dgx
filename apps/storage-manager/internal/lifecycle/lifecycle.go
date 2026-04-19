@@ -20,10 +20,27 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// freeSpacePercent returns the free space percentage (0..100) of the
+// filesystem containing `path`. Uses statfs; falls back to error on
+// missing / unreadable paths so the caller can skip the check.
+func freeSpacePercent(path string) (float64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	total := stat.Blocks * uint64(stat.Bsize)
+	avail := stat.Bavail * uint64(stat.Bsize)
+	if total == 0 {
+		return 0, fmt.Errorf("total blocks == 0")
+	}
+	return 100.0 * float64(avail) / float64(total), nil
+}
 
 type Config struct {
 	DatabaseURL   string
@@ -78,13 +95,73 @@ func (m *Manager) tick(ctx context.Context) error {
 	if err := m.applyQuota(ctx); err != nil {
 		return err
 	}
+	if err := m.applyDiskPressure(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyDiskPressure drops the oldest indexed segments when the recordings
+// filesystem drops below a free-space floor. Runs as the last guard after
+// retention + quota — those are the intended policies; this is "don't let
+// the disk fill up whatever happens".
+func (m *Manager) applyDiskPressure(ctx context.Context) error {
+	freePct, err := freeSpacePercent(m.cfg.RecordingsDir)
+	if err != nil {
+		return nil // don't fail a tick over a stat error
+	}
+	// Log health every ~5 min (every 10 ticks at 30s interval).
+	if freePct < 10.0 {
+		slog.Warn("disk pressure: dropping oldest segments", "free_pct", freePct)
+	}
+	// Drop to maintain >= 10% free. Operators with larger safety needs can
+	// tune this later; 10% of 2TB = 200GB, plenty of headroom.
+	const minFreePct = 10.0
+	if freePct >= minFreePct {
+		return nil
+	}
+
+	rows, err := m.pool.Query(ctx, `
+		SELECT id, path, bytes FROM segments
+		WHERE protected = FALSE
+		ORDER BY started_at ASC
+		LIMIT 500`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	dropped := 0
+	for rows.Next() {
+		var id, size int64
+		var path string
+		if err := rows.Scan(&id, &path, &size); err != nil {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		_, _ = m.pool.Exec(ctx, `DELETE FROM segments WHERE id=$1`, id)
+		dropped++
+		// Re-check free space every 20 files so we stop as soon as we're
+		// above the floor rather than dumping the whole oldest batch.
+		if dropped%20 == 0 {
+			if pct, err := freeSpacePercent(m.cfg.RecordingsDir); err == nil && pct >= minFreePct {
+				break
+			}
+		}
+	}
+	if dropped > 0 {
+		slog.Warn("disk pressure purged", "count", dropped)
+	}
 	return nil
 }
 
 // indexNewSegments walks recordings dir and upserts any segment not in the DB.
 // Directory layout (set by the pipeline):
 //
-//	<root>/YYYY/MM/DD/HH/<camera-id>/seg-NNNNN.mp4
+//	<root>/YYYY/MM/DD/HH/<camera-id>/seg-NNNNN.mp4   (old splitmuxsink layout)
+//	<root>/YYYY/MM/DD/HH/<camera-id>/rec.mp4          (current mp4mux+filesink)
+//	<root>/YYYY/MM/DD/HH/<camera-id>/rec-NNNNN.mp4    (future hourly rotation)
 func (m *Manager) indexNewSegments(ctx context.Context) error {
 	root := m.cfg.RecordingsDir
 	info, err := os.Stat(root)
@@ -98,7 +175,7 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 		return fmt.Errorf("%s is not a directory", root)
 	}
 
-	segRe := regexp.MustCompile(`seg-\d+\.mp4$`)
+	segRe := regexp.MustCompile(`^(seg-\d+|rec(-\d+)?)\.mp4$`)
 
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
