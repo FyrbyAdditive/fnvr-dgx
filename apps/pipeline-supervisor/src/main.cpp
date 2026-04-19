@@ -50,13 +50,20 @@ int main(int argc, char** argv) {
         // Announce "starting" before Start() so the UI can show progress
         // during the TRT engine build (first run after cache wipe: 60-90s).
         // Pipeline will publish "running" itself on reaching PLAYING.
+        //
+        // Subject: fnvr.state.camera.<id>. This is a JetStream-backed
+        // last-value stream (declared by api-server) so a fresh api-server
+        // subscriber immediately sees the current state for every camera,
+        // instead of being stuck at "unknown" until a worker happens to
+        // (re)start.
+        const std::string subj = "fnvr.state.camera." + cam.id;
         {
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"starting\"}";
-            nats.Publish("fnvr.events.system.camera", payload);
+            nats.Publish(subj, payload);
         }
         if (!p.Start()) {
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"failed\"}";
-            nats.Publish("fnvr.events.system.camera", payload);
+            nats.Publish(subj, payload);
             std::cerr << "worker[" << cam.id << "]: start failed\n";
             return 2;
         }

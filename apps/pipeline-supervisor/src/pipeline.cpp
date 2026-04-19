@@ -429,8 +429,10 @@ gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer use
                 GstState oldS, newS;
                 gst_message_parse_state_changed(msg, &oldS, &newS, nullptr);
                 if (newS == GST_STATE_PLAYING && self->nats_) {
+                    // Last-value stream on api-server side — see state.go.
+                    std::string subj = "fnvr.state.camera." + self->cam_.id;
                     std::string payload = "{\"camera_id\":\"" + self->cam_.id + "\",\"state\":\"running\"}";
-                    self->nats_->Publish("fnvr.events.system.camera", payload);
+                    self->nats_->Publish(subj, payload);
                 }
             }
             break;

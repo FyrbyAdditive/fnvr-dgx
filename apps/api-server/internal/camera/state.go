@@ -3,27 +3,48 @@ package camera
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// StateTracker subscribes to fnvr.events.system.camera and keeps the latest
-// known state per camera (starting | running | failed). States older than
-// 10 minutes with no update are treated as unknown.
+// StateTracker keeps the latest known pipeline state per camera:
+// "starting" | "running" | "failed". Older-than-10-minute states are
+// returned as unknown so a crashed worker doesn't advertise "running"
+// forever.
+//
+// Backed by a JetStream "last-value" stream (MaxMsgsPerSubject=1): when a
+// new api-server starts up, replaying the stream gives us the current
+// state per camera even if the publisher (pipeline worker) hasn't said
+// anything in a while. Previously this was a plain NATS subscribe, which
+// meant an api-server restart left all cameras stuck at "unknown" until
+// workers happened to emit a fresh state transition — which they only
+// do on (re)start.
 type StateTracker struct {
 	nc *nats.Conn
+	js jetstream.JetStream
 
 	mu      sync.RWMutex
 	entries map[string]stateEntry
 }
 
 type stateEntry struct {
-	State    string
-	Stamped  time.Time
+	State   string
+	Stamped time.Time
 }
+
+const (
+	// streamName is stable; safe to change only with a corresponding drop.
+	streamName = "FNVR_CAMERA_STATE"
+	// subjectPrefix — the wildcard subject the stream owns. Publishers use
+	// fnvr.state.camera.<camera_id>.
+	subjectFilter = "fnvr.state.camera.*"
+)
 
 func NewStateTracker(natsURL string) (*StateTracker, error) {
 	nc, err := nats.Connect(natsURL,
@@ -34,29 +55,71 @@ func NewStateTracker(natsURL string) (*StateTracker, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &StateTracker{nc: nc, entries: map[string]stateEntry{}}, nil
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("jetstream: %w", err)
+	}
+	return &StateTracker{nc: nc, js: js, entries: map[string]stateEntry{}}, nil
 }
 
 func (t *StateTracker) Start(ctx context.Context) error {
-	_, err := t.nc.Subscribe("fnvr.events.system.camera", func(m *nats.Msg) {
+	// Declare the stream idempotently. MaxMsgsPerSubject=1 makes this a
+	// last-value store — only the newest publish per camera is retained,
+	// the rest are auto-discarded. Storage=memory because this is live
+	// state; we don't care about persisting it across a NATS restart.
+	cfg := jetstream.StreamConfig{
+		Name:              streamName,
+		Subjects:          []string{subjectFilter},
+		Retention:         jetstream.LimitsPolicy,
+		Discard:           jetstream.DiscardOld,
+		MaxMsgsPerSubject: 1,
+		Storage:           jetstream.MemoryStorage,
+	}
+	if _, err := t.js.CreateOrUpdateStream(ctx, cfg); err != nil {
+		return fmt.Errorf("create stream: %w", err)
+	}
+
+	// Ephemeral consumer with DeliverAllPolicy. Because the stream has
+	// MaxMsgsPerSubject=1, "all" is exactly the latest message per
+	// camera — which is what we want on startup. After that, new
+	// publishes stream in live.
+	cons, err := t.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckPolicy:     jetstream.AckNonePolicy,
+		FilterSubject: subjectFilter,
+	})
+	if err != nil {
+		return fmt.Errorf("create consumer: %w", err)
+	}
+
+	_, err = cons.Consume(func(m jetstream.Msg) {
 		var msg struct {
 			CameraID string `json:"camera_id"`
 			State    string `json:"state"`
 		}
-		if err := json.Unmarshal(m.Data, &msg); err != nil {
+		if err := json.Unmarshal(m.Data(), &msg); err != nil {
 			slog.Warn("camera-state: bad payload", "err", err)
 			return
 		}
 		if msg.CameraID == "" || msg.State == "" {
 			return
 		}
+		// Prefer the server-stamped time when available so replays on
+		// startup don't look newer than they actually are; fall back to
+		// now when metadata is missing (shouldn't happen for JS msgs).
+		stamped := time.Now()
+		if meta, err := m.Metadata(); err == nil && !meta.Timestamp.IsZero() {
+			stamped = meta.Timestamp
+		}
 		t.mu.Lock()
-		t.entries[msg.CameraID] = stateEntry{State: msg.State, Stamped: time.Now()}
+		t.entries[msg.CameraID] = stateEntry{State: msg.State, Stamped: stamped}
 		t.mu.Unlock()
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("consume: %w", err)
 	}
+
 	go func() {
 		<-ctx.Done()
 		_ = t.nc.Drain()
@@ -84,3 +147,8 @@ func (t *StateTracker) State(cameraID string) (string, bool) {
 	}
 	return e.State, true
 }
+
+// Unused import guard — we want to surface jetstream.ErrNoStreamResponse
+// style errors clearly if the broker is unreachable, but errors.Is isn't
+// used yet. Left referenced so linters don't strip the import.
+var _ = errors.Is
