@@ -79,6 +79,10 @@ export function Timeline() {
             <span className="inline-block w-0.5 h-3 bg-amber-400/80" />
             detection ({detections.length})
           </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block w-0.5 h-3 bg-emerald-400" />
+            now
+          </span>
         </div>
       </header>
 
@@ -145,6 +149,17 @@ function TimelineRuler({
 }) {
   const dayMs = to.getTime() - from.getTime();
   const ref = useRef<HTMLDivElement>(null);
+
+  // "Now" marker — shown only when the currently-viewed day window
+  // contains the present time. Ticks every 10s, which is finer than the
+  // ruler can visibly resolve at 24h wide.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const h = setInterval(() => setNow(Date.now()), 10_000);
+    return () => clearInterval(h);
+  }, []);
+  const nowInWindow = now >= from.getTime() && now < to.getTime();
+  const nowPct = nowInWindow ? ((now - from.getTime()) / dayMs) * 100 : 0;
 
   const pct = (d: Date) => ((d.getTime() - from.getTime()) / dayMs) * 100;
 
@@ -215,6 +230,22 @@ function TimelineRuler({
             className="absolute top-0 bottom-0 w-px bg-red-500 pointer-events-none"
             style={{ left: `${(cursorMs / dayMs) * 100}%` }}
           />
+        )}
+        {/* "now" marker — green full-height line with a small time chip */}
+        {nowInWindow && (
+          <>
+            <div
+              className="absolute top-0 bottom-0 w-px bg-emerald-400 pointer-events-none"
+              style={{ left: `${nowPct}%` }}
+              title={`now · ${new Date(now).toLocaleTimeString()}`}
+            />
+            <div
+              className="absolute top-0 text-[10px] bg-emerald-500/80 text-black px-1 rounded-sm pointer-events-none -translate-x-1/2 tabular-nums"
+              style={{ left: `${nowPct}%` }}
+            >
+              now
+            </div>
+          </>
         )}
       </div>
     </div>
