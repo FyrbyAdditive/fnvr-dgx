@@ -1,12 +1,17 @@
 import { FormEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { api, NotificationChannel, NotificationSubscription, Rule } from "@/lib/api";
 
 export function Rules() {
   const qc = useQueryClient();
   const { data: rules = [] } = useQuery({ queryKey: ["rules"], queryFn: api.listRules });
   const { data: zones = [] } = useQuery({ queryKey: ["zones"], queryFn: () => api.listZones() });
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
+  const { data: channels = [] } = useQuery({ queryKey: ["channels"], queryFn: api.listChannels });
+  const { data: subscriptions = [] } = useQuery({
+    queryKey: ["subscriptions"],
+    queryFn: () => api.listSubscriptions(),
+  });
 
   const createRule = useMutation({
     mutationFn: api.createRule,
@@ -99,29 +104,123 @@ export function Rules() {
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800">
             {rules.map((r) => (
-              <li key={r.id} className="p-3 flex items-center gap-3 text-sm">
-                <div className="flex-1">
-                  <div className="font-medium">{r.name}</div>
-                  <div className="text-xs text-neutral-500">
-                    {(r.definition.classes ?? []).join(", ")}
-                    {r.definition.camera_id && ` · ${r.definition.camera_id}`}
-                    {` · ≥${Math.round((r.definition.min_confidence ?? 0) * 100)}%`}
-                    {` · ${r.definition.severity ?? "info"}`}
-                  </div>
-                </div>
-                <button className="text-xs text-neutral-400 hover:underline"
-                  onClick={() => toggleRule.mutate({ id: r.id, enabled: r.enabled })}>
-                  {r.enabled ? "disable" : "enable"}
-                </button>
-                <button className="text-xs text-red-400 hover:underline"
-                  onClick={() => deleteRule.mutate(r.id)}>
-                  delete
-                </button>
-              </li>
+              <RuleRow
+                key={r.id}
+                rule={r}
+                channels={channels}
+                subscriptions={subscriptions.filter((s) => s.rule_id === r.id)}
+                onToggle={() => toggleRule.mutate({ id: r.id, enabled: r.enabled })}
+                onDelete={() => deleteRule.mutate(r.id)}
+              />
             ))}
           </ul>
         )}
       </section>
     </div>
+  );
+}
+
+function RuleRow({ rule, channels, subscriptions, onToggle, onDelete }: {
+  rule: Rule;
+  channels: NotificationChannel[];
+  subscriptions: NotificationSubscription[];
+  onToggle: () => void;
+  onDelete: () => void;
+}) {
+  const qc = useQueryClient();
+  const [addChannelID, setAddChannelID] = useState("");
+
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["subscriptions"] });
+  const addSub = useMutation({ mutationFn: api.createSubscription, onSuccess: invalidate });
+  const delSub = useMutation({ mutationFn: api.deleteSubscription, onSuccess: invalidate });
+
+  const subscribedIDs = new Set(subscriptions.map((s) => s.channel_id));
+  const available = channels.filter((c) => !subscribedIDs.has(c.id));
+
+  const handleAdd = () => {
+    if (!addChannelID) return;
+    addSub.mutate({
+      channel_id: addChannelID,
+      rule_id: rule.id,
+      min_severity: "info",
+    });
+    setAddChannelID("");
+  };
+
+  return (
+    <li className="p-3 text-sm">
+      <div className="flex items-center gap-3">
+        <div className="flex-1">
+          <div className="font-medium">{rule.name}</div>
+          <div className="text-xs text-neutral-500">
+            {(rule.definition.classes ?? []).join(", ")}
+            {rule.definition.camera_id && ` · ${rule.definition.camera_id}`}
+            {` · ≥${Math.round((rule.definition.min_confidence ?? 0) * 100)}%`}
+            {` · ${rule.definition.severity ?? "info"}`}
+          </div>
+        </div>
+        <button className="text-xs text-neutral-400 hover:underline" onClick={onToggle}>
+          {rule.enabled ? "disable" : "enable"}
+        </button>
+        <button className="text-xs text-red-400 hover:underline" onClick={onDelete}>
+          delete
+        </button>
+      </div>
+
+      <div className="mt-2 pl-2 border-l-2 border-neutral-800 text-xs flex flex-wrap items-center gap-2">
+        <span className="text-neutral-500">notifies:</span>
+        {subscriptions.length === 0 && (
+          <span className="text-neutral-600 italic">no channels</span>
+        )}
+        {subscriptions.map((s) => {
+          const c = channels.find((c) => c.id === s.channel_id);
+          return (
+            <span
+              key={s.id}
+              className="inline-flex items-center gap-1 bg-neutral-800 rounded px-2 py-0.5"
+            >
+              {c ? `${c.name} (${c.kind})` : s.channel_id.slice(0, 8)}
+              <button
+                className="text-red-400 hover:text-red-300"
+                onClick={() => delSub.mutate(s.id)}
+                title="unsubscribe"
+              >
+                ×
+              </button>
+            </span>
+          );
+        })}
+        {available.length > 0 && (
+          <>
+            <select
+              className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5"
+              value={addChannelID}
+              onChange={(e) => setAddChannelID(e.target.value)}
+            >
+              <option value="">+ add channel…</option>
+              {available.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.kind})
+                </option>
+              ))}
+            </select>
+            {addChannelID && (
+              <button
+                className="text-blue-400 hover:underline"
+                onClick={handleAdd}
+                disabled={addSub.isPending}
+              >
+                add
+              </button>
+            )}
+          </>
+        )}
+        {channels.length === 0 && (
+          <a href="/settings" className="text-blue-400 hover:underline">
+            create a channel
+          </a>
+        )}
+      </div>
+    </li>
   );
 }
