@@ -222,6 +222,20 @@ func (s *Store) AcknowledgeIncident(ctx context.Context, id string) error {
 	return nil
 }
 
+// DeleteIncident removes an incident row. Associated notification
+// deliveries and subscriptions stay intact (they reference by id and
+// will just stop matching). Returns ErrNotFound for unknown id.
+func (s *Store) DeleteIncident(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM incidents WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // scanJSON is a convenience wrapper used only to suppress unused warnings
 // when pgx.ErrNoRows is imported elsewhere; left in so future callers can
 // resolve via this package.

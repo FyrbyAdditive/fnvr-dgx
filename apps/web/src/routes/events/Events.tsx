@@ -16,6 +16,10 @@ export function Events() {
     mutationFn: api.ackIncident,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["incidents"] }),
   });
+  const del = useMutation({
+    mutationFn: api.deleteIncident,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["incidents"] }),
+  });
 
   const openInTimeline = (cameraId: string, startedAt: string) =>
     navigate(
@@ -35,7 +39,7 @@ export function Events() {
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm">
             {incidents.map((i) => (
-              <li key={i.id} className={`grid grid-cols-[8rem_1fr_6rem] gap-2 items-center
+              <li key={i.id} className={`grid grid-cols-[8rem_1fr_9rem] gap-2 items-center
                 ${i.acknowledged ? "opacity-50" : ""}`}>
                 <button
                   type="button"
@@ -51,11 +55,23 @@ export function Events() {
                     <span className="text-neutral-400"> · {i.summary}</span>
                   </span>
                 </button>
-                <button className={`text-xs px-2 py-2 text-right ${i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}`}
-                  onClick={() => !i.acknowledged && ack.mutate(i.id)}
-                  disabled={i.acknowledged}>
-                  {i.acknowledged ? "ack'd" : "acknowledge"}
-                </button>
+                <div className="flex items-center justify-end gap-3 pr-2 text-xs">
+                  <button
+                    className={i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}
+                    onClick={() => !i.acknowledged && ack.mutate(i.id)}
+                    disabled={i.acknowledged}
+                  >
+                    {i.acknowledged ? "ack'd" : "acknowledge"}
+                  </button>
+                  <button
+                    className="text-red-400 hover:underline"
+                    onClick={() => del.mutate(i.id)}
+                    disabled={del.isPending}
+                    title="Delete this incident"
+                  >
+                    delete
+                  </button>
+                </div>
               </li>
             ))}
           </ul>

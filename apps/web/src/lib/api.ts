@@ -161,6 +161,8 @@ export const api = {
   listIncidents: (limit = 100) => req<Incident[]>(`/incidents?limit=${limit}`),
   ackIncident: (id: string) =>
     req<void>(`/incidents/${id}/ack`, { method: "POST" }),
+  deleteIncident: (id: string) =>
+    req<void>(`/incidents/${id}`, { method: "DELETE" }),
 
   listSegments: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number } = {}) => {
     const p = new URLSearchParams();

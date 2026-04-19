@@ -143,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 
 			protected.HandleFunc("GET /api/v1/incidents", s.handleListIncidents)
 			protected.HandleFunc("POST /api/v1/incidents/{id}/ack", s.handleAckIncident)
+			protected.HandleFunc("DELETE /api/v1/incidents/{id}", s.handleDeleteIncident)
 		}
 
 		if s.events != nil {
@@ -656,6 +657,17 @@ func (s *Server) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAckIncident(w http.ResponseWriter, r *http.Request) {
 	if err := s.rules.AcknowledgeIncident(r.Context(), r.PathValue("id")); errors.Is(err, rules.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDeleteIncident(w http.ResponseWriter, r *http.Request) {
+	if err := s.rules.DeleteIncident(r.Context(), r.PathValue("id")); errors.Is(err, rules.ErrNotFound) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	} else if err != nil {
