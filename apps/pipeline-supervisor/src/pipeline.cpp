@@ -206,34 +206,63 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                      "rtsp://mediamtx:8554/usb0 instead (usb-bridge service).\n";
         return nullptr;
     } else {
-        // RTSP source: probe the codec (h264 vs h265) so we pick the right
-        // depay + parse + decoder. Reolink cams in particular name their
-        // paths "h264Preview_…" but deliver HEVC on newer firmware. Default
-        // to H.264 when probing fails (the older common case).
-        std::string codec = ProbeRtspCodec(url);
-        if (codec.empty()) codec = "h264";
-        std::cerr << "pipeline[" << cam_.id << "]: probed codec=" << codec << "\n";
+        // RTSP source: probe codec + dimensions. Reolink cams in particular
+        // name their paths "h264Preview_…" but deliver HEVC on newer
+        // firmware, and panorama cams (e.g. Duo 2) come in at 4608x1728.
+        // We keep the source's aspect ratio by deriving target dims from
+        // the probed size, capped to 1080 lines.
+        auto probe = ProbeRtsp(url);
+        if (probe.codec.empty()) probe.codec = "h264";
+        std::cerr << "pipeline[" << cam_.id << "]: probed codec=" << probe.codec
+                  << " size=" << probe.width << "x" << probe.height << "\n";
 
-        if (codec == "h265") {
+        if (probe.codec == "h265") {
+            // Compute aspect-preserving target. If we know source size,
+            // fit to max(1080) height; otherwise fall back to 1920x1080.
+            int tw = 1920, th = 1080;
+            if (probe.width > 0 && probe.height > 0) {
+                th = std::min(1080, probe.height);
+                // width scaled, rounded to even (H.264 4:2:0 needs even).
+                tw = static_cast<int>(
+                    static_cast<double>(th) * probe.width / probe.height + 0.5);
+                if (tw & 1) tw += 1;
+            }
+            // Clamp width to something sane (avoid ultra-wide 4K → 3520x1080
+            // for 21:9 panoramas is ok, but cap at 2880 to keep encoder
+            // within NVENC session budget).
+            if (tw > 2880) {
+                th = static_cast<int>(
+                    static_cast<double>(2880) * th / tw + 0.5);
+                if (th & 1) tw = (tw / 2880) * th; else tw = 2880;
+                tw = 2880;
+            }
+            std::cerr << "pipeline[" << cam_.id
+                      << "]: recording target=" << tw << "x" << th << "\n";
+
             p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
                  "rtph265depay ! h265parse config-interval=1 ! "
                  "video/x-h265,stream-format=byte-stream,alignment=au ! "
-                 // Re-mux H.265 into H.264 via NVDEC+NVENC so the rest of
-                 // the pipeline (recording + inference) only has to handle
-                 // one codec path. Decode on GPU → scale down (4K Reolinks
-                 // are common; 1080p is plenty for NVR) → re-encode on GPU.
-                 // Skipping the explicit scale makes the encoder produce
-                 // whatever the source is (e.g. 3840x2160), which then
-                 // breaks downstream videoscale stages that only constrain
-                 // width, producing wildly wrong aspect-ratio thumbnails.
+                 // Re-mux H.265 → H.264 via NVDEC+NVENC so the rest of
+                 // the pipeline only has to handle one codec path. Target
+                 // dims preserve source aspect ratio.
                  "nvv4l2decoder ! "
                  "nvvideoconvert ! "
-                 "video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080 ! "
+                 "video/x-raw(memory:NVMM),format=NV12,width=" << tw
+                 << ",height=" << th << " ! "
                  "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
                  "h264parse config-interval=1 ! ";
+            rec_width_ = tw;
+            rec_height_ = th;
         } else {
+            // Source is already H.264 — pass through the parsed elementary
+            // stream; downstream infers dims from the caps. Record at
+            // source resolution.
             p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
                  "rtph264depay ! h264parse config-interval=1 ! ";
+            if (probe.width > 0 && probe.height > 0) {
+                rec_width_ = probe.width;
+                rec_height_ = probe.height;
+            }
         }
     }
 
@@ -247,10 +276,18 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // specific to the USB pipeline shape; recording comes back when
     // we solve them properly (probably by app-level mp4 rotation).
     p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
+
+    // Use the probed recording dims if we have them, falling back to 1080p.
+    // enable-padding=1 tells nvstreammux to letterbox rather than stretch,
+    // preserving the source aspect — important for panorama cams.
+    int mux_w = rec_width_ > 0 ? rec_width_ : 1920;
+    int mux_h = rec_height_ > 0 ? rec_height_ : 1080;
+
     if (use_deepstream_ && is_v4l2) {
         p << "nvv4l2decoder ! "
-             "mux.sink_0 nvstreammux name=mux batch-size=1 width=1920 height=1080 "
-             "  live-source=1 batched-push-timeout=40000 ! "
+             "mux.sink_0 nvstreammux name=mux batch-size=1 "
+             "  width=" << mux_w << " height=" << mux_h
+             << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
              "fakesink sync=false ";
     } else if (use_deepstream_) {
@@ -258,8 +295,9 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         // elementary stream so it works from both source types. Memory
         // stays NVMM from nvv4l2decoder onward.
         p << "nvv4l2decoder ! "
-             "mux.sink_0 nvstreammux name=mux batch-size=1 width=1920 height=1080 "
-             "  live-source=1 batched-push-timeout=40000 ! "
+             "mux.sink_0 nvstreammux name=mux batch-size=1 "
+             "  width=" << mux_w << " height=" << mux_h
+             << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
              "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
              "nvvideoconvert ! "
              // H.264 (not H.265) for the recording branch: browsers play

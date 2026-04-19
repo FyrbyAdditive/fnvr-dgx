@@ -70,8 +70,15 @@ export function Timeline() {
           value={dayKey}
           onChange={(e) => setDayKey(e.target.value)}
         />
-        <div className="text-sm text-neutral-500">
-          {segments.length} segments · {detections.length} detections
+        <div className="flex items-center gap-3 text-xs text-neutral-500 ml-auto">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block w-3 h-2 bg-blue-600/60 rounded-sm" />
+            recording ({segments.length})
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block w-0.5 h-3 bg-amber-400/80" />
+            detection ({detections.length})
+          </span>
         </div>
       </header>
 
@@ -154,12 +161,19 @@ function TimelineRuler({
       <div
         ref={ref}
         onClick={handleClick}
-        className="relative h-24 bg-neutral-900 rounded cursor-crosshair"
+        className="relative h-28 bg-neutral-900 rounded cursor-crosshair"
       >
+        {/* row labels */}
+        <div className="absolute left-1 top-[28%] -translate-y-1/2 text-[10px] text-neutral-400 pointer-events-none">
+          recording
+        </div>
+        <div className="absolute left-1 top-[73%] -translate-y-1/2 text-[10px] text-neutral-400 pointer-events-none">
+          detections
+        </div>
         {/* hour grid */}
         {hours.map((h) => (
           <div key={h}
-               className="absolute top-0 bottom-0 border-l border-neutral-800 text-[10px] text-neutral-600 pl-1"
+               className="absolute top-0 bottom-3 border-l border-neutral-800 text-[10px] text-neutral-600 pl-1"
                style={{ left: `${(h / 24) * 100}%` }}>
             {h.toString().padStart(2, "0")}
           </div>
@@ -176,7 +190,7 @@ function TimelineRuler({
             <div
               key={s.id}
               className="absolute bg-blue-600/60 hover:bg-blue-500/80"
-              style={{ left: `${left}%`, width: `${width}%`, top: "20%", height: "30%" }}
+              style={{ left: `${left}%`, width: `${width}%`, top: "18%", height: "22%" }}
               title={`${start.toLocaleTimeString()} → ${end.toLocaleTimeString()}`}
             />
           );
@@ -190,7 +204,7 @@ function TimelineRuler({
             <div
               key={d.id}
               className="absolute w-0.5 bg-amber-400/80"
-              style={{ left: `${p}%`, top: "60%", height: "30%" }}
+              style={{ left: `${p}%`, top: "60%", height: "25%" }}
               title={`${t.toLocaleTimeString()} · ${d.class_name} ${(d.confidence * 100).toFixed(0)}%`}
             />
           );

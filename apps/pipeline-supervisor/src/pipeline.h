@@ -43,6 +43,12 @@ private:
     std::atomic<bool> faulted_{false};
     std::unique_ptr<WhepServer> whep_;
 
+    // Target dimensions for the recording / inference branch. Zero until
+    // BuildPipeline has probed the source; caps for nvstreammux and the
+    // inference encoder key off these so aspect is preserved end-to-end.
+    int rec_width_ = 0;
+    int rec_height_ = 0;
+
 public:
     bool Faulted() const { return faulted_.load(); }
 };

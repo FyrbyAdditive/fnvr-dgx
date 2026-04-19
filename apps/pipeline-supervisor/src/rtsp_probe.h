@@ -4,14 +4,20 @@
 
 namespace fnvr {
 
-// ProbeRtspCodec opens the given RTSP URL just long enough to read the
-// video codec from the SDP, then closes. Returns "h264" or "h265" on
-// success; empty string on any failure (the caller should fall back to
-// a default).
-//
-// The probe uses GStreamer's discoverer which speaks RTSP DESCRIBE and
-// parses the SDP without starting a transport. Typical completion time
-// is ~1 second against a healthy camera.
+struct RtspProbeResult {
+    std::string codec;  // "h264" | "h265" | "" (unknown)
+    int width = 0;
+    int height = 0;
+};
+
+// ProbeRtsp opens the given RTSP URL just long enough to read the video
+// codec + dimensions from the SDP / first packets, then closes. On any
+// failure the fields are left empty/zero and the caller should fall back
+// to reasonable defaults.
+RtspProbeResult ProbeRtsp(const std::string& url);
+
+// Legacy helper — returns just the codec string. New code should use
+// ProbeRtsp() above.
 std::string ProbeRtspCodec(const std::string& url);
 
 }  // namespace fnvr
