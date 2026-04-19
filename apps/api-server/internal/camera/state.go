@@ -127,10 +127,15 @@ func (t *StateTracker) Start(ctx context.Context) error {
 	return nil
 }
 
-// State returns the last known state and true, or "", false if unknown or
-// stale. "running" entries stay fresh for 10 minutes; anything else for
-// 2 minutes (failed/starting both self-expire so a crashed worker doesn't
-// advertise a stale "starting" forever).
+// State returns the last known state and true, or "", false if unknown
+// or stale. Freshness window varies by state:
+//   - "running":   10 min (long — the supervisor re-publishes "running"
+//                  on every reconnect, so genuinely stuck workers time
+//                  out eventually).
+//   - "starting":  15 min (long — first-use TRT engine compiles can
+//                  take 10+ min on yolo26x; we don't want the UI to
+//                  flash "pipeline offline" mid-build).
+//   - other:       2 min  (failed / unexpected states self-expire).
 func (t *StateTracker) State(cameraID string) (string, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -139,8 +144,11 @@ func (t *StateTracker) State(cameraID string) (string, bool) {
 		return "", false
 	}
 	maxAge := 2 * time.Minute
-	if e.State == "running" {
+	switch e.State {
+	case "running":
 		maxAge = 10 * time.Minute
+	case "starting":
+		maxAge = 15 * time.Minute
 	}
 	if time.Since(e.Stamped) > maxAge {
 		return "", false
