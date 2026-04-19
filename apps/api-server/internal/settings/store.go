@@ -53,8 +53,13 @@ func (s *Store) Set(ctx context.Context, key string, value json.RawMessage) erro
 var validYoloVariants = map[string]struct{}{
 	"yolo26n": {}, "yolo26s": {}, "yolo26m": {}, "yolo26l": {}, "yolo26x": {},
 }
+// INT8 is technically wired but hits an upstream TRT assertion during
+// calibration on YOLO26 ONNX (see docs/known-issues.md). Disabled at
+// the validator layer until resolved. Remove the "commented" entry to
+// re-enable.
 var validPrecisions = map[string]struct{}{
-	"fp16": {}, "int8": {},
+	"fp16": {},
+	// "int8": {},  // disabled — see docs/known-issues.md
 }
 
 type Detector struct {

@@ -38,9 +38,12 @@ RUN git clone --depth 1 --branch ${NATS_C_VERSION} https://github.com/nats-io/na
 ARG DS_YOLO_COMMIT=master
 # OPENCV=1 compiles the INT8 calibrator into the custom parser .so.
 # Without it, the operator can't do on-device INT8 calibration and
-# must stay on FP16. OpenCV dev headers required for the build.
+# must stay on FP16. OpenCV dev headers required for the build;
+# libde265-0 is a runtime dep dragged in by libopencv (HEVC decoding
+# inside OpenCV's imgcodecs) — we already have it for ffmpeg/gst but
+# install explicitly to pin the presence.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopencv-dev \
+    libopencv-dev libde265-0 \
   && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch ${DS_YOLO_COMMIT} https://github.com/marcoslucianops/DeepStream-Yolo.git /tmp/ds-yolo \
   && cd /tmp/ds-yolo/nvdsinfer_custom_impl_Yolo \
@@ -139,6 +142,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx264-163 libx265-199 libxvidcore4 \
     libavcodec58 libavutil56 libavformat58 \
     libswresample3 libswscale5 libvpx7 libmp3lame0 libflac8 libmpg123-0 \
+    libde265-0 \
   && rm -rf /var/lib/apt/lists/*
 
 ENV FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/trafficcamnet.txt

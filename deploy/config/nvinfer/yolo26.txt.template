@@ -31,6 +31,12 @@ symmetric-padding=1
 cluster-mode=4
 parse-bbox-func-name=NvDsInferParseYolo
 custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_Yolo.so
+# Route engine creation through the custom lib's entry function so it
+# can inject the INT8 calibrator (for INT8 runs) or the ONNX parser
+# with YOLO-specific shape handling. Without this, DeepStream's stock
+# engine builder runs and bails out with "INT8 calibration file not
+# specified" because it doesn't see the custom lib's calibrator path.
+engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 [class-attrs-all]
 pre-cluster-threshold=0.25

@@ -58,3 +58,35 @@ Several contributing factors isolated and fixed; one remains. Detailed narrative
 Next investigation: `strace -f -e trace=openat,read,ioctl` on the **host**'s working `gst-launch-1.0 ... ! nvv4l2h264enc ! fakesink` and diff against the container's trace filtered to `/sys`, `/proc`, `/dev`, `/tmp`, `/var` opens. The divergence point will be in the first few hundred syscalls.
 
 **Pragmatic stance for now.** Stack runs in `FNVR_USE_DEEPSTREAM=0` (pure record) while this is unblocked. Rules engine, SSE live events, and the whole web UI work end-to-end already — they can consume detections from *any* source, including one produced off-Jetson (e.g. sidecar Triton or CPU-side inference), so shipping can progress without this resolved.
+
+## YOLO26 INT8 calibration fails on DeepStream-Yolo (JetPack 6.2 / TRT 10.3)
+
+**Symptoms.** Switching the detector to INT8 in Settings triggers the
+DeepStream-Yolo calibrator, which produces a TRT assertion and SIGSEGVs
+the worker in a tight loop:
+
+```
+WARNING: INT8 calibration file not specified/accessible. INT8 calibration
+         can be done through setDynamicRange API in 'NvDsInferCreateNetwork'
+Building the TensorRT Engine
+File does not exist: /var/lib/fnvr/models/yolo26/yolo26x.calib.table
+ERROR: [TRT]: [checkSanity.cpp::checkLinks::218] Error Code 2: Internal Error
+  (Assertion item.second != nullptr failed. region should have been removed
+  from Graph::regions)
+worker[...]: killed by signal 11
+```
+
+**Config.** Plugin compiled with `OPENCV=1`; nvinfer config includes
+`engine-create-func-name=NvDsInferYoloCudaEngineGet`,
+`int8-calib-file=<nonexistent>`, `INT8_CALIB_IMG_PATH` env set, ≥100
+calibration JPEGs available on disk.
+
+**Status.** Interpreted as an upstream TRT 10.3 bug interacting with
+the YOLO26 ONNX graph topology during INT8 quantisation. FP16 builds
+fine from the same ONNX, which isolates the issue to INT8 path.
+
+**Workaround.** INT8 option is disabled in the Settings UI + API
+validator. FP16 is the default and only supported precision until
+upstream fixes land. Revisit when NVIDIA ships TRT 10.5+ with
+DeepStream 7.2+ or when DeepStream-Yolo publishes a YOLO26 INT8
+workaround.

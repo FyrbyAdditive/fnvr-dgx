@@ -101,16 +101,14 @@ function Detector() {
                 checked={precision === "fp16"}
                 onChange={() => setPrecision("fp16")}
               />
-              FP16 (default)
+              FP16
             </label>
-            <label className="inline-flex items-center gap-1">
-              <input
-                type="radio"
-                name="precision"
-                checked={precision === "int8"}
-                onChange={() => setPrecision("int8")}
-              />
-              INT8 (~1.5–2× faster, first use triggers ~5 min calibration)
+            <label
+              className="inline-flex items-center gap-1 text-neutral-500"
+              title="INT8 via DeepStream-Yolo's calibrator is disabled pending an upstream TRT fix — see docs/known-issues.md"
+            >
+              <input type="radio" name="precision" disabled />
+              INT8 (temporarily disabled)
             </label>
           </div>
         </div>
