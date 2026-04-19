@@ -46,6 +46,19 @@ export function Timeline() {
   const [zoom, setZoom] = useState<{ from: number; to: number }>({ from: 0, to: 1 });
   const resetZoom = () => setZoom({ from: 0, to: 1 });
 
+  // Optional: overlay bounding boxes + class labels on the player, fed
+  // from the detections endpoint (PG for recent, sidecar JSONL for
+  // older clips). Persisted via localStorage so the choice survives
+  // reloads, matching the Live page's "show stats" pattern.
+  const [showOverlay, setShowOverlay] = useState<boolean>(() => {
+    try { return localStorage.getItem("fnvr.timeline.showOverlay") === "1"; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fnvr.timeline.showOverlay", showOverlay ? "1" : "0"); }
+    catch { /* sandboxed iframe, no-op */ }
+  }, [showOverlay]);
+
   const activeClip = useMemo(() => {
     if (cursorMs == null) return null;
     const cursor = new Date(from.getTime() + cursorMs);
@@ -109,6 +122,17 @@ export function Timeline() {
             zoom: {msToHHMM(zoom.from * dayRangeMs(from, to))} – {msToHHMM(zoom.to * dayRangeMs(from, to))} ⟳
           </button>
         )}
+        <button
+          onClick={() => setShowOverlay((v) => !v)}
+          className={`text-xs px-2 py-1 rounded border ${
+            showOverlay
+              ? "bg-amber-700/70 border-amber-600 text-amber-100"
+              : "bg-neutral-900 border-neutral-700 text-neutral-400 hover:text-white"
+          }`}
+          title="Draw bounding boxes + class labels on the recorded video using detections from the sidecar"
+        >
+          {showOverlay ? "overlay on" : "overlay off"}
+        </button>
         <div className="flex items-center gap-3 text-xs text-neutral-500 ml-auto">
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block w-3 h-2 bg-blue-600/60 rounded-sm" />
@@ -126,7 +150,11 @@ export function Timeline() {
       </header>
 
       <div className="rounded bg-neutral-900 overflow-hidden relative">
-        <Player clip={activeClip} onEnded={handleClipEnded} />
+        <Player
+          clip={activeClip}
+          onEnded={handleClipEnded}
+          detections={showOverlay ? detections : undefined}
+        />
       </div>
 
       <TimelineRuler
@@ -148,9 +176,14 @@ export function Timeline() {
 function Player({
   clip,
   onEnded,
+  detections,
 }: {
   clip: { segment: Segment; offsetSec: number } | null;
   onEnded: () => void;
+  /** If provided, draw bounding boxes + class labels on the player
+   *  using detections whose ts is near the current video frame. If
+   *  undefined, overlay is disabled (default). */
+  detections?: HistoricDetection[];
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   const url = clip ? api.segmentFileUrl(clip.segment.id) : "";
@@ -165,6 +198,54 @@ function Player({
     else v.addEventListener("loadedmetadata", seek, { once: true });
   }, [clip]);
 
+  // Track the video's wall-clock timestamp while it plays so the
+  // overlay below can redraw boxes as frames advance. rVFC fires per
+  // decoded frame when supported; fallback to a 10Hz rAF-ish timer.
+  const [wallMs, setWallMs] = useState<number | null>(null);
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 16, h: 9 });
+  useEffect(() => {
+    if (!clip || detections === undefined || !ref.current) {
+      setWallMs(null);
+      return;
+    }
+    const v = ref.current as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+    };
+    const segStart = new Date(clip.segment.started_at).getTime();
+    let cancelled = false;
+    const push = () => {
+      if (cancelled) return;
+      setWallMs(segStart + v.currentTime * 1000);
+    };
+    if (typeof v.requestVideoFrameCallback === "function") {
+      const step = () => {
+        if (cancelled) return;
+        push();
+        v.requestVideoFrameCallback!(step);
+      };
+      v.requestVideoFrameCallback!(step);
+    } else {
+      const h = setInterval(push, 100);
+      return () => { cancelled = true; clearInterval(h); };
+    }
+    return () => { cancelled = true; };
+  }, [clip, detections]);
+
+  // Observe intrinsic video size so the overlay can size a matching
+  // letterboxed inner frame (same trick Live tiles use).
+  useEffect(() => {
+    if (!ref.current) return;
+    const v = ref.current;
+    const update = () => {
+      if (v.videoWidth && v.videoHeight) {
+        setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+      }
+    };
+    v.addEventListener("loadedmetadata", update);
+    update();
+    return () => v.removeEventListener("loadedmetadata", update);
+  }, [clip]);
+
   if (!clip) {
     return (
       <div className="h-full flex items-center justify-center text-neutral-500 text-sm">
@@ -172,18 +253,137 @@ function Player({
       </div>
     );
   }
+
+  // When overlay is on, compute which detections are "current" for
+  // the active video frame. Window is ±250ms which covers ~15 fps
+  // detection rates and keeps latest boxes visible across skipped
+  // frames.
+  let active: HistoricDetection[] = [];
+  if (detections && wallMs != null) {
+    const lo = wallMs - 250;
+    const hi = wallMs + 250;
+    for (const d of detections) {
+      const t = new Date(d.ts).getTime();
+      if (t >= lo && t <= hi) active.push(d);
+    }
+  }
+
   return (
-    <video
-      ref={ref}
-      key={clip.segment.id}
-      src={url}
-      controls
-      autoPlay
-      playsInline
-      onEnded={onEnded}
-      className="w-full h-full object-contain bg-black"
-    />
+    <div className="relative w-full h-full flex items-center justify-center">
+      <video
+        ref={ref}
+        key={clip.segment.id}
+        src={url}
+        controls
+        autoPlay
+        playsInline
+        onEnded={onEnded}
+        className="w-full h-full object-contain bg-black"
+      />
+      {/* Overlay container mirrors the video's letterboxed content box
+          so bbox coords (0..1 of source) land on the actual visible
+          pixels, not on the black bars. */}
+      {detections !== undefined && active.length > 0 && (
+        <PlayerOverlay
+          videoRef={ref}
+          videoSize={videoSize}
+          detections={active}
+        />
+      )}
+    </div>
   );
+}
+
+function PlayerOverlay({
+  videoRef,
+  videoSize,
+  detections,
+}: {
+  videoRef: React.RefObject<HTMLVideoElement>;
+  videoSize: { w: number; h: number };
+  detections: HistoricDetection[];
+}) {
+  // Compute the letterboxed content rect inside the video element,
+  // matching object-contain. bbox coords are 0..1 of the source frame
+  // so we multiply by that rect and add the element-relative offset.
+  const [box, setBox] = useState<{ left: number; top: number; w: number; h: number } | null>(null);
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const recalc = () => {
+      const elW = v.clientWidth;
+      const elH = v.clientHeight;
+      const srcAspect = videoSize.w / videoSize.h;
+      const elAspect = elW / elH;
+      let w, h, left, top;
+      if (elAspect > srcAspect) {
+        // Pillarbox: full height, narrower width
+        h = elH;
+        w = h * srcAspect;
+        left = (elW - w) / 2;
+        top = 0;
+      } else {
+        // Letterbox: full width, shorter height
+        w = elW;
+        h = w / srcAspect;
+        left = 0;
+        top = (elH - h) / 2;
+      }
+      setBox({ left, top, w, h });
+    };
+    recalc();
+    const ro = new ResizeObserver(recalc);
+    ro.observe(v);
+    return () => ro.disconnect();
+  }, [videoRef, videoSize]);
+
+  if (!box) return null;
+  return (
+    <div
+      className="absolute pointer-events-none"
+      style={{ left: box.left, top: box.top, width: box.w, height: box.h }}
+    >
+      {detections.map((d) => (
+        <OverlayBox key={d.id} d={d} />
+      ))}
+    </div>
+  );
+}
+
+function OverlayBox({ d }: { d: HistoricDetection }) {
+  const color = overlayColor(d.class_name);
+  return (
+    <div
+      className="absolute"
+      style={{
+        left: `${d.bbox.x * 100}%`,
+        top: `${d.bbox.y * 100}%`,
+        width: `${d.bbox.w * 100}%`,
+        height: `${d.bbox.h * 100}%`,
+        border: `2px solid ${color}`,
+        boxShadow: `0 0 0 1px rgba(0,0,0,0.5)`,
+      }}
+    >
+      <div
+        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight"
+        style={{
+          background: color,
+          color: "#000",
+          transform: "translateY(-100%)",
+        }}
+      >
+        {d.class_name} {(d.confidence * 100).toFixed(0)}%
+      </div>
+    </div>
+  );
+}
+
+// Stable per-class colour hash — same scheme as Live tiles so a "car"
+// is the same colour in live and in Timeline playback.
+function overlayColor(cls: string): string {
+  let h = 0;
+  for (let i = 0; i < cls.length; i++) h = (h * 31 + cls.charCodeAt(i)) & 0xffffff;
+  return `hsl(${h % 360}, 85%, 55%)`;
 }
 
 function TimelineRuler({

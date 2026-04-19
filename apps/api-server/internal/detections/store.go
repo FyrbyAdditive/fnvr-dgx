@@ -218,7 +218,11 @@ func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap i
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 
 	out := make([]Row, 0, 64)
-	var idCounter int64 // sidecar rows have no PG id; use synthetic
+	// Derive a stable per-file hash for the row ID. Sidecar rows have
+	// no PG BIGSERIAL — we synthesize negative IDs deterministically so
+	// React keys + any "seek to this detection" lookups stay stable
+	// across requests and don't collide between files.
+	pathHash := fnv64(path)
 	for scanner.Scan() {
 		if len(out) >= cap {
 			break
@@ -243,9 +247,15 @@ func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap i
 		if !to.IsZero() && !ev.TS.Before(to) {
 			continue
 		}
-		idCounter++
+		// ID = negative 63-bit hash of (path, event_id) — unique per
+		// event across files, never collides with PG BIGSERIAL (which
+		// is always positive).
+		id := int64(fnv64Combine(pathHash, ev.ID)) & 0x7fffffffffffffff
+		if id == 0 {
+			id = 1
+		}
 		r := Row{
-			ID:         -idCounter, // negative to distinguish from PG BIGSERIAL
+			ID:         -id,
 			EventID:    ev.ID,
 			CameraID:   ev.CameraID,
 			TS:         ev.TS,
@@ -263,6 +273,27 @@ func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap i
 		return out, fmt.Errorf("scan %s: %w", path, err)
 	}
 	return out, nil
+}
+
+// fnv64 / fnv64Combine: tiny inline FNV-1a over strings. Used to
+// synthesize stable IDs for sidecar rows (no external dep).
+func fnv64(s string) uint64 {
+	const off, prime uint64 = 14695981039346656037, 1099511628211
+	h := off
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+func fnv64Combine(seed uint64, s string) uint64 {
+	const prime uint64 = 1099511628211
+	h := seed
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
 }
 
 type sidecarEvent struct {
