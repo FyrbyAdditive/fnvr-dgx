@@ -143,17 +143,32 @@ publish_state() {
 if [ "$PRECISION" = "int8" ]; then
     CALIB_FILE="$YOLO_DEST/${VARIANT}.calib.table"
     if [ ! -f "$CALIB_FILE" ]; then
-        publish_state "calibrating" "Calibrating INT8 for $VARIANT. No calibration table exists for this variant yet; takes a few minutes and is cached on disk after."
-        echo "entrypoint: running INT8 calibration for $VARIANT"
-        if [ -x /usr/local/bin/calibrate-yolo26.sh ]; then
-            if ! /usr/local/bin/calibrate-yolo26.sh "$VARIANT" "$CALIB_FILE"; then
-                publish_state "failed" "INT8 calibration for $VARIANT failed — falling back to FP16. Check /var/lib/fnvr/models/yolo26/calib_images/."
-                echo "entrypoint: calibration failed, falling back to FP16"
-                PRECISION="fp16"
-            fi
-        else
-            publish_state "failed" "calibrate-yolo26.sh missing in image — falling back to FP16"
+        # nvinfer does the actual calibration itself when it builds the
+        # INT8 engine. We just prepare the inputs it needs:
+        #   INT8_CALIB_IMG_PATH  — path to a newline-separated list of
+        #                          absolute image paths to calibrate against
+        #   INT8_CALIB_BATCH_SIZE — batch for calibration inference
+        # After preparation, nvinfer is invoked in the normal worker flow;
+        # it'll auto-write $CALIB_FILE as a side-effect. Minimum ~500
+        # images recommended; we run with whatever's there and warn if low.
+        CALIB_DIR="$YOLO_DEST/calib_images"
+        if [ ! -d "$CALIB_DIR" ] || [ -z "$(ls -A "$CALIB_DIR" 2>/dev/null)" ]; then
+            publish_state "failed" "INT8 calibration: no images in $CALIB_DIR. Drop ~500 representative JPEGs there and retry. Falling back to FP16."
+            echo "entrypoint: $CALIB_DIR empty — cannot calibrate, falling back to FP16"
             PRECISION="fp16"
+        else
+            CALIB_LIST="$YOLO_DEST/calibration.txt"
+            find "$CALIB_DIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) > "$CALIB_LIST"
+            N_IMAGES=$(wc -l < "$CALIB_LIST")
+            export INT8_CALIB_IMG_PATH="$CALIB_LIST"
+            export INT8_CALIB_BATCH_SIZE=1
+            if [ "$N_IMAGES" -lt 100 ]; then
+                publish_state "calibrating" "Calibrating INT8 for $VARIANT with only $N_IMAGES images (≥500 recommended for accuracy). Takes a few minutes; cached on disk."
+                echo "entrypoint: WARNING only $N_IMAGES calibration images; accuracy will suffer"
+            else
+                publish_state "calibrating" "Calibrating INT8 for $VARIANT using $N_IMAGES images. Takes a few minutes; cached on disk."
+            fi
+            echo "entrypoint: INT8_CALIB_IMG_PATH=$CALIB_LIST ($N_IMAGES images)"
         fi
     fi
 fi

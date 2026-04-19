@@ -36,9 +36,15 @@ RUN git clone --depth 1 --branch ${NATS_C_VERSION} https://github.com/nats-io/na
 # with the stock nvinfer parser; this .so is what makes it work.
 # (TensorRT dev headers ship with the triton-multiarch base image.)
 ARG DS_YOLO_COMMIT=master
+# OPENCV=1 compiles the INT8 calibrator into the custom parser .so.
+# Without it, the operator can't do on-device INT8 calibration and
+# must stay on FP16. OpenCV dev headers required for the build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopencv-dev \
+  && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch ${DS_YOLO_COMMIT} https://github.com/marcoslucianops/DeepStream-Yolo.git /tmp/ds-yolo \
   && cd /tmp/ds-yolo/nvdsinfer_custom_impl_Yolo \
-  && CUDA_VER=12.6 make \
+  && CUDA_VER=12.6 OPENCV=1 make \
   && install -Dm755 libnvdsinfer_custom_impl_Yolo.so /usr/local/lib/fnvr/libnvdsinfer_custom_impl_Yolo.so \
   && cp /tmp/ds-yolo/utils/export_yolo26.py /usr/local/bin/export_yolo26.py \
   && chmod +x /usr/local/bin/export_yolo26.py \
