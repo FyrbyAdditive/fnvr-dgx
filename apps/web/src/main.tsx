@@ -8,6 +8,7 @@ import { Live } from "@/routes/live/Live";
 import { Timeline } from "@/routes/timeline/Timeline";
 import { Cameras } from "@/routes/cameras/Cameras";
 import { Events } from "@/routes/events/Events";
+import { Plates } from "@/routes/plates/Plates";
 import { Rules } from "@/routes/rules/Rules";
 import { Settings } from "@/routes/settings/Settings";
 import "./index.css";
@@ -27,6 +28,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
             <Route path="/cameras" element={<Cameras />} />
             <Route path="/events" element={<Events />} />
             <Route path="/rules" element={<Rules />} />
+            <Route path="/plates" element={<Plates />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
         </Routes>

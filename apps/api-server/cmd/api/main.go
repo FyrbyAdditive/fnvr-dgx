@@ -19,6 +19,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
+	"github.com/fnvr/fnvr/apps/api-server/internal/plates"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/server"
@@ -166,6 +167,7 @@ func runServe() error {
 		PipelineStat:  pipelineStat,
 		NatsPublish:   pipelineStat.Publish,
 		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),
+		Plates:        plates.NewStore(pool),
 	})
 
 	httpSrv := &http.Server{

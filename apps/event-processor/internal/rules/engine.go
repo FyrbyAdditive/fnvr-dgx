@@ -55,6 +55,12 @@ type Engine struct {
 	// class_name). Absent camera in the outer map = no mutes (fast path).
 	mutedClasses map[string]map[string]struct{}
 
+	// Plate hotlist: enabled rows from plate_hotlist, loaded in
+	// reload() and checked in onDetection for kind="anpr" events. The
+	// pattern strings are SQL-LIKE shape (literal + '%'), normalised
+	// to uppercase alphanumerics + '%'.
+	hotlist []hotlistEntry
+
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
 
@@ -130,6 +136,17 @@ type Schedule struct {
 type compiledRule struct {
 	Rule
 	classes map[string]struct{}
+}
+
+// hotlistEntry is the match-time shape of a plate_hotlist row. We keep
+// the raw pattern for debug + the pre-split segments used by the
+// likeMatch helper; LIKE-style matching is simple enough that we don't
+// need a regex or an extra dependency.
+type hotlistEntry struct {
+	ID       string
+	Pattern  string // already normalised: uppercase alphanumerics + '%'
+	Label    string
+	Severity string
 }
 
 func New(ctx context.Context, cfg Config) (*Engine, error) {
@@ -352,17 +369,43 @@ func (e *Engine) reload(ctx context.Context) error {
 		}
 	}
 
+	// Plate hotlist: enabled rows only; disabled entries are simply
+	// absent from the in-memory list, not flagged. Pattern is stored
+	// pre-normalised by the store so we can match directly.
+	hrows, err := e.pool.Query(ctx, `
+		SELECT id::text, pattern, label, severity
+		FROM plate_hotlist
+		WHERE enabled = TRUE`)
+	if err != nil {
+		return err
+	}
+	var hotlist []hotlistEntry
+	for hrows.Next() {
+		var h hotlistEntry
+		if err := hrows.Scan(&h.ID, &h.Pattern, &h.Label, &h.Severity); err != nil {
+			hrows.Close()
+			return err
+		}
+		if h.Severity == "" {
+			h.Severity = "warning"
+		}
+		hotlist = append(hotlist, h)
+	}
+	hrows.Close()
+
 	e.mu.Lock()
 	e.rules = compiled
 	e.zones = zones
 	e.enabledDetectors = enabled
 	e.mutedClasses = muted
+	e.hotlist = hotlist
 	e.mu.Unlock()
 	slog.Info("rules reloaded",
 		"rules", len(compiled),
 		"zone_cameras", len(zones),
 		"detector_filtered_cameras", len(enabled),
-		"class_muted_cameras", len(muted))
+		"class_muted_cameras", len(muted),
+		"plate_hotlist", len(hotlist))
 	return nil
 }
 
@@ -372,6 +415,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	zones := e.zones[d.CameraID]
 	allowed := e.enabledDetectors[d.CameraID]
 	muted := e.mutedClasses[d.CameraID]
+	hotlist := e.hotlist
 	e.mu.RUnlock()
 
 	// Per-camera detector whitelist — e.g. ANPR is pointless on indoor
@@ -429,6 +473,30 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 			TrackID:    d.TrackID,
 			Attributes: d.Attributes,
 		})
+	}
+
+	// Plate hotlist match. ANPR-only; ignored for object/face
+	// detections. Cooldown keyed by (entry.ID, camera) so a plate
+	// moving through a few frames fires exactly one incident per
+	// camera per 30s. We fire AFTER the PG INSERT so the incident
+	// can always be traced back to a real detection row if future
+	// work links incidents↔detections.
+	if d.Kind == "anpr" && len(hotlist) > 0 {
+		if plate := normalisePlate(d.Attributes["plate"]); plate != "" {
+			for _, h := range hotlist {
+				if !likePlateMatch(plate, h.Pattern) {
+					continue
+				}
+				key := "hotlist:" + h.ID + ":" + d.CameraID
+				if !e.cooldownOK(key, 30, d.TS) {
+					continue
+				}
+				if err := e.fireHotlistIncident(ctx, d, plate, h); err != nil {
+					slog.Warn("fire hotlist incident",
+						"hotlist_id", h.ID, "err", err)
+				}
+			}
+		}
 	}
 
 	for _, r := range rules {
@@ -524,6 +592,138 @@ func (e *Engine) fireIncident(ctx context.Context, r compiledRule, d Detection) 
 		"summary":    summary,
 	})
 	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
+}
+
+// fireHotlistIncident mirrors fireIncident but for a plate-hotlist
+// match: rule_id is NULL (incidents.rule_id is nullable and
+// FK ON DELETE SET NULL, so dispatcher + HA bridge pick it up just
+// fine), severity comes from the hotlist entry, and the summary is
+// operator-readable. The dispatcher's subscription join already
+// treats s.rule_id IS NULL as "match any rule", so any subscription
+// without a specific rule_id filter receives these.
+func (e *Engine) fireHotlistIncident(ctx context.Context, d Detection, plate string, h hotlistEntry) error {
+	severity := h.Severity
+	if severity == "" {
+		severity = "warning"
+	}
+	summary := fmt.Sprintf("hotlist: %s (%s) on %s", h.Label, plate, d.CameraID)
+
+	var incidentID string
+	err := e.pool.QueryRow(ctx, `
+		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at, severity, summary)
+		VALUES (NULL, $1, $2, $2, $3, $4) RETURNING id::text`,
+		d.CameraID, d.TS, severity, summary).Scan(&incidentID)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"id":         incidentID,
+		"camera_id":  d.CameraID,
+		"started_at": d.TS,
+		"severity":   severity,
+		"summary":    summary,
+		// Carry a hint so downstream consumers (HA, MQTT channel)
+		// can distinguish hotlist hits from rule-driven ones.
+		"hotlist_id": h.ID,
+		"plate":      plate,
+	})
+	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
+}
+
+// normalisePlate strips non-alphanumerics and uppercases a raw plate
+// string from a detection's Attributes["plate"]. Mirrors the SQL
+// generated-column expression in migration 0013 and the api-server
+// plates.NormalisePattern so all three layers agree.
+func normalisePlate(p string) string {
+	out := make([]byte, 0, len(p))
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			out = append(out, c)
+		case c >= 'a' && c <= 'z':
+			out = append(out, c-32)
+		}
+	}
+	return string(out)
+}
+
+// likePlateMatch is a tiny SQL-LIKE matcher: literal + '%' wildcard.
+// Both inputs must be pre-normalised to the same alphabet. No
+// single-char '_' wildcard — plates never need it.
+func likePlateMatch(s, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	if !containsByte(pattern, '%') {
+		return s == pattern
+	}
+	segs := splitByte(pattern, '%')
+	if segs[0] != "" && !hasPrefix(s, segs[0]) {
+		return false
+	}
+	pos := len(segs[0])
+	for i := 1; i < len(segs)-1; i++ {
+		seg := segs[i]
+		if seg == "" {
+			continue
+		}
+		idx := indexFrom(s, seg, pos)
+		if idx < 0 {
+			return false
+		}
+		pos = idx + len(seg)
+	}
+	last := segs[len(segs)-1]
+	if last != "" && !hasSuffix(s[pos:], last) {
+		return false
+	}
+	return true
+}
+
+// Tiny string helpers so we don't import `strings` just for these.
+func containsByte(s string, c byte) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return true
+		}
+	}
+	return false
+}
+func splitByte(s string, c byte) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+func hasPrefix(s, p string) bool {
+	if len(p) > len(s) {
+		return false
+	}
+	return s[:len(p)] == p
+}
+func hasSuffix(s, p string) bool {
+	if len(p) > len(s) {
+		return false
+	}
+	return s[len(s)-len(p):] == p
+}
+func indexFrom(s, sub string, from int) int {
+	if from < 0 || from > len(s) {
+		return -1
+	}
+	for i := from; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 // --- helpers ---

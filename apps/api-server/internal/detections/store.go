@@ -64,6 +64,34 @@ type ListArgs struct {
 	From     time.Time
 	To       time.Time
 	Limit    int
+	// Kind filters by the "object" | "anpr" | "face" discriminator.
+	// Empty = no filter. Uses the detections_kind_idx btree.
+	Kind string
+	// PlatePattern matches against the normalised `plate` generated
+	// column. Treated as LIKE when it contains '%' (uses the
+	// text_pattern_ops btree for prefixes, gin_trgm_ops for
+	// contains), equality otherwise. The input is normalised
+	// (uppercase alphanumerics + preserved '%') before querying so
+	// user-typed dashes / spaces match detector output.
+	PlatePattern string
+}
+
+// normalisePlateQuery strips whitespace / hyphens / dots and
+// uppercases, preserving '%' wildcards. Mirrors the SQL generated-
+// column expression so a user-typed "AB-12" matches "AB12CDE" via
+// the prefix index.
+func normalisePlateQuery(p string) string {
+	out := make([]byte, 0, len(p))
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '%':
+			out = append(out, c)
+		case c >= 'a' && c <= 'z':
+			out = append(out, c-32)
+		}
+	}
+	return string(out)
 }
 
 // List returns detections in the requested time range, sorted newest-
@@ -145,6 +173,16 @@ func (s *Store) queryPG(ctx context.Context, a ListArgs, from, to time.Time, lim
 	if a.CameraID != "" {
 		sql += " AND camera_id = " + addArg(a.CameraID)
 	}
+	if a.Kind != "" {
+		sql += " AND kind = " + addArg(a.Kind)
+	}
+	if p := normalisePlateQuery(a.PlatePattern); p != "" {
+		if strings.Contains(p, "%") {
+			sql += " AND plate LIKE " + addArg(p)
+		} else {
+			sql += " AND plate = " + addArg(p)
+		}
+	}
 	if !from.IsZero() {
 		sql += " AND ts >= " + addArg(from)
 	}
@@ -200,7 +238,8 @@ func (s *Store) querySidecars(ctx context.Context, a ListArgs, from, to time.Tim
 			continue
 		}
 		sidecar := sidecarPath(clean)
-		rows, err := s.readSidecar(sidecar, a.CameraID, from, to, limit-len(out))
+		rows, err := s.readSidecar(sidecar, a.CameraID, from, to, limit-len(out),
+			a.Kind, normalisePlateQuery(a.PlatePattern))
 		if err != nil {
 			// Missing sidecar = hour had zero detections, or an older
 			// segment predating the sidecar feature. Not an error.
@@ -216,7 +255,8 @@ func (s *Store) querySidecars(ctx context.Context, a ListArgs, from, to time.Tim
 	return out, nil
 }
 
-func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap int) ([]Row, error) {
+func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap int,
+	kindFilter, platePattern string) ([]Row, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -255,6 +295,29 @@ func (s *Store) readSidecar(path, cameraFilter string, from, to time.Time, cap i
 		}
 		if !to.IsZero() && !ev.TS.Before(to) {
 			continue
+		}
+		if kindFilter != "" {
+			k := ev.Kind
+			if k == "" {
+				k = "object"
+			}
+			if k != kindFilter {
+				continue
+			}
+		}
+		if platePattern != "" {
+			// Extract "plate" out of the sidecar's raw attributes JSON
+			// and match against the normalised pattern. We reuse the
+			// same alphanumeric-uppercase normalisation as the SQL
+			// generated column so sidecar + PG agree.
+			var attrs map[string]string
+			if len(ev.Attributes) > 0 {
+				_ = json.Unmarshal(ev.Attributes, &attrs)
+			}
+			candidate := normalisePlateQuery(attrs["plate"])
+			if candidate == "" || !likeMatch(candidate, platePattern) {
+				continue
+			}
 		}
 		// ID = negative 63-bit hash of (path, event_id) — unique per
 		// event across files, never collides with PG BIGSERIAL (which
@@ -309,6 +372,42 @@ func fnv64Combine(seed uint64, s string) uint64 {
 		h *= prime
 	}
 	return h
+}
+
+// likeMatch is a small SQL-LIKE matcher for the sidecar path, where
+// we can't delegate to Postgres. Supports '%' (zero-or-more) between
+// literal segments. Both inputs must already be normalised to the
+// same alphabet (uppercase alphanumerics) so exact segment compares
+// are correct. No '_' single-char wildcard — plate UX doesn't need
+// it and keeping the matcher tiny avoids surprises.
+func likeMatch(s, pattern string) bool {
+	if !strings.Contains(pattern, "%") {
+		return s == pattern
+	}
+	segs := strings.Split(pattern, "%")
+	// A leading non-empty segment must be a prefix.
+	if segs[0] != "" && !strings.HasPrefix(s, segs[0]) {
+		return false
+	}
+	// Middle segments: each must appear in order.
+	pos := len(segs[0])
+	for i := 1; i < len(segs)-1; i++ {
+		seg := segs[i]
+		if seg == "" {
+			continue
+		}
+		idx := strings.Index(s[pos:], seg)
+		if idx < 0 {
+			return false
+		}
+		pos += idx + len(seg)
+	}
+	// A trailing non-empty segment must be a suffix from pos onward.
+	last := segs[len(segs)-1]
+	if last != "" && !strings.HasSuffix(s[pos:], last) {
+		return false
+	}
+	return true
 }
 
 type sidecarEvent struct {

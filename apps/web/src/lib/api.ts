@@ -218,13 +218,29 @@ export const api = {
   },
   segmentFileUrl: (id: number) => `${base}/segments/${id}/file`,
 
-  listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number } = {}) => {
+  listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number; kind?: string; plate?: string } = {}) => {
     const p = new URLSearchParams();
     if (opts.cameraId) p.set("camera_id", opts.cameraId);
     if (opts.from) p.set("from", opts.from.toISOString());
     if (opts.to) p.set("to", opts.to.toISOString());
     if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.kind) p.set("kind", opts.kind);
+    if (opts.plate) p.set("plate", opts.plate);
     return req<HistoricDetection[]>(`/detections${p.size ? `?${p}` : ""}`);
+  },
+
+  listHotlist: () => req<HotlistEntry[]>("/plate_hotlist"),
+  createHotlist: (body: Partial<HotlistEntry>) =>
+    req<HotlistEntry>("/plate_hotlist", { method: "POST", body: JSON.stringify(body) }),
+  updateHotlist: (id: string, body: Partial<HotlistEntry>) =>
+    req<void>(`/plate_hotlist/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteHotlist: (id: string) =>
+    req<void>(`/plate_hotlist/${id}`, { method: "DELETE" }),
+  recentPlates: (opts: { hours?: number; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.hours) p.set("hours", String(opts.hours));
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return req<RecentPlate[]>(`/plates/recent${p.size ? `?${p}` : ""}`);
   },
 
   listChannels: () => req<NotificationChannel[]>("/notifications/channels"),
@@ -273,6 +289,24 @@ export type DetectorSettings = {
   yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
   yolo26_precision: "fp16" | "int8";
   anpr_enabled?: boolean;
+};
+
+export type HotlistEntry = {
+  id: string;
+  pattern: string;
+  label: string;
+  severity: "info" | "warning" | "critical";
+  notes?: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RecentPlate = {
+  plate: string;
+  last_camera: string;
+  last_seen: string;
+  count: number;
 };
 
 export type HAConfig = {

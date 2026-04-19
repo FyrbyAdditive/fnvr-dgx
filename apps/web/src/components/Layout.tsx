@@ -8,6 +8,7 @@ const tabs = [
   { to: "/cameras", label: "Cameras" },
   { to: "/rules", label: "Rules" },
   { to: "/timeline", label: "Timeline" },
+  { to: "/plates", label: "Plates" },
   { to: "/settings", label: "Settings" },
 ];
 

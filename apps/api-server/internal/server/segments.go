@@ -133,6 +133,8 @@ type detectionsReq struct {
 func detectionArgsFromRequest(r *http.Request) detectionsReq {
 	var req detectionsReq
 	req.list.CameraID = r.URL.Query().Get("camera_id")
+	req.list.Kind = r.URL.Query().Get("kind")
+	req.list.PlatePattern = r.URL.Query().Get("plate")
 	req.list.Limit = 2000
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {

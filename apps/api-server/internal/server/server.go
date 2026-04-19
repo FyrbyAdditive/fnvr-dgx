@@ -20,6 +20,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
+	"github.com/fnvr/fnvr/apps/api-server/internal/plates"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
@@ -45,6 +46,7 @@ type Server struct {
 	pipelineStat *pipeline.StateTracker
 	natsPublish  func(subject string, data []byte) error
 	detections   *detections.Store
+	plates       *plates.Store
 }
 
 type Deps struct {
@@ -64,6 +66,7 @@ type Deps struct {
 	PipelineStat  *pipeline.StateTracker
 	NatsPublish   func(subject string, data []byte) error
 	Detections    *detections.Store
+	Plates        *plates.Store
 }
 
 func New(d Deps) *Server {
@@ -84,6 +87,7 @@ func New(d Deps) *Server {
 		pipelineStat: d.PipelineStat,
 		natsPublish:  d.NatsPublish,
 		detections:   d.Detections,
+		plates:       d.Plates,
 	}
 }
 
@@ -161,6 +165,17 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/detections", s.handleListDetections)
 		}
 
+		if s.plates != nil {
+			// Hotlist CRUD is admin-only; the list + recent views are
+			// readable by viewers so a read-only observer can still
+			// search plates and see the hotlist.
+			protected.HandleFunc("GET /api/v1/plate_hotlist", s.handleListHotlist)
+			protected.Handle("POST /api/v1/plate_hotlist", auth.AdminFunc(s.handleCreateHotlist))
+			protected.Handle("PATCH /api/v1/plate_hotlist/{id}", auth.AdminFunc(s.handleUpdateHotlist))
+			protected.Handle("DELETE /api/v1/plate_hotlist/{id}", auth.AdminFunc(s.handleDeleteHotlist))
+			protected.HandleFunc("GET /api/v1/plates/recent", s.handleRecentPlates)
+		}
+
 		if s.notifs != nil {
 			protected.HandleFunc("GET /api/v1/notifications/channels", s.handleListChannels)
 			protected.Handle("POST /api/v1/notifications/channels", auth.AdminFunc(s.handleCreateChannel))
@@ -220,6 +235,11 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/segments", guarded)
 			mux.Handle("/api/v1/segments/", guarded)
 			mux.Handle("/api/v1/detections", guarded)
+		}
+		if s.plates != nil {
+			mux.Handle("/api/v1/plate_hotlist", guarded)
+			mux.Handle("/api/v1/plate_hotlist/", guarded)
+			mux.Handle("/api/v1/plates/recent", guarded)
 		}
 		if s.notifs != nil {
 			mux.Handle("/api/v1/notifications/channels", guarded)
