@@ -194,7 +194,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystemInfo(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":   "dev",
-		"milestone": "M2",
+		"milestone": "M3",
 		"time":      time.Now().UTC(),
 	})
 }
