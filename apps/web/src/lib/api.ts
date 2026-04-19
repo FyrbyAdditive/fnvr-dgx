@@ -118,10 +118,54 @@ export type HistoricDetection = {
   attributes?: Record<string, string>;
 };
 
+export type Me = {
+  user_id: string;
+  username: string;
+  role: string;
+  is_admin: boolean;
+  api_only: boolean;
+};
+
+export type User = {
+  id: string;
+  username: string;
+  role: string;
+  disabled: boolean;
+  api_only: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type APIToken = {
+  id: string;
+  user_id: string;
+  name: string;
+  created_at: string;
+  last_used_at?: string | null;
+};
+
 export const api = {
   systemInfo: () => req<{ version: string; milestone: string; time: string }>("/system/info"),
+  me: () => req<Me>("/me"),
 
   listLocalDevices: () => req<LocalDevice[]>("/system/local-devices"),
+
+  // Users + tokens (admin only).
+  listUsers: () => req<User[]>("/users"),
+  createUser: (body: { username: string; password?: string; role: "admin" | "viewer"; api_only?: boolean }) =>
+    req<User>("/users", { method: "POST", body: JSON.stringify(body) }),
+  updateUser: (id: string, body: { role?: "admin" | "viewer"; disabled?: boolean; password?: string }) =>
+    req<void>(`/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteUser: (id: string) =>
+    req<void>(`/users/${id}`, { method: "DELETE" }),
+  listTokens: (userID: string) => req<APIToken[]>(`/users/${userID}/tokens`),
+  createToken: (userID: string, name: string) =>
+    req<{ id: string; token: string }>(`/users/${userID}/tokens`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  revokeToken: (userID: string, tokenID: string) =>
+    req<void>(`/users/${userID}/tokens/${tokenID}`, { method: "DELETE" }),
 
   listCameras: () => req<Camera[]>("/cameras"),
   createCamera: (c: Partial<Camera>) =>

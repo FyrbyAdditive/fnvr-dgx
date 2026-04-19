@@ -2,10 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useRecentDetections } from "@/lib/events";
+import { useMe } from "@/lib/me";
 
 export function Events() {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const detections = useRecentDetections(200);
   const { data: incidents = [] } = useQuery({
     queryKey: ["incidents"],
@@ -55,23 +58,29 @@ export function Events() {
                     <span className="text-neutral-400"> · {i.summary}</span>
                   </span>
                 </button>
-                <div className="flex items-center justify-end gap-3 pr-2 text-xs">
-                  <button
-                    className={i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}
-                    onClick={() => !i.acknowledged && ack.mutate(i.id)}
-                    disabled={i.acknowledged}
-                  >
-                    {i.acknowledged ? "ack'd" : "acknowledge"}
-                  </button>
-                  <button
-                    className="text-red-400 hover:underline"
-                    onClick={() => del.mutate(i.id)}
-                    disabled={del.isPending}
-                    title="Delete this incident"
-                  >
-                    delete
-                  </button>
-                </div>
+                {isAdmin ? (
+                  <div className="flex items-center justify-end gap-3 pr-2 text-xs">
+                    <button
+                      className={i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}
+                      onClick={() => !i.acknowledged && ack.mutate(i.id)}
+                      disabled={i.acknowledged}
+                    >
+                      {i.acknowledged ? "ack'd" : "acknowledge"}
+                    </button>
+                    <button
+                      className="text-red-400 hover:underline"
+                      onClick={() => del.mutate(i.id)}
+                      disabled={del.isPending}
+                      title="Delete this incident"
+                    >
+                      delete
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-xs text-neutral-600 text-right pr-2">
+                    {i.acknowledged ? "ack'd" : ""}
+                  </span>
+                )}
               </li>
             ))}
           </ul>

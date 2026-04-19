@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Camera } from "@/lib/api";
 import { loadCocoLabels } from "@/lib/classes";
+import { useMe } from "@/lib/me";
 import { ZoneEditor } from "./ZoneEditor";
 
 
@@ -9,6 +10,8 @@ type Kind = "rtsp" | "v4l2" | "rtmp" | "http";
 
 export function Cameras() {
   const qc = useQueryClient();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const { data: devices = [] } = useQuery({
     queryKey: ["local-devices"],
@@ -50,52 +53,54 @@ export function Cameras() {
 
   return (
     <div className="p-4 space-y-6 max-w-4xl">
-      <section>
-        <h2 className="text-lg font-semibold mb-2">Add camera</h2>
+      {isAdmin && (
+        <section>
+          <h2 className="text-lg font-semibold mb-2">Add camera</h2>
 
-        <div className="flex gap-1 mb-3 text-sm">
-          {(["rtsp", "v4l2", "rtmp", "http"] as Kind[]).map((k) => (
-            <button key={k} type="button"
-              className={`px-3 py-1 rounded ${
-                kind === k ? "bg-neutral-800 text-white" : "text-neutral-400 hover:bg-neutral-900"
-              }`}
-              onClick={() => setKind(k)}>
-              {kindLabel(k)}
+          <div className="flex gap-1 mb-3 text-sm">
+            {(["rtsp", "v4l2", "rtmp", "http"] as Kind[]).map((k) => (
+              <button key={k} type="button"
+                className={`px-3 py-1 rounded ${
+                  kind === k ? "bg-neutral-800 text-white" : "text-neutral-400 hover:bg-neutral-900"
+                }`}
+                onClick={() => setKind(k)}>
+                {kindLabel(k)}
+              </button>
+            ))}
+          </div>
+
+          <form onSubmit={onSubmit} className="space-y-2 text-sm">
+            <input className="w-full bg-neutral-900 rounded px-3 py-2" placeholder="Display name (e.g. Front door)"
+              value={name} onChange={(e) => setName(e.target.value)} required />
+
+            {kind === "v4l2" ? (
+              <select className="w-full bg-neutral-900 rounded px-3 py-2"
+                value={device} onChange={(e) => setDevice(e.target.value)} required>
+                <option value="">— select a device —</option>
+                {devices.map((d) => (
+                  <option key={d.path} value={d.path}>
+                    {d.label} ({d.path})
+                  </option>
+                ))}
+                {devices.length === 0 && <option disabled>No local cameras detected</option>}
+              </select>
+            ) : (
+              <input className="w-full bg-neutral-900 rounded px-3 py-2" placeholder={placeholderFor(kind)}
+                value={rtspUrl} onChange={(e) => setRtspUrl(e.target.value)} required />
+            )}
+
+            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 rounded px-3 py-2"
+              disabled={create.isPending}>
+              {create.isPending ? "Adding…" : "Add camera"}
             </button>
-          ))}
-        </div>
-
-        <form onSubmit={onSubmit} className="space-y-2 text-sm">
-          <input className="w-full bg-neutral-900 rounded px-3 py-2" placeholder="Display name (e.g. Front door)"
-            value={name} onChange={(e) => setName(e.target.value)} required />
-
-          {kind === "v4l2" ? (
-            <select className="w-full bg-neutral-900 rounded px-3 py-2"
-              value={device} onChange={(e) => setDevice(e.target.value)} required>
-              <option value="">— select a device —</option>
-              {devices.map((d) => (
-                <option key={d.path} value={d.path}>
-                  {d.label} ({d.path})
-                </option>
-              ))}
-              {devices.length === 0 && <option disabled>No local cameras detected</option>}
-            </select>
-          ) : (
-            <input className="w-full bg-neutral-900 rounded px-3 py-2" placeholder={placeholderFor(kind)}
-              value={rtspUrl} onChange={(e) => setRtspUrl(e.target.value)} required />
-          )}
-
-          <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 rounded px-3 py-2"
-            disabled={create.isPending}>
-            {create.isPending ? "Adding…" : "Add camera"}
-          </button>
-          {create.isError && (
-            <div className="text-red-400 text-xs">
-              {String((create.error as any)?.message ?? "Could not save camera")}
-            </div>
-          )}
-        </form>
-      </section>
+            {create.isError && (
+              <div className="text-red-400 text-xs">
+                {String((create.error as any)?.message ?? "Could not save camera")}
+              </div>
+            )}
+          </form>
+        </section>
+      )}
 
       <section>
         <h2 className="text-lg font-semibold mb-2">
@@ -109,6 +114,7 @@ export function Cameras() {
               <CameraRow
                 key={c.id}
                 camera={c}
+                isAdmin={isAdmin}
                 onDelete={() => remove.mutate(c.id)}
               />
             ))}
@@ -124,7 +130,7 @@ export function Cameras() {
   );
 }
 
-function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void }) {
+function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boolean; onDelete: () => void }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <li className="text-sm">
@@ -132,7 +138,7 @@ function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void 
         <button
           className="text-neutral-500 hover:text-white text-xs w-4"
           onClick={() => setExpanded((v) => !v)}
-          title={expanded ? "hide zones" : "edit zones"}
+          title={expanded ? "hide details" : "show details"}
         >
           {expanded ? "▾" : "▸"}
         </button>
@@ -142,14 +148,16 @@ function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void 
             {camera.id} · {camera.url}
           </div>
         </div>
-        <button
-          className="text-xs text-red-400 hover:underline"
-          onClick={onDelete}
-        >
-          delete
-        </button>
+        {isAdmin && (
+          <button
+            className="text-xs text-red-400 hover:underline"
+            onClick={onDelete}
+          >
+            delete
+          </button>
+        )}
       </div>
-      {expanded && (
+      {expanded && isAdmin && (
         <div className="px-3 pb-3 space-y-3">
           <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />

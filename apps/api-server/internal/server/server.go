@@ -115,35 +115,40 @@ func (s *Server) Handler() http.Handler {
 
 		protected.HandleFunc("GET /api/v1/system/local-devices", s.handleLocalDevices)
 
+		// Reads — allowed for any authenticated user (admin or viewer).
+		// Writes — wrapped in auth.AdminFunc so viewers get 403.
 		protected.HandleFunc("GET /api/v1/cameras", s.handleListCameras)
-		protected.HandleFunc("POST /api/v1/cameras", s.handleCreateCamera)
+		protected.Handle("POST /api/v1/cameras", auth.AdminFunc(s.handleCreateCamera))
 		protected.HandleFunc("GET /api/v1/cameras/{id}", s.handleGetCamera)
-		protected.HandleFunc("DELETE /api/v1/cameras/{id}", s.handleDeleteCamera)
-		protected.HandleFunc("PATCH /api/v1/cameras/{id}/detectors", s.handleUpdateCameraDetectors)
-		protected.HandleFunc("PATCH /api/v1/cameras/{id}/classes", s.handleUpdateCameraClasses)
+		protected.Handle("DELETE /api/v1/cameras/{id}", auth.AdminFunc(s.handleDeleteCamera))
+		protected.Handle("PATCH /api/v1/cameras/{id}/detectors", auth.AdminFunc(s.handleUpdateCameraDetectors))
+		protected.Handle("PATCH /api/v1/cameras/{id}/classes", auth.AdminFunc(s.handleUpdateCameraClasses))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
 		if s.whep != nil {
+			// WHEP negotiation is a viewer action (it establishes a live
+			// playback session, not a mutation), so stays open to all
+			// authenticated users.
 			protected.HandleFunc("POST /api/v1/cameras/{id}/whep", s.handleWhepOffer)
 			protected.HandleFunc("OPTIONS /api/v1/cameras/{id}/whep", s.handleWhepOptions)
 		}
 
 		if s.rules != nil {
 			protected.HandleFunc("GET /api/v1/zones", s.handleListZones)
-			protected.HandleFunc("POST /api/v1/zones", s.handleCreateZone)
-			protected.HandleFunc("DELETE /api/v1/zones/{id}", s.handleDeleteZone)
-			protected.HandleFunc("PATCH /api/v1/zones/{id}/exclusions", s.handleUpdateZoneExclusions)
+			protected.Handle("POST /api/v1/zones", auth.AdminFunc(s.handleCreateZone))
+			protected.Handle("DELETE /api/v1/zones/{id}", auth.AdminFunc(s.handleDeleteZone))
+			protected.Handle("PATCH /api/v1/zones/{id}/exclusions", auth.AdminFunc(s.handleUpdateZoneExclusions))
 
 			protected.HandleFunc("GET /api/v1/rules", s.handleListRules)
-			protected.HandleFunc("POST /api/v1/rules", s.handleCreateRule)
-			protected.HandleFunc("DELETE /api/v1/rules/{id}", s.handleDeleteRule)
-			protected.HandleFunc("POST /api/v1/rules/{id}/enable", s.handleEnableRule)
-			protected.HandleFunc("POST /api/v1/rules/{id}/disable", s.handleDisableRule)
+			protected.Handle("POST /api/v1/rules", auth.AdminFunc(s.handleCreateRule))
+			protected.Handle("DELETE /api/v1/rules/{id}", auth.AdminFunc(s.handleDeleteRule))
+			protected.Handle("POST /api/v1/rules/{id}/enable", auth.AdminFunc(s.handleEnableRule))
+			protected.Handle("POST /api/v1/rules/{id}/disable", auth.AdminFunc(s.handleDisableRule))
 
 			protected.HandleFunc("GET /api/v1/incidents", s.handleListIncidents)
-			protected.HandleFunc("POST /api/v1/incidents/{id}/ack", s.handleAckIncident)
-			protected.HandleFunc("DELETE /api/v1/incidents/{id}", s.handleDeleteIncident)
+			protected.Handle("POST /api/v1/incidents/{id}/ack", auth.AdminFunc(s.handleAckIncident))
+			protected.Handle("DELETE /api/v1/incidents/{id}", auth.AdminFunc(s.handleDeleteIncident))
 		}
 
 		if s.events != nil {
@@ -158,30 +163,39 @@ func (s *Server) Handler() http.Handler {
 
 		if s.notifs != nil {
 			protected.HandleFunc("GET /api/v1/notifications/channels", s.handleListChannels)
-			protected.HandleFunc("POST /api/v1/notifications/channels", s.handleCreateChannel)
-			protected.HandleFunc("DELETE /api/v1/notifications/channels/{id}", s.handleDeleteChannel)
-			protected.HandleFunc("POST /api/v1/notifications/channels/{id}/enable", s.handleEnableChannel)
-			protected.HandleFunc("POST /api/v1/notifications/channels/{id}/disable", s.handleDisableChannel)
+			protected.Handle("POST /api/v1/notifications/channels", auth.AdminFunc(s.handleCreateChannel))
+			protected.Handle("DELETE /api/v1/notifications/channels/{id}", auth.AdminFunc(s.handleDeleteChannel))
+			protected.Handle("POST /api/v1/notifications/channels/{id}/enable", auth.AdminFunc(s.handleEnableChannel))
+			protected.Handle("POST /api/v1/notifications/channels/{id}/disable", auth.AdminFunc(s.handleDisableChannel))
 
 			protected.HandleFunc("GET /api/v1/notifications/subscriptions", s.handleListSubscriptions)
-			protected.HandleFunc("POST /api/v1/notifications/subscriptions", s.handleCreateSubscription)
-			protected.HandleFunc("DELETE /api/v1/notifications/subscriptions/{id}", s.handleDeleteSubscription)
+			protected.Handle("POST /api/v1/notifications/subscriptions", auth.AdminFunc(s.handleCreateSubscription))
+			protected.Handle("DELETE /api/v1/notifications/subscriptions/{id}", auth.AdminFunc(s.handleDeleteSubscription))
 
 			protected.HandleFunc("GET /api/v1/notifications/deliveries", s.handleRecentDeliveries)
 		}
 
 		if s.settings != nil {
 			protected.HandleFunc("GET /api/v1/settings/detector", s.handleGetDetector)
-			protected.HandleFunc("PUT /api/v1/settings/detector", s.handleUpdateDetector)
+			protected.Handle("PUT /api/v1/settings/detector", auth.AdminFunc(s.handleUpdateDetector))
 			protected.HandleFunc("GET /api/v1/settings/class_mutes", s.handleGetClassMutes)
-			protected.HandleFunc("PUT /api/v1/settings/class_mutes", s.handleUpdateClassMutes)
+			protected.Handle("PUT /api/v1/settings/class_mutes", auth.AdminFunc(s.handleUpdateClassMutes))
 		}
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
 		}
 		if s.natsPublish != nil {
-			protected.HandleFunc("POST /api/v1/system/pipeline/restart", s.handlePipelineRestart)
+			protected.Handle("POST /api/v1/system/pipeline/restart", auth.AdminFunc(s.handlePipelineRestart))
 		}
+
+		// User + API-token management — admin-only end to end.
+		protected.Handle("GET /api/v1/users", auth.AdminFunc(s.handleListUsers))
+		protected.Handle("POST /api/v1/users", auth.AdminFunc(s.handleCreateUser))
+		protected.Handle("PATCH /api/v1/users/{id}", auth.AdminFunc(s.handleUpdateUser))
+		protected.Handle("DELETE /api/v1/users/{id}", auth.AdminFunc(s.handleDeleteUser))
+		protected.Handle("GET /api/v1/users/{id}/tokens", auth.AdminFunc(s.handleListTokens))
+		protected.Handle("POST /api/v1/users/{id}/tokens", auth.AdminFunc(s.handleCreateToken))
+		protected.Handle("DELETE /api/v1/users/{id}/tokens/{token_id}", auth.AdminFunc(s.handleRevokeToken))
 
 		guarded := s.auth.Middleware(protected)
 		mux.Handle("/api/v1/auth/logout", guarded)
@@ -222,6 +236,8 @@ func (s *Server) Handler() http.Handler {
 		if s.natsPublish != nil {
 			mux.Handle("/api/v1/system/pipeline/restart", guarded)
 		}
+		mux.Handle("/api/v1/users", guarded)
+		mux.Handle("/api/v1/users/", guarded)
 	}
 
 	return loggingMiddleware(corsMiddleware(mux))
@@ -297,8 +313,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id":  sess.UserID,
 		"username": sess.Username,
 		"role":     sess.Role,
+		"is_admin": auth.IsAdmin(sess),
+		"api_only": sess.APIOnly,
 	})
 }
 

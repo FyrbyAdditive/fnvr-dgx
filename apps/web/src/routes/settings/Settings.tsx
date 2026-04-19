@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ClassMutes as ClassMutesT, DetectorSettings, NotificationChannel } from "@/lib/api";
+import { api, APIToken, ClassMutes as ClassMutesT, DetectorSettings, NotificationChannel } from "@/lib/api";
 import { loadCocoLabels, classCategory, CATEGORY_ORDER } from "@/lib/classes";
+import { useMe } from "@/lib/me";
 
 export function Settings() {
   const { data: info } = useQuery({ queryKey: ["info"], queryFn: api.systemInfo });
+  const { data: me } = useMe();
 
   return (
     <div className="p-4 space-y-6 max-w-3xl">
       <Detector />
       <ClassMutes />
+
+      {me?.is_admin && <Users />}
 
       <section>
         <h2 className="text-lg font-semibold mb-2">System</h2>
@@ -35,6 +39,8 @@ const YOLO_VARIANTS: { value: DetectorSettings["yolo26_variant"]; label: string 
 
 function Detector() {
   const qc = useQueryClient();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: current } = useQuery({
     queryKey: ["detector"],
     queryFn: api.getDetectorSettings,
@@ -138,20 +144,22 @@ function Detector() {
           </label>
         </div>
 
-        <div>
-          <button
-            className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
-            onClick={() => save.mutate()}
-            disabled={!dirty || save.isPending}
-          >
-            {save.isPending ? "Saving…" : dirty ? "Save and restart pipeline" : "No changes"}
-          </button>
-          {save.isError && (
-            <span className="text-red-400 text-xs ml-3">
-              {String((save.error as Error)?.message ?? "failed")}
-            </span>
-          )}
-        </div>
+        {isAdmin && (
+          <div>
+            <button
+              className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
+              onClick={() => save.mutate()}
+              disabled={!dirty || save.isPending}
+            >
+              {save.isPending ? "Saving…" : dirty ? "Save and restart pipeline" : "No changes"}
+            </button>
+            {save.isError && (
+              <span className="text-red-400 text-xs ml-3">
+                {String((save.error as Error)?.message ?? "failed")}
+              </span>
+            )}
+          </div>
+        )}
 
         <PipelineStatusChip state={pipelineState?.state} />
       </div>
@@ -165,6 +173,8 @@ function Detector() {
 // live on the camera row, not here.
 function ClassMutes() {
   const qc = useQueryClient();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: server } = useQuery({
     queryKey: ["class-mutes"],
     queryFn: api.getClassMutes,
@@ -246,7 +256,7 @@ function ClassMutes() {
           {local.global.length} global · {local.indoor.length} indoor ·{" "}
           {local.outdoor.length} outdoor
         </span>
-        {dirty && (
+        {dirty && isAdmin && (
           <button
             className="ml-auto bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
             disabled={save.isPending}
@@ -375,6 +385,8 @@ function PipelineStatusChip({ state }: { state?: { state: string; variant?: stri
 
 function NotificationChannels() {
   const qc = useQueryClient();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: channels = [] } = useQuery({
     queryKey: ["channels"],
     queryFn: api.listChannels,
@@ -398,7 +410,7 @@ function NotificationChannels() {
         subscription never fires — add subscriptions via the API for now.
       </p>
 
-      <NewChannelForm onCreated={invalidate} />
+      {isAdmin && <NewChannelForm onCreated={invalidate} />}
 
       {channels.length === 0 ? (
         <p className="text-neutral-500 text-sm mt-4">No channels yet.</p>
@@ -417,20 +429,22 @@ function NotificationChannels() {
                   {formatChannelConfig(c)}
                 </div>
               </div>
-              <div className="flex gap-3 text-xs">
-                <button
-                  className="text-blue-400 hover:underline"
-                  onClick={() => (c.enabled ? disable.mutate(c.id) : enable.mutate(c.id))}
-                >
-                  {c.enabled ? "disable" : "enable"}
-                </button>
-                <button
-                  className="text-red-400 hover:underline"
-                  onClick={() => confirm(`delete channel "${c.name}"?`) && del.mutate(c.id)}
-                >
-                  delete
-                </button>
-              </div>
+              {isAdmin && (
+                <div className="flex gap-3 text-xs">
+                  <button
+                    className="text-blue-400 hover:underline"
+                    onClick={() => (c.enabled ? disable.mutate(c.id) : enable.mutate(c.id))}
+                  >
+                    {c.enabled ? "disable" : "enable"}
+                  </button>
+                  <button
+                    className="text-red-400 hover:underline"
+                    onClick={() => confirm(`delete channel "${c.name}"?`) && del.mutate(c.id)}
+                  >
+                    delete
+                  </button>
+                </div>
+              )}
             </li>
           ))}
         </ul>
@@ -548,4 +562,338 @@ function formatChannelConfig(c: NotificationChannel): string {
     return `${(c.config.server as string) ?? "https://ntfy.sh"}/${(c.config.topic as string) ?? ""}`;
   }
   return JSON.stringify(c.config);
+}
+
+// Admin-only users section: list, add, role-change, disable, delete,
+// and an expandable tokens drawer for api-only users. All calls are
+// server-side gated; this UI is the convenience layer.
+function Users() {
+  const qc = useQueryClient();
+  const { data: users = [] } = useQuery({
+    queryKey: ["users"],
+    queryFn: api.listUsers,
+  });
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["users"] });
+
+  const update = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: Parameters<typeof api.updateUser>[1] }) =>
+      api.updateUser(id, body),
+    onSuccess: invalidate,
+  });
+  const del = useMutation({ mutationFn: api.deleteUser, onSuccess: invalidate });
+
+  const [showTokensFor, setShowTokensFor] = useState<string | null>(null);
+
+  return (
+    <section>
+      <h2 className="text-lg font-semibold mb-2">Users</h2>
+      <p className="text-sm text-neutral-500 mb-3">
+        Admin can edit everything. Viewer can read everything but cannot
+        change settings, cameras, zones, or rules. API-only users cannot
+        log into the web UI; they authenticate with personal access
+        tokens in the Authorization header.
+      </p>
+
+      <NewUserForm onCreated={invalidate} />
+
+      {users.length === 0 ? (
+        <p className="text-neutral-500 text-sm mt-4">No users yet.</p>
+      ) : (
+        <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm mt-4">
+          {users.map((u) => (
+            <li key={u.id} className="p-2">
+              <div className="grid grid-cols-[1fr_auto_auto] gap-2 items-center">
+                <div>
+                  <div className="font-medium">
+                    {u.username}{" "}
+                    <span className="text-neutral-500 font-normal">
+                      · {prettyRole(u.role)}
+                      {u.api_only && <span className="text-emerald-400"> · api-only</span>}
+                      {u.disabled && <span className="text-amber-500"> · disabled</span>}
+                    </span>
+                  </div>
+                  <div className="text-xs text-neutral-500">
+                    created {new Date(u.created_at).toLocaleDateString()}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 text-xs">
+                  <select
+                    className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5"
+                    value={normaliseRole(u.role)}
+                    disabled={update.isPending}
+                    onChange={(e) =>
+                      update.mutate({
+                        id: u.id,
+                        body: { role: e.target.value as "admin" | "viewer" },
+                      })
+                    }
+                  >
+                    <option value="admin">admin</option>
+                    <option value="viewer">viewer</option>
+                  </select>
+                  <button
+                    className={u.disabled ? "text-emerald-400 hover:underline" : "text-amber-400 hover:underline"}
+                    onClick={() =>
+                      update.mutate({ id: u.id, body: { disabled: !u.disabled } })
+                    }
+                  >
+                    {u.disabled ? "enable" : "disable"}
+                  </button>
+                  {u.api_only ? (
+                    <button
+                      className="text-blue-400 hover:underline"
+                      onClick={() =>
+                        setShowTokensFor(showTokensFor === u.id ? null : u.id)
+                      }
+                    >
+                      {showTokensFor === u.id ? "hide tokens" : "tokens"}
+                    </button>
+                  ) : (
+                    <PasswordResetButton userID={u.id} />
+                  )}
+                </div>
+                <button
+                  className="text-xs text-red-400 hover:underline"
+                  onClick={() => {
+                    if (confirm(`delete user "${u.username}"?`)) del.mutate(u.id);
+                  }}
+                >
+                  delete
+                </button>
+              </div>
+              {showTokensFor === u.id && u.api_only && (
+                <TokensPanel userID={u.id} />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {update.isError && (
+        <div className="text-red-400 text-xs mt-2">
+          {String((update.error as Error)?.message ?? "update failed")}
+        </div>
+      )}
+      {del.isError && (
+        <div className="text-red-400 text-xs mt-2">
+          {String((del.error as Error)?.message ?? "delete failed")}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function prettyRole(r: string): string {
+  // Legacy rows may have "superadmin"/"operator"/"guest"; show them as
+  // they map to the handler-side gate.
+  if (r === "superadmin" || r === "admin") return "admin";
+  return "viewer";
+}
+function normaliseRole(r: string): "admin" | "viewer" {
+  return prettyRole(r) as "admin" | "viewer";
+}
+
+function NewUserForm({ onCreated }: { onCreated: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<"admin" | "viewer">("viewer");
+  const [apiOnly, setApiOnly] = useState(false);
+
+  const create = useMutation({
+    mutationFn: api.createUser,
+    onSuccess: () => {
+      onCreated();
+      setUsername("");
+      setPassword("");
+      setRole("viewer");
+      setApiOnly(false);
+    },
+  });
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    create.mutate({
+      username: username.trim(),
+      password: apiOnly ? undefined : password,
+      role,
+      api_only: apiOnly,
+    });
+  };
+
+  return (
+    <form onSubmit={submit} className="grid grid-cols-[1fr_1fr_8rem_auto_auto] gap-2 items-center">
+      <input
+        className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+        placeholder="Username"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        required
+      />
+      <input
+        className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm disabled:opacity-50"
+        placeholder={apiOnly ? "(no password — api-only)" : "Password"}
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        disabled={apiOnly}
+        required={!apiOnly}
+      />
+      <select
+        className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+        value={role}
+        onChange={(e) => setRole(e.target.value as "admin" | "viewer")}
+      >
+        <option value="viewer">viewer</option>
+        <option value="admin">admin</option>
+      </select>
+      <label className="inline-flex items-center gap-1 text-xs text-neutral-400">
+        <input
+          type="checkbox"
+          checked={apiOnly}
+          onChange={(e) => setApiOnly(e.target.checked)}
+        />
+        api-only
+      </label>
+      <button
+        type="submit"
+        className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
+        disabled={create.isPending}
+      >
+        {create.isPending ? "adding…" : "add user"}
+      </button>
+      {create.isError && (
+        <span className="col-span-5 text-red-400 text-xs">
+          {String((create.error as Error)?.message ?? "failed")}
+        </span>
+      )}
+    </form>
+  );
+}
+
+function PasswordResetButton({ userID }: { userID: string }) {
+  const update = useMutation({
+    mutationFn: ({ password }: { password: string }) =>
+      api.updateUser(userID, { password }),
+  });
+  const reset = () => {
+    const pw = prompt("New password (shown once — the user will need to re-login):");
+    if (!pw) return;
+    update.mutate({ password: pw });
+  };
+  return (
+    <button
+      className="text-blue-400 hover:underline"
+      onClick={reset}
+      disabled={update.isPending}
+      title="Set a new password for this user"
+    >
+      {update.isPending ? "saving…" : "reset pw"}
+    </button>
+  );
+}
+
+function TokensPanel({ userID }: { userID: string }) {
+  const qc = useQueryClient();
+  const { data: tokens = [] } = useQuery({
+    queryKey: ["tokens", userID],
+    queryFn: () => api.listTokens(userID),
+  });
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["tokens", userID] });
+  const [name, setName] = useState("");
+  const [justCreated, setJustCreated] = useState<string | null>(null);
+
+  const create = useMutation({
+    mutationFn: () => api.createToken(userID, name.trim()),
+    onSuccess: (res) => {
+      setJustCreated(res.token);
+      setName("");
+      invalidate();
+    },
+  });
+  const revoke = useMutation({
+    mutationFn: (tokenID: string) => api.revokeToken(userID, tokenID),
+    onSuccess: invalidate,
+  });
+
+  return (
+    <div className="mt-2 ml-3 pl-3 border-l-2 border-neutral-800 space-y-2">
+      <form
+        className="flex items-center gap-2 text-xs"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (name.trim()) create.mutate();
+        }}
+      >
+        <input
+          className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5 min-w-[14rem]"
+          placeholder="Token name (e.g. grafana, home-assistant)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          required
+        />
+        <button
+          type="submit"
+          className="bg-blue-600 hover:bg-blue-500 rounded px-2 py-0.5 disabled:opacity-50"
+          disabled={create.isPending}
+        >
+          {create.isPending ? "creating…" : "create token"}
+        </button>
+      </form>
+      {justCreated && (
+        <div className="bg-emerald-950/60 border border-emerald-700 rounded p-2 text-xs">
+          <div className="mb-1 text-emerald-200">
+            New token — copy now, it will not be shown again.
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              readOnly
+              className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 font-mono text-xs"
+              value={justCreated}
+              onClick={(e) => (e.target as HTMLInputElement).select()}
+            />
+            <button
+              className="bg-neutral-800 hover:bg-neutral-700 rounded px-2 py-1"
+              onClick={() => {
+                navigator.clipboard?.writeText(justCreated);
+              }}
+            >
+              copy
+            </button>
+            <button
+              className="text-neutral-400 hover:text-white"
+              onClick={() => setJustCreated(null)}
+            >
+              dismiss
+            </button>
+          </div>
+        </div>
+      )}
+      {tokens.length === 0 ? (
+        <p className="text-xs text-neutral-500">No tokens yet.</p>
+      ) : (
+        <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-xs">
+          {tokens.map((t: APIToken) => (
+            <li key={t.id} className="p-2 grid grid-cols-[1fr_auto_auto] gap-2 items-center">
+              <div>
+                <div className="font-medium">{t.name}</div>
+                <div className="text-neutral-500">
+                  created {new Date(t.created_at).toLocaleDateString()}
+                  {t.last_used_at && (
+                    <> · last used {new Date(t.last_used_at).toLocaleString()}</>
+                  )}
+                </div>
+              </div>
+              <button
+                className="text-red-400 hover:underline"
+                onClick={() => {
+                  if (confirm(`revoke token "${t.name}"?`)) revoke.mutate(t.id);
+                }}
+              >
+                revoke
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }

@@ -1,9 +1,12 @@
 import { FormEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, NotificationChannel, NotificationSubscription, Rule } from "@/lib/api";
+import { useMe } from "@/lib/me";
 
 export function Rules() {
   const qc = useQueryClient();
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: rules = [] } = useQuery({ queryKey: ["rules"], queryFn: api.listRules });
   const { data: zones = [] } = useQuery({ queryKey: ["zones"], queryFn: () => api.listZones() });
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
@@ -61,6 +64,7 @@ export function Rules() {
 
   return (
     <div className="p-4 space-y-6 max-w-3xl">
+      {isAdmin && (
       <section>
         <h2 className="text-lg font-semibold mb-2">New rule</h2>
         <form onSubmit={submit} className="grid grid-cols-2 gap-2 text-sm">
@@ -114,6 +118,7 @@ export function Rules() {
           </button>
         </form>
       </section>
+      )}
 
       <section>
         <h2 className="text-lg font-semibold mb-2">Rules ({rules.length})</h2>
@@ -127,6 +132,7 @@ export function Rules() {
                 rule={r}
                 channels={channels}
                 subscriptions={subscriptions.filter((s) => s.rule_id === r.id)}
+                isAdmin={isAdmin}
                 onToggle={() => toggleRule.mutate({ id: r.id, enabled: r.enabled })}
                 onDelete={() => deleteRule.mutate(r.id)}
               />
@@ -138,10 +144,11 @@ export function Rules() {
   );
 }
 
-function RuleRow({ rule, channels, subscriptions, onToggle, onDelete }: {
+function RuleRow({ rule, channels, subscriptions, isAdmin, onToggle, onDelete }: {
   rule: Rule;
   channels: NotificationChannel[];
   subscriptions: NotificationSubscription[];
+  isAdmin: boolean;
   onToggle: () => void;
   onDelete: () => void;
 }) {
@@ -178,12 +185,16 @@ function RuleRow({ rule, channels, subscriptions, onToggle, onDelete }: {
             {` · ${rule.definition.severity ?? "info"}`}
           </div>
         </div>
-        <button className="text-xs text-neutral-400 hover:underline" onClick={onToggle}>
-          {rule.enabled ? "disable" : "enable"}
-        </button>
-        <button className="text-xs text-red-400 hover:underline" onClick={onDelete}>
-          delete
-        </button>
+        {isAdmin && (
+          <>
+            <button className="text-xs text-neutral-400 hover:underline" onClick={onToggle}>
+              {rule.enabled ? "disable" : "enable"}
+            </button>
+            <button className="text-xs text-red-400 hover:underline" onClick={onDelete}>
+              delete
+            </button>
+          </>
+        )}
       </div>
 
       <div className="mt-2 pl-2 border-l-2 border-neutral-800 text-xs flex flex-wrap items-center gap-2">
@@ -199,17 +210,19 @@ function RuleRow({ rule, channels, subscriptions, onToggle, onDelete }: {
               className="inline-flex items-center gap-1 bg-neutral-800 rounded px-2 py-0.5"
             >
               {c ? `${c.name} (${c.kind})` : s.channel_id.slice(0, 8)}
-              <button
-                className="text-red-400 hover:text-red-300"
-                onClick={() => delSub.mutate(s.id)}
-                title="unsubscribe"
-              >
-                ×
-              </button>
+              {isAdmin && (
+                <button
+                  className="text-red-400 hover:text-red-300"
+                  onClick={() => delSub.mutate(s.id)}
+                  title="unsubscribe"
+                >
+                  ×
+                </button>
+              )}
             </span>
           );
         })}
-        {available.length > 0 && (
+        {isAdmin && available.length > 0 && (
           <>
             <select
               className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5"
