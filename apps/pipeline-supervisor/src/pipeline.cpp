@@ -46,8 +46,11 @@ std::string short_id() {
 }
 
 struct ProbeCtx {
-    std::string    camera_id;
-    NatsPublisher* nats;
+    std::string           camera_id;
+    NatsPublisher*        nats;
+    // Snapshot of the effective mute set, resolved at worker startup.
+    // The probe short-circuits on empty so unmuted cameras pay zero.
+    std::set<std::string> muted_classes;
 };
 
 // JSON-escape minimal — only the fields we emit. Labels are small ASCII, IDs
@@ -95,6 +98,16 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             float h = obj->rect_params.height / float(H);
 
             const char* label = obj->obj_label[0] ? obj->obj_label : "object";
+
+            // Class-mute gate at source. Drops before NATS publish so
+            // muted classes don't reach Live bboxes, SSE, or event-
+            // processor. The Go rules engine runs an identical gate as
+            // defence-in-depth; both staying in sync is enforced by the
+            // resolution formula living in both languages.
+            if (!ctx->muted_classes.empty() &&
+                ctx->muted_classes.count(label) > 0) {
+                continue;
+            }
 
             std::ostringstream js;
             js << "{"
@@ -407,7 +420,7 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                 // Leaked on purpose: lifetime matches the pipeline, cleaned up
                 // when the process exits. Fine for M2, tighten when we have
                 // multi-pipeline lifecycle.
-                auto* ctx = new ProbeCtx{cam_.id, nats_};
+                auto* ctx = new ProbeCtx{cam_.id, nats_, cam_.muted_classes};
                 gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe, ctx, nullptr);
                 gst_object_unref(src);
             }

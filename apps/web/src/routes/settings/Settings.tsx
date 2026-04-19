@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, DetectorSettings, NotificationChannel } from "@/lib/api";
+import { api, ClassMutes as ClassMutesT, DetectorSettings, NotificationChannel } from "@/lib/api";
+import { loadCocoLabels, classCategory, CATEGORY_ORDER } from "@/lib/classes";
 
 export function Settings() {
   const { data: info } = useQuery({ queryKey: ["info"], queryFn: api.systemInfo });
@@ -8,6 +9,7 @@ export function Settings() {
   return (
     <div className="p-4 space-y-6 max-w-3xl">
       <Detector />
+      <ClassMutes />
 
       <section>
         <h2 className="text-lg font-semibold mb-2">System</h2>
@@ -132,6 +134,186 @@ function Detector() {
       </div>
     </section>
   );
+}
+
+// Three-bucket class-mute editor (global / indoor / outdoor). Each bucket
+// is an independent set — the server unions them with the camera's
+// location_kind to produce the effective mute set. Per-camera overrides
+// live on the camera row, not here.
+function ClassMutes() {
+  const qc = useQueryClient();
+  const { data: server } = useQuery({
+    queryKey: ["class-mutes"],
+    queryFn: api.getClassMutes,
+  });
+  const [labels, setLabels] = useState<string[]>([]);
+  useEffect(() => {
+    loadCocoLabels().then(setLabels);
+  }, []);
+
+  // Local editable copy. Null = not yet seeded.
+  const [local, setLocal] = useState<ClassMutesT | null>(null);
+  useEffect(() => {
+    if (server && !local) setLocal(server);
+  }, [server, local]);
+
+  const [expanded, setExpanded] = useState(false);
+  const [openCats, setOpenCats] = useState<Record<string, boolean>>({});
+
+  const grouped = useMemo(() => {
+    const g: Record<string, string[]> = {};
+    for (const c of CATEGORY_ORDER) g[c] = [];
+    for (const l of labels) g[classCategory(l)].push(l);
+    return g;
+  }, [labels]);
+
+  const save = useMutation({
+    mutationFn: async (m: ClassMutesT) => {
+      await api.updateClassMutes(m);
+      // Pipeline workers snapshot their mute set at spawn, so a restart
+      // is needed to stop muted classes from reaching Live bboxes. The
+      // event-processor gate already picks up the change within 30s,
+      // which keeps PG / sidecar / rules correct in the meantime.
+      await api.restartPipeline();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["class-mutes"] });
+      qc.invalidateQueries({ queryKey: ["pipeline-state"] });
+    },
+  });
+
+  if (!local) {
+    return (
+      <section>
+        <h2 className="text-lg font-semibold mb-2">Muted classes</h2>
+        <p className="text-sm text-neutral-500">Loading…</p>
+      </section>
+    );
+  }
+
+  const has = (bucket: keyof ClassMutesT, cls: string) =>
+    local[bucket].includes(cls);
+  const toggle = (bucket: keyof ClassMutesT, cls: string) => {
+    setLocal((prev) => {
+      if (!prev) return prev;
+      const set = new Set(prev[bucket]);
+      if (set.has(cls)) set.delete(cls);
+      else set.add(cls);
+      return { ...prev, [bucket]: Array.from(set).sort() };
+    });
+  };
+
+  const dirty =
+    !!server &&
+    (bucketDiffers(server.global, local.global) ||
+      bucketDiffers(server.indoor, local.indoor) ||
+      bucketDiffers(server.outdoor, local.outdoor));
+
+  return (
+    <section>
+      <div className="flex items-baseline gap-3">
+        <button
+          className="text-lg font-semibold flex items-center gap-1 hover:text-neutral-300"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <span className="inline-block w-3">{expanded ? "▾" : "▸"}</span>
+          Muted classes
+        </button>
+        <span className="text-sm text-neutral-500">
+          {local.global.length} global · {local.indoor.length} indoor ·{" "}
+          {local.outdoor.length} outdoor
+        </span>
+        {dirty && (
+          <button
+            className="ml-auto bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
+            disabled={save.isPending}
+            onClick={() => save.mutate(local)}
+          >
+            {save.isPending ? "Saving…" : "Save and restart pipeline"}
+          </button>
+        )}
+      </div>
+      <p className="text-sm text-neutral-500 mt-1">
+        Detections in any muted class are dropped before the timeline
+        and rules engine. Indoor/outdoor buckets apply on top of global
+        to cameras tagged with that location (Cameras → expand a row).
+        Per-camera overrides let one camera ignore or re-enable a class.
+      </p>
+
+      {expanded && (
+        <div className="mt-3 rounded border border-neutral-800 divide-y divide-neutral-800">
+          <div className="grid grid-cols-[1fr_4rem_4rem_4rem] gap-2 items-center px-3 py-1 bg-neutral-900 text-xs text-neutral-500 uppercase">
+            <span>Class</span>
+            <span className="text-center">Global</span>
+            <span className="text-center">Indoor</span>
+            <span className="text-center">Outdoor</span>
+          </div>
+          {CATEGORY_ORDER.map((cat) => {
+            const classes = grouped[cat] ?? [];
+            if (classes.length === 0) return null;
+            const open = !!openCats[cat];
+            const counts = {
+              global: classes.filter((c) => has("global", c)).length,
+              indoor: classes.filter((c) => has("indoor", c)).length,
+              outdoor: classes.filter((c) => has("outdoor", c)).length,
+            };
+            return (
+              <div key={cat}>
+                <button
+                  className="w-full grid grid-cols-[1fr_4rem_4rem_4rem] gap-2 items-center px-3 py-1 text-left hover:bg-neutral-900"
+                  onClick={() =>
+                    setOpenCats((p) => ({ ...p, [cat]: !open }))
+                  }
+                >
+                  <span className="text-sm font-medium">
+                    <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
+                    {cat} <span className="text-neutral-500">({classes.length})</span>
+                  </span>
+                  <span className="text-center text-xs text-neutral-500">{counts.global || ""}</span>
+                  <span className="text-center text-xs text-neutral-500">{counts.indoor || ""}</span>
+                  <span className="text-center text-xs text-neutral-500">{counts.outdoor || ""}</span>
+                </button>
+                {open &&
+                  classes.map((cls) => (
+                    <div
+                      key={cls}
+                      className="grid grid-cols-[1fr_4rem_4rem_4rem] gap-2 items-center px-3 py-1 text-sm"
+                    >
+                      <span className="pl-5 text-neutral-300">{cls}</span>
+                      <input
+                        type="checkbox"
+                        className="mx-auto"
+                        checked={has("global", cls)}
+                        onChange={() => toggle("global", cls)}
+                      />
+                      <input
+                        type="checkbox"
+                        className="mx-auto"
+                        checked={has("indoor", cls)}
+                        onChange={() => toggle("indoor", cls)}
+                      />
+                      <input
+                        type="checkbox"
+                        className="mx-auto"
+                        checked={has("outdoor", cls)}
+                        onChange={() => toggle("outdoor", cls)}
+                      />
+                    </div>
+                  ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function bucketDiffers(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return true;
+  const s = new Set(a);
+  for (const x of b) if (!s.has(x)) return true;
+  return false;
 }
 
 function PipelineStatusChip({ state }: { state?: { state: string; variant?: string; precision?: string; message?: string } }) {

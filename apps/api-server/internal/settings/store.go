@@ -101,3 +101,75 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	}
 	return s.Set(ctx, "detector.yolo26_precision", pb)
 }
+
+// ClassMutes is the three-bucket class-mute configuration applied by
+// event-processor: global covers every camera; indoor/outdoor apply on
+// top of global to cameras tagged with the matching location_kind.
+// Per-camera overrides (on the cameras row) can add or subtract from
+// the resolved set. Always-non-nil slices so the JSON shape is stable.
+type ClassMutes struct {
+	Global  []string `json:"global"`
+	Indoor  []string `json:"indoor"`
+	Outdoor []string `json:"outdoor"`
+}
+
+func (s *Store) GetClassMutes(ctx context.Context) (ClassMutes, error) {
+	m := ClassMutes{Global: []string{}, Indoor: []string{}, Outdoor: []string{}}
+	for _, kv := range []struct {
+		key string
+		dst *[]string
+	}{
+		{"classes.disabled.global", &m.Global},
+		{"classes.disabled.indoor", &m.Indoor},
+		{"classes.disabled.outdoor", &m.Outdoor},
+	} {
+		raw, err := s.Get(ctx, kv.key)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return m, err
+		}
+		_ = json.Unmarshal(raw, kv.dst)
+		if *kv.dst == nil {
+			*kv.dst = []string{}
+		}
+	}
+	return m, nil
+}
+
+func (s *Store) SetClassMutes(ctx context.Context, m ClassMutes) error {
+	for _, kv := range []struct {
+		key string
+		src []string
+	}{
+		{"classes.disabled.global", normaliseClassList(m.Global)},
+		{"classes.disabled.indoor", normaliseClassList(m.Indoor)},
+		{"classes.disabled.outdoor", normaliseClassList(m.Outdoor)},
+	} {
+		b, _ := json.Marshal(kv.src)
+		if err := s.Set(ctx, kv.key, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// normaliseClassList returns a non-nil slice with empty strings and
+// duplicates removed. Keeps the on-disk JSON tidy and lets the engine
+// skip the "is this empty" check.
+func normaliseClassList(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}

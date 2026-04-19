@@ -36,8 +36,17 @@ export type Camera = {
   record_mode: string;
   enabled: boolean;
   enabled_detectors?: string[];
+  location_kind?: "indoor" | "outdoor" | null;
+  mute_classes_override?: string[];
+  unmute_classes_override?: string[];
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
+};
+
+export type ClassMutes = {
+  global: string[];
+  indoor: string[];
+  outdoor: string[];
 };
 
 export type LocalDevice = { path: string; label: string; capabilities: string[] };
@@ -118,6 +127,14 @@ export const api = {
     req<void>(`/cameras/${id}`, { method: "DELETE" }),
   updateCameraDetectors: (id: string, body: { enabled_detectors: string[] }) =>
     req<void>(`/cameras/${id}/detectors`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateCameraClasses: (
+    id: string,
+    body: {
+      location_kind?: "indoor" | "outdoor" | "";
+      mute_classes_override?: string[];
+      unmute_classes_override?: string[];
+    },
+  ) => req<void>(`/cameras/${id}/classes`, { method: "PATCH", body: JSON.stringify(body) }),
 
   listZones: (cameraId?: string) =>
     req<Zone[]>(`/zones${cameraId ? `?camera_id=${encodeURIComponent(cameraId)}` : ""}`),
@@ -185,6 +202,11 @@ export const api = {
   getDetectorSettings: () => req<DetectorSettings>("/settings/detector"),
   updateDetectorSettings: (body: DetectorSettings) =>
     req<void>("/settings/detector", { method: "PUT", body: JSON.stringify(body) }),
+
+  // Class-mute hierarchy (global + indoor/outdoor buckets).
+  getClassMutes: () => req<ClassMutes>("/settings/class_mutes"),
+  updateClassMutes: (body: ClassMutes) =>
+    req<void>("/settings/class_mutes", { method: "PUT", body: JSON.stringify(body) }),
 
   // Pipeline lifecycle.
   getPipelineState: () => req<PipelineStateResponse>("/system/pipeline/state"),

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,11 @@ struct CameraConfig {
     std::string url;
     std::string substream_url;   // optional
     std::string recording_mode;  // continuous | motion | event | scheduled | hybrid
+    // Classes to drop at the InferSrcProbe before NATS publish. Resolved
+    // at worker startup using the same formula as the Go rules engine:
+    //   ((global ∪ bucket(location_kind)) \ unmute_override) ∪ mute_override
+    // Empty = no mutes; probe short-circuits cheaply.
+    std::set<std::string> muted_classes;
 };
 
 struct Config {

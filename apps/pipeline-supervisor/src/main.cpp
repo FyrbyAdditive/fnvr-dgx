@@ -25,6 +25,7 @@
 #include <gst/gst.h>
 
 #include "config.h"
+#include "db_reconciler.h"
 #include "nats_publisher.h"
 #include "pipeline.h"
 #include "supervisor.h"
@@ -62,6 +63,15 @@ int main(int argc, char** argv) {
         cam.id = argv[2];
         cam.url = argv[3];
         cam.recording_mode = argv[4];
+        // Resolve the effective mute set from Postgres before the
+        // pipeline builds — gives the InferSrcProbe a point-in-time
+        // snapshot that persists for the life of this worker. Operators
+        // restart the pipeline to apply changes (matches Settings UI).
+        cam.muted_classes = fnvr::ReadMutedClassesForCamera(cfg.database_url, cam.id);
+        if (!cam.muted_classes.empty()) {
+            std::cerr << "worker[" << cam.id << "]: muting "
+                      << cam.muted_classes.size() << " class(es) at pipeline\n";
+        }
 
         fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
                                       cfg.use_deepstream, &nats);

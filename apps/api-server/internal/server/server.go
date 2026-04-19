@@ -120,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 		protected.HandleFunc("GET /api/v1/cameras/{id}", s.handleGetCamera)
 		protected.HandleFunc("DELETE /api/v1/cameras/{id}", s.handleDeleteCamera)
 		protected.HandleFunc("PATCH /api/v1/cameras/{id}/detectors", s.handleUpdateCameraDetectors)
+		protected.HandleFunc("PATCH /api/v1/cameras/{id}/classes", s.handleUpdateCameraClasses)
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -171,6 +172,8 @@ func (s *Server) Handler() http.Handler {
 		if s.settings != nil {
 			protected.HandleFunc("GET /api/v1/settings/detector", s.handleGetDetector)
 			protected.HandleFunc("PUT /api/v1/settings/detector", s.handleUpdateDetector)
+			protected.HandleFunc("GET /api/v1/settings/class_mutes", s.handleGetClassMutes)
+			protected.HandleFunc("PUT /api/v1/settings/class_mutes", s.handleUpdateClassMutes)
 		}
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
@@ -210,6 +213,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		if s.settings != nil {
 			mux.Handle("/api/v1/settings/detector", guarded)
+			mux.Handle("/api/v1/settings/class_mutes", guarded)
 		}
 		if s.pipelineStat != nil {
 			mux.Handle("/api/v1/system/pipeline/state", guarded)
@@ -336,19 +340,22 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			}
 		}
 		out = append(out, map[string]any{
-			"id":                c.ID,
-			"name":              c.Name,
-			"url":               c.URL,
-			"substream":         c.Substream,
-			"record_mode":       c.RecordMode,
-			"enabled":           c.Enabled,
-			"retention_days":    c.RetentionDays,
-			"quota_gb":          c.QuotaGB,
-			"group_id":          c.GroupID,
-			"enabled_detectors": c.EnabledDetectors,
-			"created_at":        c.CreatedAt,
-			"updated_at":        c.UpdatedAt,
-			"state":             state,
+			"id":                       c.ID,
+			"name":                     c.Name,
+			"url":                      c.URL,
+			"substream":                c.Substream,
+			"record_mode":              c.RecordMode,
+			"enabled":                  c.Enabled,
+			"retention_days":           c.RetentionDays,
+			"quota_gb":                 c.QuotaGB,
+			"group_id":                 c.GroupID,
+			"enabled_detectors":        c.EnabledDetectors,
+			"location_kind":            c.LocationKind,
+			"mute_classes_override":    c.MuteClassesOverride,
+			"unmute_classes_override":  c.UnmuteClassesOverride,
+			"created_at":               c.CreatedAt,
+			"updated_at":               c.UpdatedAt,
+			"state":                    state,
 		})
 	}
 	return out

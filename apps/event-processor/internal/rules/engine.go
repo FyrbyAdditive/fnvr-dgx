@@ -47,6 +47,14 @@ type Engine struct {
 	// new cameras keep behaving like they always did.
 	enabledDetectors map[string][]string
 
+	// Per-camera resolved class-mute set. Computed in reload() from:
+	//   - settings.classes.disabled.{global,indoor,outdoor}
+	//   - cameras.{location_kind, mute_classes_override,
+	//     unmute_classes_override}
+	// The onDetection gate just does an O(1) map lookup on (camera_id,
+	// class_name). Absent camera in the outer map = no mutes (fast path).
+	mutedClasses map[string]map[string]struct{}
+
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
 
@@ -144,6 +152,7 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		sidecar:          sw,
 		zones:            map[string][]Zone{},
 		enabledDetectors: map[string][]string{},
+		mutedClasses:     map[string]map[string]struct{}{},
 		cooldowns:        map[string]time.Time{},
 		tracks:           map[string]trackEntry{},
 	}, nil
@@ -256,36 +265,104 @@ func (e *Engine) reload(ctx context.Context) error {
 		compiled = append(compiled, compiledRule{Rule: r, classes: cls})
 	}
 
-	// Per-camera detector whitelist. Empty array on disk = "all enabled";
-	// we preserve that meaning in memory by leaving the key out of the map
-	// (absent ⇒ allow-all in the gate).
-	crows, err := e.pool.Query(ctx, `SELECT id, enabled_detectors FROM cameras`)
+	// Per-camera detector whitelist + class-mute overrides. Empty
+	// enabled_detectors on disk = "all enabled"; we preserve that by
+	// leaving the key out of the enabled map (absent ⇒ allow-all).
+	crows, err := e.pool.Query(ctx, `
+		SELECT id, enabled_detectors, location_kind,
+		       mute_classes_override, unmute_classes_override
+		FROM cameras`)
 	if err != nil {
 		return err
 	}
 	enabled := map[string][]string{}
+	type camMutes struct {
+		location string // "", "indoor", or "outdoor"
+		mute     []string
+		unmute   []string
+	}
+	camsByID := map[string]camMutes{}
 	for crows.Next() {
 		var id string
 		var kinds []string
-		if err := crows.Scan(&id, &kinds); err != nil {
+		var location *string
+		var mute, unmute []string
+		if err := crows.Scan(&id, &kinds, &location, &mute, &unmute); err != nil {
 			crows.Close()
 			return err
 		}
 		if len(kinds) > 0 {
 			enabled[id] = kinds
 		}
+		loc := ""
+		if location != nil {
+			loc = *location
+		}
+		camsByID[id] = camMutes{location: loc, mute: mute, unmute: unmute}
 	}
 	crows.Close()
+
+	// Class-mute buckets from settings. Missing rows = empty bucket —
+	// first-boot safety, since migration 0008 seeds them but a
+	// pre-migration start shouldn't break.
+	bucket := func(key string) []string {
+		var raw []byte
+		err := e.pool.QueryRow(ctx,
+			`SELECT value FROM settings WHERE key=$1`, key).Scan(&raw)
+		if err != nil {
+			return nil
+		}
+		var out []string
+		_ = json.Unmarshal(raw, &out)
+		return out
+	}
+	globalMutes := bucket("classes.disabled.global")
+	indoorMutes := bucket("classes.disabled.indoor")
+	outdoorMutes := bucket("classes.disabled.outdoor")
+
+	muted := map[string]map[string]struct{}{}
+	for id, cm := range camsByID {
+		// Start with global, add the location bucket that matches.
+		set := map[string]struct{}{}
+		for _, c := range globalMutes {
+			set[c] = struct{}{}
+		}
+		switch cm.location {
+		case "indoor":
+			for _, c := range indoorMutes {
+				set[c] = struct{}{}
+			}
+		case "outdoor":
+			for _, c := range outdoorMutes {
+				set[c] = struct{}{}
+			}
+		}
+		// Subtract the camera's unmute_override, then add its
+		// mute_override. Order matters: unmute-then-mute lets an
+		// operator unmute a class globally-muted *and* then re-mute it
+		// themselves — weird but unambiguous.
+		for _, c := range cm.unmute {
+			delete(set, c)
+		}
+		for _, c := range cm.mute {
+			set[c] = struct{}{}
+		}
+		if len(set) > 0 {
+			muted[id] = set
+		}
+	}
 
 	e.mu.Lock()
 	e.rules = compiled
 	e.zones = zones
 	e.enabledDetectors = enabled
+	e.mutedClasses = muted
 	e.mu.Unlock()
 	slog.Info("rules reloaded",
 		"rules", len(compiled),
 		"zone_cameras", len(zones),
-		"detector_filtered_cameras", len(enabled))
+		"detector_filtered_cameras", len(enabled),
+		"class_muted_cameras", len(muted))
 	return nil
 }
 
@@ -294,6 +371,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	rules := e.rules
 	zones := e.zones[d.CameraID]
 	allowed := e.enabledDetectors[d.CameraID]
+	muted := e.mutedClasses[d.CameraID]
 	e.mu.RUnlock()
 
 	// Per-camera detector whitelist — e.g. ANPR is pointless on indoor
@@ -312,6 +390,15 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	// because "inside" is not well-defined for them.
 	if isMuted(d, zones) {
 		return nil
+	}
+
+	// Class-mute hierarchy (global ∪ location-bucket, minus per-camera
+	// unmute, plus per-camera mute). Resolved in reload() so this hot
+	// path is an O(1) lookup.
+	if muted != nil {
+		if _, hit := muted[d.ClassName]; hit {
+			return nil
+		}
 	}
 
 	// Persist raw detection — the timeline reads from here.

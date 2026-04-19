@@ -26,9 +26,18 @@ type Camera struct {
 	// EnabledDetectors is a whitelist of detector kinds (e.g. ["object"]) —
 	// empty array means "every detector" (the friendly default so legacy
 	// rows behave like they always did).
-	EnabledDetectors []string  `json:"enabled_detectors"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	EnabledDetectors []string `json:"enabled_detectors"`
+	// LocationKind selects which class-mute bucket applies on top of
+	// global (indoor/outdoor). nil = no bucket, only global applies.
+	LocationKind *string `json:"location_kind,omitempty"`
+	// MuteClassesOverride adds classes to the mute set for this camera
+	// only (classes muted here even if not in global/location buckets).
+	MuteClassesOverride []string `json:"mute_classes_override"`
+	// UnmuteClassesOverride removes classes from the resolved mute set
+	// for this camera only (re-enables an inherited mute).
+	UnmuteClassesOverride []string  `json:"unmute_classes_override"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 type Store struct {
@@ -41,6 +50,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
+		       location_kind, mute_classes_override, unmute_classes_override,
 		       created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
@@ -52,7 +62,8 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		var c Camera
 		if err := rows.Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode,
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
-			&c.EnabledDetectors, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.EnabledDetectors, &c.LocationKind, &c.MuteClassesOverride,
+			&c.UnmuteClassesOverride, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -65,15 +76,60 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
+		       location_kind, mute_classes_override, unmute_classes_override,
 		       created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
 			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
+			&c.LocationKind, &c.MuteClassesOverride, &c.UnmuteClassesOverride,
 			&c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
 	return c, err
+}
+
+// SetClassMuting updates any combination of {location_kind, mute_override,
+// unmute_override}. Each argument is applied only if non-nil; that way the
+// PATCH endpoint can send partial bodies without us having to pre-read the
+// row. locKind points to "indoor" / "outdoor" / "" (empty string clears the
+// tag and writes NULL); nil leaves it untouched. For the two slices, nil =
+// don't change, empty = clear.
+func (s *Store) SetClassMuting(ctx context.Context, id string,
+	locKind *string, muteOverride, unmuteOverride []string) error {
+	// Build the UPDATE dynamically so we only touch the columns that were
+	// supplied. Always bumps updated_at.
+	sets := []string{"updated_at = NOW()"}
+	args := []any{id}
+	add := func(v any) string {
+		args = append(args, v)
+		return "$" + itoa(len(args))
+	}
+	if locKind != nil {
+		if *locKind == "" {
+			sets = append(sets, "location_kind = NULL")
+		} else {
+			if *locKind != "indoor" && *locKind != "outdoor" {
+				return errors.New("location_kind must be indoor, outdoor, or empty")
+			}
+			sets = append(sets, "location_kind = "+add(*locKind))
+		}
+	}
+	if muteOverride != nil {
+		sets = append(sets, "mute_classes_override = "+add(muteOverride))
+	}
+	if unmuteOverride != nil {
+		sets = append(sets, "unmute_classes_override = "+add(unmuteOverride))
+	}
+	sql := "UPDATE cameras SET " + strings.Join(sets, ", ") + " WHERE id = $1"
+	tag, err := s.pool.Exec(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // SetEnabledDetectors replaces the camera's detector whitelist. Nil = "all

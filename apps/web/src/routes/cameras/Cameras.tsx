@@ -1,6 +1,7 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Camera } from "@/lib/api";
+import { loadCocoLabels } from "@/lib/classes";
 import { ZoneEditor } from "./ZoneEditor";
 
 
@@ -150,6 +151,7 @@ function CameraRow({ camera, onDelete }: { camera: Camera; onDelete: () => void 
       </div>
       {expanded && (
         <div className="px-3 pb-3 space-y-3">
+          <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
         </div>
@@ -205,6 +207,204 @@ function DetectorToggle({ camera }: { camera: Camera }) {
             {k.label}
           </label>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// LocationAndOverrides bundles the per-camera bits of the class-mute
+// hierarchy: which bucket (indoor/outdoor/none) applies, plus two chip-
+// input lists that add or subtract from the resolved mute set.
+function LocationAndOverrides({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const { data: globalMutes } = useQuery({
+    queryKey: ["class-mutes"],
+    queryFn: api.getClassMutes,
+  });
+  const [labels, setLabels] = useState<string[]>([]);
+  useEffect(() => {
+    loadCocoLabels().then(setLabels);
+  }, []);
+
+  // Pipeline workers snapshot muted_classes at spawn, so a change only
+  // stops muted bboxes from reaching Live after a restart. We PATCH
+  // immediately (so sidecar/PG side picks up via the 30s reload) but
+  // defer the expensive restart to an explicit Apply — chip-editing
+  // otherwise fires a 10s video gap per click.
+  const [hasEdits, setHasEdits] = useState(false);
+
+  const patch = useMutation({
+    mutationFn: (body: Parameters<typeof api.updateCameraClasses>[1]) =>
+      api.updateCameraClasses(camera.id, body),
+    onSuccess: () => {
+      setHasEdits(true);
+      qc.invalidateQueries({ queryKey: ["cameras"] });
+    },
+  });
+
+  const restart = useMutation({
+    mutationFn: () => api.restartPipeline(),
+    onSuccess: () => {
+      setHasEdits(false);
+      qc.invalidateQueries({ queryKey: ["pipeline-state"] });
+    },
+  });
+
+  const loc = (camera.location_kind ?? "") as "" | "indoor" | "outdoor";
+  const muteOv = camera.mute_classes_override ?? [];
+  const unmuteOv = camera.unmute_classes_override ?? [];
+
+  // Classes muted by inheritance for this camera (global + the location
+  // bucket). These are the candidates the operator can re-enable.
+  const inherited = useMemo(() => {
+    if (!globalMutes) return [];
+    const set = new Set<string>(globalMutes.global);
+    if (loc === "indoor") for (const c of globalMutes.indoor) set.add(c);
+    if (loc === "outdoor") for (const c of globalMutes.outdoor) set.add(c);
+    return Array.from(set).sort();
+  }, [globalMutes, loc]);
+
+  const setLoc = (next: "" | "indoor" | "outdoor") =>
+    patch.mutate({ location_kind: next });
+
+  const toggleMute = (cls: string) => {
+    const next = muteOv.includes(cls)
+      ? muteOv.filter((c) => c !== cls)
+      : [...muteOv, cls].sort();
+    patch.mutate({ mute_classes_override: next });
+  };
+  const toggleUnmute = (cls: string) => {
+    const next = unmuteOv.includes(cls)
+      ? unmuteOv.filter((c) => c !== cls)
+      : [...unmuteOv, cls].sort();
+    patch.mutate({ unmute_classes_override: next });
+  };
+
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800 space-y-2">
+      {hasEdits && (
+        <div className="flex items-center gap-2 text-xs bg-amber-900/30 border border-amber-700/40 rounded px-2 py-1">
+          <span className="text-amber-200">
+            Pipeline restart needed for Live bboxes to reflect these changes.
+          </span>
+          <button
+            className="ml-auto bg-amber-700 hover:bg-amber-600 rounded px-2 py-0.5"
+            disabled={restart.isPending}
+            onClick={() => restart.mutate()}
+          >
+            {restart.isPending ? "Restarting…" : "Restart pipeline"}
+          </button>
+        </div>
+      )}
+      <div className="flex items-center gap-2 text-xs">
+        <span className="text-neutral-400">Location</span>
+        <select
+          className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5"
+          value={loc}
+          onChange={(e) => setLoc(e.target.value as "" | "indoor" | "outdoor")}
+          disabled={patch.isPending}
+        >
+          <option value="">— none —</option>
+          <option value="indoor">indoor</option>
+          <option value="outdoor">outdoor</option>
+        </select>
+        <span className="text-neutral-600">
+          picks which class-mute bucket applies here
+        </span>
+      </div>
+
+      <ChipPicker
+        title="Also mute on this camera"
+        hint="Classes added only for this camera, on top of global/location."
+        selected={muteOv}
+        candidates={labels}
+        onToggle={toggleMute}
+        disabled={patch.isPending}
+      />
+
+      {inherited.length > 0 && (
+        <ChipPicker
+          title="Re-enable from inherited"
+          hint={`Classes currently muted by global${loc ? `/${loc}` : ""} that this camera should still see.`}
+          selected={unmuteOv}
+          candidates={inherited}
+          onToggle={toggleUnmute}
+          disabled={patch.isPending}
+        />
+      )}
+    </div>
+  );
+}
+
+// ChipPicker is a generic "show selected as chips, plus a datalist input
+// to add". Enter key or blur commits. Clicking a chip toggles it off.
+// Kept local to Cameras.tsx since it's only used here.
+function ChipPicker({
+  title,
+  hint,
+  selected,
+  candidates,
+  onToggle,
+  disabled,
+}: {
+  title: string;
+  hint: string;
+  selected: string[];
+  candidates: string[];
+  onToggle: (cls: string) => void;
+  disabled?: boolean;
+}) {
+  const [draft, setDraft] = useState("");
+  const listId = `chips-${title.replace(/\s+/g, "-")}`;
+  const commit = () => {
+    const v = draft.trim();
+    if (!v) return;
+    if (!candidates.includes(v)) {
+      // Allow anyway — operators may mute classes a future model has,
+      // or COCO class names we don't know about. Harmless no-op if so.
+    }
+    onToggle(v);
+    setDraft("");
+  };
+  return (
+    <div>
+      <div className="text-xs text-neutral-400 mb-1">
+        {title} <span className="text-neutral-600">· {hint}</span>
+      </div>
+      <div className="flex flex-wrap gap-1 items-center">
+        {selected.map((c) => (
+          <button
+            key={c}
+            className="text-xs bg-neutral-800 hover:bg-red-900 rounded px-2 py-0.5"
+            disabled={disabled}
+            onClick={() => onToggle(c)}
+            title="remove"
+          >
+            {c} ✕
+          </button>
+        ))}
+        <input
+          className="text-xs bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5 min-w-[10rem]"
+          placeholder="add class…"
+          list={listId}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commit();
+            }
+          }}
+          onBlur={commit}
+          disabled={disabled}
+        />
+        <datalist id={listId}>
+          {candidates
+            .filter((c) => !selected.includes(c))
+            .map((c) => (
+              <option key={c} value={c} />
+            ))}
+        </datalist>
       </div>
     </div>
   );
