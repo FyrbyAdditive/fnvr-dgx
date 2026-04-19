@@ -20,6 +20,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/server"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
+	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
 )
 
 func main() {
@@ -119,6 +120,14 @@ func runServe() error {
 		return fmt.Errorf("events start: %w", err)
 	}
 
+	whepReg, err := whep.NewRegistry(cfg.NATSURL)
+	if err != nil {
+		return fmt.Errorf("whep registry: %w", err)
+	}
+	if err := whepReg.Start(ctx); err != nil {
+		return fmt.Errorf("whep start: %w", err)
+	}
+
 	srv := server.New(server.Deps{
 		Config:    cfg,
 		Pool:      pool,
@@ -128,6 +137,7 @@ func runServe() error {
 		Events:    bus,
 		Rules:     rules.NewStore(pool),
 		Snapshots: snapshot.New(cfg.DataDir + "/recordings"),
+		Whep:      whepReg,
 	})
 
 	httpSrv := &http.Server{

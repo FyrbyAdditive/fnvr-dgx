@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/system"
+	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
 )
 
 type Server struct {
@@ -30,6 +33,7 @@ type Server struct {
 	events   *events.Bus
 	rules    *rules.Store
 	snaps    *snapshot.Service
+	whep     *whep.Registry
 }
 
 type Deps struct {
@@ -41,6 +45,7 @@ type Deps struct {
 	Events    *events.Bus
 	Rules     *rules.Store
 	Snapshots *snapshot.Service
+	Whep      *whep.Registry
 }
 
 func New(d Deps) *Server {
@@ -53,6 +58,7 @@ func New(d Deps) *Server {
 		events:   d.Events,
 		rules:    d.Rules,
 		snaps:    d.Snapshots,
+		whep:     d.Whep,
 	}
 }
 
@@ -81,6 +87,10 @@ func (s *Server) Handler() http.Handler {
 		protected.HandleFunc("DELETE /api/v1/cameras/{id}", s.handleDeleteCamera)
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
+		}
+		if s.whep != nil {
+			protected.HandleFunc("POST /api/v1/cameras/{id}/whep", s.handleWhepOffer)
+			protected.HandleFunc("OPTIONS /api/v1/cameras/{id}/whep", s.handleWhepOptions)
 		}
 
 		if s.rules != nil {
@@ -266,6 +276,57 @@ func (s *Server) handleDeleteCamera(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.pipeline.RemoveCamera(ctxWithTimeout(r.Context()), id); err != nil {
 		slog.Warn("pipeline.RemoveCamera failed", "id", id, "err", err)
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleWhepOffer proxies a browser's SDP offer to the pipeline worker that
+// owns the camera. Returns the worker's SDP answer verbatim.
+func (s *Server) handleWhepOffer(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	entry, ok := s.whep.Lookup(id)
+	if !ok {
+		http.Error(w, "camera not streaming", http.StatusNotFound)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if len(body) == 0 {
+		http.Error(w, "empty offer", http.StatusBadRequest)
+		return
+	}
+
+	// Worker binds on pipeline container network interface; docker DNS
+	// resolves "pipeline" to that container. Any port the worker bound
+	// is reachable internally regardless of compose `ports:` declaration.
+	url := fmt.Sprintf("http://pipeline:%d/whep", entry.Port)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/sdp")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Warn("whep proxy", "camera", id, "err", err)
+		http.Error(w, "worker unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/sdp")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(respBody)
+}
+
+func (s *Server) handleWhepOptions(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.WriteHeader(http.StatusNoContent)
 }
 

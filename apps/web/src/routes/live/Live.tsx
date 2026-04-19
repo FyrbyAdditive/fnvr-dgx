@@ -53,7 +53,67 @@ function CameraTile({ id, name, detections }: {
   name: string;
   detections: DetectionEvent[];
 }) {
-  // Refresh the snapshot every second.
+  // WebRTC live view. Falls back to the 1-fps JPEG snapshot below if the
+  // peer connection can't be established (camera not streaming, browser
+  // blocks insecure getUserMedia, etc.).
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [rtcLive, setRtcLive] = useState(false);
+
+  useEffect(() => {
+    let pc: RTCPeerConnection | null = null;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        pc.ontrack = (e) => {
+          if (!cancelled && videoRef.current && e.streams[0]) {
+            videoRef.current.srcObject = e.streams[0];
+            setRtcLive(true);
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        // Wait for ICE gathering to complete so the offer contains candidates.
+        await new Promise<void>((resolve) => {
+          if (pc!.iceGatheringState === "complete") return resolve();
+          const h = () => {
+            if (pc!.iceGatheringState === "complete") {
+              pc!.removeEventListener("icegatheringstatechange", h);
+              resolve();
+            }
+          };
+          pc!.addEventListener("icegatheringstatechange", h);
+          setTimeout(() => resolve(), 3000);
+        });
+
+        const res = await fetch(`/api/v1/cameras/${encodeURIComponent(id)}/whep`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/sdp" },
+          body: pc.localDescription!.sdp,
+        });
+        if (!res.ok) throw new Error(`whep ${res.status}`);
+        const answer = await res.text();
+        if (cancelled) return;
+        await pc.setRemoteDescription({ type: "answer", sdp: answer });
+      } catch {
+        setRtcLive(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (pc) pc.close();
+    };
+  }, [id]);
+
+  // Snapshot fallback refresh.
   const [t, setT] = useState(() => Date.now());
   useEffect(() => {
     const h = setInterval(() => setT(Date.now()), 1000);
@@ -61,24 +121,27 @@ function CameraTile({ id, name, detections }: {
   }, []);
   const src = `/api/v1/cameras/${encodeURIComponent(id)}/snapshot.jpg?t=${t}`;
 
-  const [ok, setOk] = useState(true);
-  useEffect(() => { setOk(true); }, [id]);
+  const [imgOk, setImgOk] = useState(true);
+  useEffect(() => { setImgOk(true); }, [id]);
 
-  // Overlay is absolutely-positioned at the tile's edges; bbox normalised
-  // 0..1 coords map directly to CSS percentages. We don't need the
-  // natural image dimensions because object-cover stretches to fill.
-  const imgRef = useRef<HTMLImageElement>(null);
   const latest = detections[0];
 
   return (
     <div className="bg-neutral-900 rounded aspect-video relative overflow-hidden">
-      {ok ? (
+      {rtcLive ? (
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+      ) : imgOk ? (
         <img
-          ref={imgRef}
           src={src}
           alt={name}
           className="absolute inset-0 w-full h-full object-cover"
-          onError={() => setOk(false)}
+          onError={() => setImgOk(false)}
         />
       ) : (
         <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm">

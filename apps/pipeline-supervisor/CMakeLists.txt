@@ -11,6 +11,8 @@ pkg_check_modules(GST REQUIRED
   gstreamer-app-1.0
   gstreamer-video-1.0
   gstreamer-pbutils-1.0
+  gstreamer-sdp-1.0
+  gstreamer-webrtc-1.0
   glib-2.0
   gobject-2.0
 )
@@ -28,6 +30,7 @@ add_executable(pipeline-supervisor
   src/config.cpp
   src/db_reconciler.cpp
   src/rtsp_probe.cpp
+  src/whep_server.cpp
 )
 
 # DeepStream headers + libs on Jetson live under /opt/nvidia/deepstream.

@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "rtsp_probe.h"
+#include "whep_server.h"
 
 // DeepStream metadata. Only include when building for Jetson — these headers
 // come from the deepstream-l4t base image.
@@ -298,7 +299,20 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
          "videorate ! video/x-raw,framerate=1/1 ! "
          "jpegenc quality=75 ! "
          "multifilesink location=/var/lib/fnvr/live/" << cam_.id << ".%d.jpg "
-         "  async=false sync=false post-messages=false max-files=4 index=0";
+         "  async=false sync=false post-messages=false max-files=4 index=0 ";
+
+    // --- WebRTC live-view branch ---
+    // A dedicated RTP payloader fed from the H.264 elementary stream;
+    // a tee downstream lets multiple per-viewer webrtcbins (added at
+    // WHEP-negotiation time) tap the same RTP packets. Without the
+    // fakesink here the payloader pad has no peer on startup and the
+    // pipeline won't preroll.
+    p << "t. ! queue max-size-buffers=200 leaky=downstream ! "
+         "h264parse config-interval=-1 ! "
+         "rtph264pay name=pay pt=96 config-interval=-1 aggregate-mode=zero-latency ! "
+         "application/x-rtp,media=video,encoding-name=H264,payload=96 ! "
+         "tee name=rtp_tee allow-not-linked=true ! "
+         "fakesink sync=false async=false";
 
     std::string desc = p.str();
     std::cerr << "pipeline[" << cam_.id << "]: " << desc << "\n";
@@ -388,10 +402,38 @@ bool SingleCameraPipeline::Start() {
         Stop();
         return false;
     }
+
+    // Stand up the WHEP server once the main pipeline is in PLAYING; new
+    // viewer webrtcbins attach to the rtp_tee on demand.
+    GstElement* rtp_tee = gst_bin_get_by_name(GST_BIN(pipeline_), "rtp_tee");
+    if (!rtp_tee) {
+        std::cerr << "pipeline[" << cam_.id << "]: rtp_tee not found in pipeline; webrtc disabled\n";
+    } else {
+        std::cerr << "pipeline[" << cam_.id << "]: rtp_tee found, starting WHEP server\n";
+        whep_ = std::make_unique<WhepServer>(cam_.id, pipeline_, rtp_tee);
+        if (!whep_->Start()) {
+            std::cerr << "pipeline[" << cam_.id << "]: whep server failed to start\n";
+            whep_.reset();
+        } else if (nats_) {
+            // Publish {camera_id, port} so api-server can route WHEP requests.
+            char payload[256];
+            std::snprintf(payload, sizeof(payload),
+                          "{\"camera_id\":\"%s\",\"port\":%d}",
+                          cam_.id.c_str(), whep_->port());
+            std::cerr << "pipeline[" << cam_.id << "]: publishing whep port=" << whep_->port() << "\n";
+            nats_->Publish("fnvr.whep.registry", payload);
+        }
+        gst_object_unref(rtp_tee);
+    }
     return true;
 }
 
+int SingleCameraPipeline::WhepPort() const {
+    return whep_ ? whep_->port() : 0;
+}
+
 void SingleCameraPipeline::Stop() {
+    whep_.reset();
     if (pipeline_) {
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         gst_object_unref(pipeline_);
