@@ -89,6 +89,15 @@ func (s *Server) Handler() http.Handler {
 	// Public routes.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/system/info", s.handleSystemInfo)
+	// Internal, unauthenticated endpoints for the pipeline container's
+	// entrypoint. Read-only; safe because the docker bridge isolates
+	// them. In a multi-tenant hosted deploy these would need IP gating.
+	if s.settings != nil {
+		mux.HandleFunc("GET /api/v1/internal/detector", s.handleGetDetector)
+	}
+	if s.cameras != nil {
+		mux.HandleFunc("GET /api/v1/internal/cameras", s.handleInternalListCameras)
+	}
 	if s.auth != nil {
 		mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 	}
@@ -282,6 +291,22 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"username": sess.Username,
 		"role":     sess.Role,
 	})
+}
+
+// handleInternalListCameras returns a minimal {id, name} list for
+// internal container-to-container lookups (e.g. pipeline entrypoint
+// publishing per-camera "starting" states). No auth; no extra fields.
+func (s *Server) handleInternalListCameras(w http.ResponseWriter, r *http.Request) {
+	cams, err := s.cameras.List(r.Context())
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	out := make([]map[string]string, 0, len(cams))
+	for _, c := range cams {
+		out = append(out, map[string]string{"id": c.ID, "name": c.Name})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {

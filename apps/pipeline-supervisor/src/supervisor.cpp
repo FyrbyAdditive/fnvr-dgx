@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <set>
+#include <string>
 #include <thread>
 
 #include <signal.h>
@@ -73,13 +77,43 @@ void Supervisor::reconcileOnce() {
         }
     }
 
-    // Start newly-added cameras. Stagger starts by a couple seconds so
-    // simultaneous TRT engine builds don't race on the shared cache file.
+    // Start newly-added cameras. Two reasons to stagger:
+    //
+    // 1. Fast path (engine cached): short delay avoids a millisecond
+    //    race on the engine deserialize, which matters surprisingly
+    //    little but costs nothing.
+    //
+    // 2. Slow path (first-use build): the first worker compiles the
+    //    TRT engine — a multi-minute operation that eats most of the
+    //    GPU. Spawning workers 2+ during this thrashes each other
+    //    and can take 15+ minutes. Instead, workers 2+ wait until the
+    //    engine file exists on disk before spawning, then all come up
+    //    together in ~2s.
+    //
+    // The engine path comes from the FNVR_INFER_CONFIG env (a rendered
+    // nvinfer config) — parse out model-engine-file= to get it. Empty
+    // on failure disables the gate (falls back to old 3s stagger).
+    std::string engine_path = readEnginePathFromInferConfig();
+
     bool first_start = true;
     for (const auto& cam : want) {
         if (workers_.find(cam.id) != workers_.end()) continue;
         if (!first_start) {
-            std::this_thread::sleep_for(3s);
+            if (!engine_path.empty()) {
+                // Wait for the first worker to produce the engine file.
+                // Cap at 30 min so a hung build doesn't block forever.
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(30);
+                while (!std::filesystem::exists(engine_path) &&
+                       std::chrono::steady_clock::now() < deadline &&
+                       !stop_) {
+                    std::this_thread::sleep_for(2s);
+                }
+                // Small additional delay so the first worker finishes
+                // its own deserialize / nvinfer init before siblings load.
+                std::this_thread::sleep_for(3s);
+            } else {
+                std::this_thread::sleep_for(3s);
+            }
         }
         first_start = false;
         std::cerr << "supervisor: starting [" << cam.id << "] url=" << cam.url << "\n";
@@ -90,6 +124,31 @@ void Supervisor::reconcileOnce() {
         w->thread = std::thread([this, raw] { workerMain(raw); });
         workers_.emplace(cam.id, std::move(w));
     }
+}
+
+// readEnginePathFromInferConfig parses the rendered nvinfer config to
+// extract the model-engine-file path. Returns empty if anything fails;
+// callers treat empty as "no gate, fall back to timed stagger".
+std::string Supervisor::readEnginePathFromInferConfig() const {
+    const char* env = std::getenv("FNVR_INFER_CONFIG");
+    if (!env || !*env) return {};
+    std::filesystem::path cfg_path(env);
+    std::error_code ec;
+    if (!std::filesystem::exists(cfg_path, ec)) return {};
+    std::ifstream f(cfg_path);
+    if (!f) return {};
+    std::string line;
+    while (std::getline(f, line)) {
+        constexpr const char* KEY = "model-engine-file=";
+        auto pos = line.find(KEY);
+        if (pos == std::string::npos) continue;
+        // Strip key + leading whitespace, trim trailing whitespace.
+        std::string val = line.substr(pos + std::char_traits<char>::length(KEY));
+        while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' '))
+            val.pop_back();
+        return val;
+    }
+    return {};
 }
 
 void Supervisor::startWorker(const CameraConfig& /*cam*/) { /* inlined above */ }

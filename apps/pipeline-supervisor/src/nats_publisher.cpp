@@ -24,7 +24,12 @@ bool NatsPublisher::Publish(std::string_view subject, std::string_view payload) 
     std::string subj(subject);
     natsStatus s = natsConnection_Publish(conn_, subj.c_str(), payload.data(),
                                           static_cast<int>(payload.size()));
-    return s == NATS_OK;
+    if (s != NATS_OK) return false;
+    // Flush so short-lived callers (e.g. pipeline-supervisor --publish)
+    // don't drain-and-destroy the connection before the buffered message
+    // actually reaches the broker. 2s is plenty for a localhost bridge.
+    natsConnection_FlushTimeout(conn_, 2000);
+    return true;
 }
 
 }  // namespace fnvr

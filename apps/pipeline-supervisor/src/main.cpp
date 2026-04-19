@@ -10,9 +10,16 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
+
+#include <signal.h>   // kill()
+#include <unistd.h>   // getpid()
 
 #include <glib.h>
 #include <gst/gst.h>
@@ -28,6 +35,18 @@ void HandleSignal(int) { g_stop = 1; }
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Lightweight publish mode — used by pipeline-entrypoint.sh to
+    // announce calibrating / compiling_engine / ready states before the
+    // supervisor is actually up. Invoked as:
+    //   pipeline-supervisor --publish <subject> <payload>
+    if (argc >= 4 && std::string(argv[1]) == "--publish") {
+        auto cfg = fnvr::LoadFromEnv();
+        fnvr::NatsPublisher nats(cfg.nats_url);
+        if (!nats.Connected()) return 1;
+        bool ok = nats.Publish(argv[2], argv[3]);
+        return ok ? 0 : 2;
+    }
+
     // Worker mode: one subprocess per camera. Isolates splitmuxsink / nvinfer
     // asserts so a single bad camera can't crash the whole supervisor.
     // Invoked as: pipeline-supervisor --worker <camera_id> <url> <record_mode>
@@ -129,6 +148,12 @@ int main(int argc, char** argv) {
                 [](natsConnection*, natsSubscription*, natsMsg* msg, void*) {
                     std::cerr << "pipeline-supervisor: received restart signal\n";
                     g_stop = 1;
+                    // Main thread is parked in pause(); poke it with a
+                    // process-level signal so its pause() returns and the
+                    // loop notices g_stop. std::raise() only signals the
+                    // calling thread; kill(getpid(), ...) signals the
+                    // process which wakes whichever thread is in pause().
+                    kill(getpid(), SIGTERM);
                     natsMsg_Destroy(msg);
                 }, nullptr);
         } else {
@@ -137,8 +162,43 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Announce ready to the pipeline-state stream so the UI banner clears.
-    nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+    // Announce ready to the pipeline-state stream so the UI banner
+    // clears — but only if the engine file actually exists, otherwise
+    // we'd clobber the entrypoint's "compiling_engine" state while the
+    // first worker is still compiling.
+    // Just set an env-hint — the supervisor's first worker will publish
+    // ready itself on reaching PLAYING via the per-worker state path,
+    // but we also want the global pipeline-state to flip. Easiest: let
+    // workers' camera-state "running" publishes double as a proxy for
+    // pipeline-ready, and have the supervisor publish ready once the
+    // reconcile loop has successfully spawned at least one worker. For
+    // now, the simplest correct behaviour: do not publish ready here if
+    // FNVR_INFER_CONFIG points at a file that references a missing
+    // engine. If unsure, default to publishing ready (backwards-
+    // compatible with the old single-config path).
+    {
+        bool publish_ready = true;
+        const char* cfg_env = std::getenv("FNVR_INFER_CONFIG");
+        if (cfg_env && *cfg_env) {
+            std::ifstream cf(cfg_env);
+            std::string line;
+            while (std::getline(cf, line)) {
+                const char* KEY = "model-engine-file=";
+                auto pos = line.find(KEY);
+                if (pos == std::string::npos) continue;
+                std::string val = line.substr(pos + std::strlen(KEY));
+                while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' '))
+                    val.pop_back();
+                if (!val.empty() && !std::filesystem::exists(val)) {
+                    publish_ready = false;
+                }
+                break;
+            }
+        }
+        if (publish_ready) {
+            nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+        }
+    }
 
     fnvr::Supervisor sup(cfg, &nats);
     std::thread runner([&sup] { sup.Run(); });

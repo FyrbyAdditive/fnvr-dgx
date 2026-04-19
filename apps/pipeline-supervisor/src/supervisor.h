@@ -41,6 +41,7 @@ private:
     void startWorker(const CameraConfig& cam);
     void stopWorker(const std::string& id);
     void workerMain(Worker* w);
+    std::string readEnginePathFromInferConfig() const;
 
     Config         cfg_;
     NatsPublisher* nats_;

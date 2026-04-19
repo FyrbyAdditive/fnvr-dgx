@@ -85,11 +85,17 @@ fi
 VARIANT="${FNVR_YOLO_VARIANT:-yolo26x}"
 PRECISION="${FNVR_YOLO_PRECISION:-fp16}"
 
-SETTINGS_URL="${FNVR_SETTINGS_URL:-http://api:8081/api/v1/settings/detector}"
+SETTINGS_URL="${FNVR_SETTINGS_URL:-http://api:8081/api/v1/internal/detector}"
 if command -v curl >/dev/null 2>&1; then
     # Best-effort fetch; ignore failure. 5s timeout because the api may be
-    # starting in parallel.
-    SETTINGS_JSON=$(curl -s --max-time 5 -H "X-Fnvr-Internal: 1" "$SETTINGS_URL" 2>/dev/null || true)
+    # starting in parallel. Retry a couple of times since the api may still
+    # be running its DB migration on first-ever boot.
+    SETTINGS_JSON=""
+    for _ in 1 2 3; do
+        SETTINGS_JSON=$(curl -s --max-time 5 "$SETTINGS_URL" 2>/dev/null || true)
+        [ -n "$SETTINGS_JSON" ] && break
+        sleep 2
+    done
     if [ -n "$SETTINGS_JSON" ]; then
         V=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_variant":"\([^"]*\)".*/\1/p')
         P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
@@ -100,37 +106,35 @@ fi
 
 echo "entrypoint: detector variant=$VARIANT precision=$PRECISION"
 
-# Simple NATS publisher via nats-box would be ideal, but it's not in the
-# image. Use nats.c's `natsConnection_Publish` from a tiny helper? Too
-# much. Instead, publish via nats-pub if available, else rely on the
-# supervisor publishing "ready" once it reaches the main loop. For
-# calibration (which can run minutes) we write a marker to stderr the
-# supervisor picks up on startup — but for the banner UX to work we
-# really do need a publish here. Use a one-shot Python NATS client if
-# python3 is present (it is — we installed it for ONNX export).
+# Fetch the current camera list and publish a "starting" state for each
+# one so the Live tiles don't show "pipeline offline" during the long
+# calibrate/compile phases. Keeps the per-camera state in sync with the
+# global pipeline-state banner.
+CAMERAS_JSON=$(curl -s --max-time 5 "http://api:8081/api/v1/internal/cameras" 2>/dev/null || true)
+# Parser: the payload is a single JSON array on one line. Use grep -o to
+# extract all "id":"..." occurrences, then cut to the id value.
+printf '%s' "$CAMERAS_JSON" \
+    | grep -oE '"id":"[^"]*"' \
+    | sed 's/"id":"\([^"]*\)"/\1/' \
+    | while read -r CID; do
+        [ -z "$CID" ] && continue
+        PAYLOAD=$(printf '{"camera_id":"%s","state":"starting"}' "$CID")
+        /usr/local/bin/pipeline-supervisor --publish "fnvr.state.camera.$CID" "$PAYLOAD" || true
+        echo "entrypoint: published starting for $CID"
+    done
+
+# publish_state uses the pipeline-supervisor binary's --publish subcommand.
+# Same nats.c connection code the supervisor itself uses for detections —
+# so no parallel NATS client to maintain. Payloads stay valid JSON and
+# JetStream correctly captures them via the MaxMsgsPerSubject=1 stream
+# api-server declares.
 publish_state() {
-    if [ -z "$FNVR_NATS_URL" ]; then return; fi
     state_name="$1"; message="$2"
-    python3 - <<PY 2>/dev/null || true
-import os, sys, json, socket, struct, threading, time
-# Minimal NATS protocol publisher — no external deps beyond stdlib.
-url = os.environ.get("FNVR_NATS_URL", "nats://nats:4222")
-host, _, port = url.replace("nats://", "").partition(":")
-port = int(port or "4222")
-try:
-    s = socket.create_connection((host, port), timeout=2)
-    # Eat INFO line.
-    s.recv(4096)
-    s.sendall(b"CONNECT {}\r\n")
-    payload = json.dumps({"state": "$state_name", "variant": "$VARIANT",
-                          "precision": "$PRECISION", "message": """$message"""})
-    msg = f"PUB fnvr.state.pipeline {len(payload)}\r\n{payload}\r\n"
-    s.sendall(msg.encode())
-    time.sleep(0.1)
-    s.close()
-except Exception:
-    pass
-PY
+    # Escape " in message — the message is usually static so keep it simple.
+    safe_msg=$(printf '%s' "$message" | sed 's/"/\\"/g')
+    payload=$(printf '{"state":"%s","variant":"%s","precision":"%s","message":"%s"}' \
+        "$state_name" "$VARIANT" "$PRECISION" "$safe_msg")
+    /usr/local/bin/pipeline-supervisor --publish fnvr.state.pipeline "$payload" || true
 }
 
 # If INT8 is selected and no calib.table exists yet for this variant,
@@ -139,7 +143,7 @@ PY
 if [ "$PRECISION" = "int8" ]; then
     CALIB_FILE="$YOLO_DEST/${VARIANT}.calib.table"
     if [ ! -f "$CALIB_FILE" ]; then
-        publish_state "calibrating" "Calibrating INT8 for $VARIANT (one-shot, ~5 min). Subsequent starts are instant."
+        publish_state "calibrating" "Calibrating INT8 for $VARIANT. No calibration table exists for this variant yet; takes a few minutes and is cached on disk after."
         echo "entrypoint: running INT8 calibration for $VARIANT"
         if [ -x /usr/local/bin/calibrate-yolo26.sh ]; then
             if ! /usr/local/bin/calibrate-yolo26.sh "$VARIANT" "$CALIB_FILE"; then
@@ -167,41 +171,13 @@ fi
 
 ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
 if [ ! -f "$ENGINE_FILE" ]; then
-    publish_state "compiling_engine" "Building TensorRT engine for $VARIANT ($PRECISION). First-time only, up to ~10 minutes."
-    echo "entrypoint: engine $ENGINE_FILE missing — pre-building with trtexec"
-
-    # Pre-build the engine in a single process BEFORE spawning workers.
-    # If we let the supervisor fork three workers first, all three fight
-    # for GPU memory at once while trying to compile the same engine,
-    # and each one gets stuck rejecting tactics for 15+ minutes.
-    # Single-process compile gets full memory access and is ~10× faster.
-    TRTEXEC=""
-    if [ -x /usr/src/tensorrt/bin/trtexec ]; then
-        TRTEXEC=/usr/src/tensorrt/bin/trtexec
-    elif command -v trtexec >/dev/null 2>&1; then
-        TRTEXEC=$(command -v trtexec)
-    fi
-
-    if [ -n "$TRTEXEC" ]; then
-        TRTEXEC_FLAGS="--onnx=$YOLO_DEST/${VARIANT}.onnx \
-            --saveEngine=$ENGINE_FILE \
-            --workspace=4096 \
-            --buildOnly"
-        if [ "$PRECISION" = "fp16" ]; then
-            TRTEXEC_FLAGS="$TRTEXEC_FLAGS --fp16"
-        else
-            TRTEXEC_FLAGS="$TRTEXEC_FLAGS --int8 --calib=$YOLO_DEST/${VARIANT}.calib.table"
-        fi
-        # `exec` is not used on purpose — we need to continue after the
-        # compile to actually start the supervisor.
-        if $TRTEXEC $TRTEXEC_FLAGS 2>&1 | tail -20; then
-            echo "entrypoint: engine pre-build completed"
-        else
-            echo "entrypoint: trtexec failed; nvinfer will try to compile anyway" >&2
-        fi
-    else
-        echo "entrypoint: trtexec not found; workers will compile in parallel (slow)" >&2
-    fi
+    publish_state "compiling_engine" "Building TensorRT engine for $VARIANT ($PRECISION). This variant + precision combo hasn't been built before on this device; can take a few minutes."
+    echo "entrypoint: engine $ENGINE_FILE missing — nvinfer will build it on first worker start"
+    # nvinfer does the build correctly; trtexec requires fiddly dynamic-
+    # shape flags matching the ONNX's export profile and still produced
+    # engines with 0 visible output layers. Accept the slower per-worker
+    # compile path; the supervisor staggers workers so only the first
+    # does the heavy lifting, the rest deserialize from cache in ~2s.
 fi
 
 # Render effective config into a writable location. /etc/fnvr is bind-
