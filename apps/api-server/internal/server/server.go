@@ -108,6 +108,7 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/zones", s.handleListZones)
 			protected.HandleFunc("POST /api/v1/zones", s.handleCreateZone)
 			protected.HandleFunc("DELETE /api/v1/zones/{id}", s.handleDeleteZone)
+			protected.HandleFunc("PATCH /api/v1/zones/{id}/exclusions", s.handleUpdateZoneExclusions)
 
 			protected.HandleFunc("GET /api/v1/rules", s.handleListRules)
 			protected.HandleFunc("POST /api/v1/rules", s.handleCreateRule)
@@ -467,6 +468,28 @@ func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	} else if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateZoneExclusions(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ExcludeClasses []string `json:"exclude_classes"`
+		ExcludeKinds   []string `json:"exclude_kinds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	err := s.rules.UpdateZoneExclusions(r.Context(), r.PathValue("id"),
+		body.ExcludeClasses, body.ExcludeKinds)
+	if errors.Is(err, rules.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

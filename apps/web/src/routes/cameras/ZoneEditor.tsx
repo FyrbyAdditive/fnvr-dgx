@@ -167,26 +167,137 @@ export function ZoneEditor({ cameraId, cameraName }: { cameraId: string; cameraN
       </div>
 
       {zones.length > 0 && (
-        <ul className="mt-2 flex flex-wrap gap-2 text-xs">
+        <ul className="mt-2 flex flex-col gap-1 text-xs">
           {zones.map((z) => (
-            <li
-              key={z.id}
-              className="inline-flex items-center gap-1 bg-neutral-800 rounded px-2 py-0.5"
-            >
-              <span>{z.name}</span>
-              <span className="text-neutral-500">· {z.kind}</span>
-              <button
-                className="text-red-400 hover:text-red-300"
-                onClick={() => deleteZone.mutate(z.id)}
-                title="delete zone"
-              >
-                ×
-              </button>
-            </li>
+            <ZoneChip key={z.id} zone={z} onDelete={() => deleteZone.mutate(z.id)} />
           ))}
         </ul>
       )}
     </div>
+  );
+}
+
+const KIND_OPTIONS: { value: string; label: string }[] = [
+  { value: "object", label: "object detection" },
+  { value: "anpr", label: "number plates (ANPR)" },
+  { value: "face", label: "face ID" },
+];
+
+function ZoneChip({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [classesText, setClassesText] = useState(
+    (zone.exclude_classes ?? []).join(", "),
+  );
+  const [kinds, setKinds] = useState<Set<string>>(
+    () => new Set(zone.exclude_kinds ?? []),
+  );
+
+  const update = useMutation({
+    mutationFn: (body: { exclude_classes: string[]; exclude_kinds: string[] }) =>
+      api.updateZoneExclusions(zone.id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["zones"] });
+      qc.invalidateQueries({ queryKey: ["zones", zone.camera_id] });
+      setOpen(false);
+    },
+  });
+
+  const save = () => {
+    const classes = classesText
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    update.mutate({ exclude_classes: classes, exclude_kinds: Array.from(kinds) });
+  };
+
+  const muteSummary =
+    (zone.exclude_classes?.length ?? 0) + (zone.exclude_kinds?.length ?? 0);
+
+  return (
+    <li className="bg-neutral-800 rounded px-2 py-1">
+      <div className="flex items-center gap-2">
+        <span className="font-medium">{zone.name}</span>
+        <span className="text-neutral-500">· {zone.kind}</span>
+        {muteSummary > 0 && (
+          <span
+            className="text-amber-400"
+            title={[
+              ...(zone.exclude_kinds ?? []).map((k) => `mute ${k}`),
+              ...(zone.exclude_classes ?? []).map((c) => `mute class "${c}"`),
+            ].join(" · ")}
+          >
+            · muting {muteSummary}
+          </span>
+        )}
+        <button
+          className="ml-auto text-neutral-400 hover:text-white"
+          onClick={() => setOpen((v) => !v)}
+          title="configure mutes"
+        >
+          {open ? "close" : "⚙"}
+        </button>
+        <button
+          className="text-red-400 hover:text-red-300"
+          onClick={onDelete}
+          title="delete zone"
+        >
+          ×
+        </button>
+      </div>
+      {open && zone.kind === "polygon" && (
+        <div className="mt-2 grid gap-2 text-xs">
+          <div>
+            <div className="text-neutral-400 mb-1">
+              Mute detector kinds inside this zone
+            </div>
+            <div className="flex flex-wrap gap-3">
+              {KIND_OPTIONS.map((opt) => (
+                <label key={opt.value} className="inline-flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={kinds.has(opt.value)}
+                    onChange={(e) => {
+                      const next = new Set(kinds);
+                      if (e.target.checked) next.add(opt.value);
+                      else next.delete(opt.value);
+                      setKinds(next);
+                    }}
+                  />
+                  {opt.label}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-neutral-400 mb-1">
+              Mute specific classes (comma-separated — e.g. <code>car, bicycle</code>)
+            </div>
+            <input
+              className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+              value={classesText}
+              onChange={(e) => setClassesText(e.target.value)}
+              placeholder="(none)"
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 disabled:opacity-50"
+              onClick={save}
+              disabled={update.isPending}
+            >
+              {update.isPending ? "saving…" : "save"}
+            </button>
+          </div>
+        </div>
+      )}
+      {open && zone.kind !== "polygon" && (
+        <div className="mt-2 text-xs text-neutral-500">
+          Mutes only apply to polygon zones — the bbox-inside test needs an
+          enclosed area.
+        </div>
+      )}
+    </li>
   );
 }
 

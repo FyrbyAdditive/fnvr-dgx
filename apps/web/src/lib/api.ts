@@ -47,6 +47,8 @@ export type Zone = {
   name: string;
   kind: "polygon" | "line" | "tripwire";
   geometry: { points: number[] };
+  exclude_classes: string[];
+  exclude_kinds: string[];
   created_at: string;
 };
 
@@ -118,6 +120,8 @@ export const api = {
     req<Zone>("/zones", { method: "POST", body: JSON.stringify(z) }),
   deleteZone: (id: string) =>
     req<void>(`/zones/${id}`, { method: "DELETE" }),
+  updateZoneExclusions: (id: string, body: { exclude_classes: string[]; exclude_kinds: string[] }) =>
+    req<void>(`/zones/${id}/exclusions`, { method: "PATCH", body: JSON.stringify(body) }),
 
   listRules: () => req<Rule[]>("/rules"),
   createRule: (r: Partial<Rule>) =>

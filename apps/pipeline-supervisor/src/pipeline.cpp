@@ -107,6 +107,10 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                         return std::string(b);
                   }()                                         << "\","
                << "\"class_name\":\"" << json_escape(label)   << "\","
+               // Detector kind — today everything here is object detection
+               // via nvinfer. ANPR / face get their own kinds later so the
+               // zone-mute gate can silence them independently.
+               << "\"kind\":\"object\","
                << "\"confidence\":"   << obj->confidence      << ","
                << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
                <<          ",\"w\":"  << w << ",\"h\":" << h << "},"

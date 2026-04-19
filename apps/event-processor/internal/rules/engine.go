@@ -48,6 +48,10 @@ type Detection struct {
 	CameraID   string            `json:"camera_id"`
 	TS         time.Time         `json:"ts"`
 	ClassName  string            `json:"class_name"`
+	// Kind is the detector family ("object", "anpr", "face", …). Empty is
+	// treated as "object" so older pipeline workers that don't set the
+	// field remain compatible.
+	Kind       string            `json:"kind,omitempty"`
 	Confidence float32           `json:"confidence"`
 	BBox       BBox              `json:"bbox"`
 	TrackID    string            `json:"track_id,omitempty"`
@@ -62,10 +66,12 @@ type BBox struct {
 }
 
 type Zone struct {
-	ID       string    `json:"id"`
-	CameraID string    `json:"camera_id"`
-	Kind     string    `json:"kind"` // polygon | line | tripwire
-	Geometry []float32 `json:"geometry"` // [x0,y0,x1,y1,...] normalised
+	ID             string    `json:"id"`
+	CameraID       string    `json:"camera_id"`
+	Kind           string    `json:"kind"` // polygon | line | tripwire
+	Geometry       []float32 `json:"geometry"` // [x0,y0,x1,y1,...] normalised
+	ExcludeClasses []string  `json:"exclude_classes,omitempty"`
+	ExcludeKinds   []string  `json:"exclude_kinds,omitempty"`
 }
 
 type Rule struct {
@@ -166,8 +172,10 @@ func (e *Engine) periodicReload(ctx context.Context) {
 }
 
 func (e *Engine) reload(ctx context.Context) error {
-	// Zones.
-	zrows, err := e.pool.Query(ctx, `SELECT id::text, camera_id, kind, geometry FROM zones`)
+	// Zones + their optional mute arrays.
+	zrows, err := e.pool.Query(ctx, `
+		SELECT id::text, camera_id, kind, geometry, exclude_classes, exclude_kinds
+		FROM zones`)
 	if err != nil {
 		return err
 	}
@@ -175,7 +183,8 @@ func (e *Engine) reload(ctx context.Context) error {
 	for zrows.Next() {
 		var z Zone
 		var geom []byte
-		if err := zrows.Scan(&z.ID, &z.CameraID, &z.Kind, &geom); err != nil {
+		if err := zrows.Scan(&z.ID, &z.CameraID, &z.Kind, &geom,
+			&z.ExcludeClasses, &z.ExcludeKinds); err != nil {
 			zrows.Close()
 			return err
 		}
@@ -221,7 +230,22 @@ func (e *Engine) reload(ctx context.Context) error {
 }
 
 func (e *Engine) onDetection(ctx context.Context, d Detection) error {
-	// Persist raw detection first — the timeline needs it regardless of rules.
+	e.mu.RLock()
+	rules := e.rules
+	zones := e.zones[d.CameraID]
+	e.mu.RUnlock()
+
+	// Zone mute gate — runs before persistence so muted detections stay out
+	// of the timeline entirely. A detection is muted if its bbox centre
+	// falls inside any polygon zone on this camera that either lists the
+	// detection's class in exclude_classes OR lists the detection's kind
+	// in exclude_kinds. Non-polygon zones (line / tripwire) don't mute
+	// because "inside" is not well-defined for them.
+	if isMuted(d, zones) {
+		return nil
+	}
+
+	// Persist raw detection — the timeline reads from here.
 	if _, err := e.pool.Exec(ctx, `
 		INSERT INTO detections (event_id, camera_id, ts, class_name, confidence, bbox, track_id, attributes)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -230,11 +254,6 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	); err != nil {
 		return err
 	}
-
-	e.mu.RLock()
-	rules := e.rules
-	zones := e.zones[d.CameraID]
-	e.mu.RUnlock()
 
 	for _, r := range rules {
 		if r.Definition.CameraID != "" && r.Definition.CameraID != d.CameraID {
@@ -336,6 +355,41 @@ func inSchedule(s Schedule, t time.Time) bool {
 	}
 	// wraps midnight
 	return mins >= s.StartMinute || mins <= s.EndMinute
+}
+
+// isMuted returns true when the detection's bbox centre falls inside any
+// polygon zone that mutes the detection by class or detector kind.
+func isMuted(d Detection, zones []Zone) bool {
+	if len(zones) == 0 {
+		return false
+	}
+	kind := d.Kind
+	if kind == "" {
+		kind = "object"
+	}
+	cx, cy := d.BBox.X+d.BBox.W/2, d.BBox.Y+d.BBox.H/2
+	for _, z := range zones {
+		if z.Kind != "polygon" {
+			continue
+		}
+		if len(z.ExcludeClasses) == 0 && len(z.ExcludeKinds) == 0 {
+			continue
+		}
+		if !pointInPolygon(cx, cy, z.Geometry) {
+			continue
+		}
+		for _, c := range z.ExcludeClasses {
+			if c == d.ClassName {
+				return true
+			}
+		}
+		for _, k := range z.ExcludeKinds {
+			if k == kind {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func bboxInZone(b BBox, zoneID string, zones []Zone) bool {

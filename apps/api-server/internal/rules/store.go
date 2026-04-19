@@ -15,12 +15,14 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type Zone struct {
-	ID        string          `json:"id"`
-	CameraID  string          `json:"camera_id"`
-	Name      string          `json:"name"`
-	Kind      string          `json:"kind"`     // polygon | line | tripwire
-	Geometry  json.RawMessage `json:"geometry"` // {"points":[x0,y0,x1,y1,...]}
-	CreatedAt time.Time       `json:"created_at"`
+	ID             string          `json:"id"`
+	CameraID       string          `json:"camera_id"`
+	Name           string          `json:"name"`
+	Kind           string          `json:"kind"`     // polygon | line | tripwire
+	Geometry       json.RawMessage `json:"geometry"` // {"points":[x0,y0,x1,y1,...]}
+	ExcludeClasses []string        `json:"exclude_classes"`
+	ExcludeKinds   []string        `json:"exclude_kinds"`
+	CreatedAt      time.Time       `json:"created_at"`
 }
 
 type Rule struct {
@@ -51,7 +53,8 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 func (s *Store) ListZones(ctx context.Context, cameraID string) ([]Zone, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text, camera_id, name, kind, geometry, created_at
+		SELECT id::text, camera_id, name, kind, geometry,
+		       exclude_classes, exclude_kinds, created_at
 		FROM zones
 		WHERE ($1 = '' OR camera_id = $1)
 		ORDER BY created_at ASC`, cameraID)
@@ -62,7 +65,8 @@ func (s *Store) ListZones(ctx context.Context, cameraID string) ([]Zone, error) 
 	out := make([]Zone, 0)
 	for rows.Next() {
 		var z Zone
-		if err := rows.Scan(&z.ID, &z.CameraID, &z.Name, &z.Kind, &z.Geometry, &z.CreatedAt); err != nil {
+		if err := rows.Scan(&z.ID, &z.CameraID, &z.Name, &z.Kind, &z.Geometry,
+			&z.ExcludeClasses, &z.ExcludeKinds, &z.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, z)
@@ -74,13 +78,42 @@ func (s *Store) CreateZone(ctx context.Context, z Zone) (Zone, error) {
 	if z.Kind == "" {
 		z.Kind = "polygon"
 	}
+	if z.ExcludeClasses == nil {
+		z.ExcludeClasses = []string{}
+	}
+	if z.ExcludeKinds == nil {
+		z.ExcludeKinds = []string{}
+	}
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO zones (camera_id, name, kind, geometry)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO zones (camera_id, name, kind, geometry, exclude_classes, exclude_kinds)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id::text, created_at`,
-		z.CameraID, z.Name, z.Kind, z.Geometry).
+		z.CameraID, z.Name, z.Kind, z.Geometry, z.ExcludeClasses, z.ExcludeKinds).
 		Scan(&z.ID, &z.CreatedAt)
 	return z, err
+}
+
+// UpdateZoneExclusions replaces the exclude_classes + exclude_kinds arrays
+// on a zone. Nil inputs are treated as empty (caller may pass []string{}
+// explicitly; nil means "clear"). Both arrays are always replaced together
+// so partial writes can't leave an old value around.
+func (s *Store) UpdateZoneExclusions(ctx context.Context, id string, classes, kinds []string) error {
+	if classes == nil {
+		classes = []string{}
+	}
+	if kinds == nil {
+		kinds = []string{}
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE zones SET exclude_classes = $2, exclude_kinds = $3 WHERE id = $1`,
+		id, classes, kinds)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) DeleteZone(ctx context.Context, id string) error {
