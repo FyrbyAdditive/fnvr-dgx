@@ -168,33 +168,67 @@ fi
 ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
 if [ ! -f "$ENGINE_FILE" ]; then
     publish_state "compiling_engine" "Building TensorRT engine for $VARIANT ($PRECISION). First-time only, up to ~10 minutes."
-    echo "entrypoint: engine $ENGINE_FILE missing — nvinfer will compile it"
+    echo "entrypoint: engine $ENGINE_FILE missing — pre-building with trtexec"
+
+    # Pre-build the engine in a single process BEFORE spawning workers.
+    # If we let the supervisor fork three workers first, all three fight
+    # for GPU memory at once while trying to compile the same engine,
+    # and each one gets stuck rejecting tactics for 15+ minutes.
+    # Single-process compile gets full memory access and is ~10× faster.
+    TRTEXEC=""
+    if [ -x /usr/src/tensorrt/bin/trtexec ]; then
+        TRTEXEC=/usr/src/tensorrt/bin/trtexec
+    elif command -v trtexec >/dev/null 2>&1; then
+        TRTEXEC=$(command -v trtexec)
+    fi
+
+    if [ -n "$TRTEXEC" ]; then
+        TRTEXEC_FLAGS="--onnx=$YOLO_DEST/${VARIANT}.onnx \
+            --saveEngine=$ENGINE_FILE \
+            --workspace=4096 \
+            --buildOnly"
+        if [ "$PRECISION" = "fp16" ]; then
+            TRTEXEC_FLAGS="$TRTEXEC_FLAGS --fp16"
+        else
+            TRTEXEC_FLAGS="$TRTEXEC_FLAGS --int8 --calib=$YOLO_DEST/${VARIANT}.calib.table"
+        fi
+        # `exec` is not used on purpose — we need to continue after the
+        # compile to actually start the supervisor.
+        if $TRTEXEC $TRTEXEC_FLAGS 2>&1 | tail -20; then
+            echo "entrypoint: engine pre-build completed"
+        else
+            echo "entrypoint: trtexec failed; nvinfer will try to compile anyway" >&2
+        fi
+    else
+        echo "entrypoint: trtexec not found; workers will compile in parallel (slow)" >&2
+    fi
 fi
 
-# Render effective config.
+# Render effective config into a writable location. /etc/fnvr is bind-
+# mounted read-only from the host's deploy/config, so put the rendered
+# file on the fnvr-data volume next to the models.
 export MODEL="$VARIANT"
 export NETWORK_MODE ENGINE_SUFFIX INT8_LINE
+EFFECTIVE_CFG="$YOLO_DEST/yolo26.effective.txt"
 if command -v envsubst >/dev/null 2>&1; then
     envsubst '$MODEL $NETWORK_MODE $ENGINE_SUFFIX $INT8_LINE' \
         < /etc/fnvr/nvinfer/yolo26.txt.template \
-        > /etc/fnvr/nvinfer/yolo26.effective.txt
+        > "$EFFECTIVE_CFG"
 else
-    # envsubst lives in gettext-base; belt-and-braces fallback using sed.
     sed \
         -e "s|\$MODEL|$MODEL|g" \
         -e "s|\$NETWORK_MODE|$NETWORK_MODE|g" \
         -e "s|\$ENGINE_SUFFIX|$ENGINE_SUFFIX|g" \
         -e "s|\$INT8_LINE|$INT8_LINE|g" \
         /etc/fnvr/nvinfer/yolo26.txt.template \
-        > /etc/fnvr/nvinfer/yolo26.effective.txt
+        > "$EFFECTIVE_CFG"
 fi
 
 # Default to YOLO26 unless the operator has pinned a specific config via
 # the env (e.g. the old trafficcamnet for rollback).
 if [ -z "$FNVR_INFER_CONFIG" ] || [ "$FNVR_INFER_CONFIG" = "/etc/fnvr/nvinfer/trafficcamnet.txt" ]; then
-    : "${FNVR_INFER_CONFIG:=/etc/fnvr/nvinfer/yolo26.effective.txt}"
     if [ -f /var/lib/fnvr/models/yolo26/"$VARIANT".onnx ]; then
-        export FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/yolo26.effective.txt
+        export FNVR_INFER_CONFIG="$EFFECTIVE_CFG"
     fi
 fi
 

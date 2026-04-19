@@ -54,7 +54,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
   && python3 -m pip install --no-cache-dir \
       "ultralytics==8.3.*" "onnx>=1.16" "onnxslim>=0.1.34" "onnxruntime>=1.18" \
+      "onnxscript>=0.1" \
   && rm -rf /var/lib/apt/lists/*
+
+# Patch the upstream export script for ultralytics 8.3.x: the else branch
+# calls self.forward_head which was renamed/removed in 8.3. The if branch
+# (hasattr "inference") works when present; when it isn't, use the
+# equivalent _inference call directly so the script works across
+# ultralytics versions.
+RUN python3 - <<'PY'
+import pathlib
+p = pathlib.Path("/usr/local/bin/export_yolo26.py")
+src = p.read_text()
+
+# Patch 1: ultralytics 8.3.x renamed/dropped Detect.forward_head. Use
+# the tensor-concat form that also works across versions.
+src = src.replace(
+    "    else:\n"
+    "        one2one = self.forward_head(x_detach, **self.one2one)\n"
+    "        y = self._inference(one2one)\n",
+    "    else:\n"
+    "        one2one = [\n"
+    "            torch.cat((self.one2one_cv2[i](x_detach[i]),\n"
+    "                       self.one2one_cv3[i](x_detach[i])), 1)\n"
+    "            for i in range(self.nl)\n"
+    "        ]\n"
+    "        y = self._inference(one2one)\n"
+)
+
+# Patch 2: torch >=2.8 defaults torch.onnx.export(dynamo=True), which
+# routes through torch.export.export() and fails on the monkey-patched
+# forward. Force the legacy TorchScript exporter with dynamo=False.
+src = src.replace(
+    'dynamic_axes=dynamic_axes if args.dynamic else None\n    )',
+    'dynamic_axes=dynamic_axes if args.dynamic else None,\n'
+    '        dynamo=False\n    )'
+)
+
+p.write_text(src)
+PY
 
 ARG YOLO26_VARIANTS="yolo26n yolo26s yolo26m yolo26l yolo26x"
 RUN set -eux; \
