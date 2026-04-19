@@ -129,6 +129,14 @@ func runServe() error {
 		return fmt.Errorf("whep start: %w", err)
 	}
 
+	camStates, err := camera.NewStateTracker(cfg.NATSURL)
+	if err != nil {
+		return fmt.Errorf("camera state tracker: %w", err)
+	}
+	if err := camStates.Start(ctx); err != nil {
+		return fmt.Errorf("camera state start: %w", err)
+	}
+
 	srv := server.New(server.Deps{
 		Config:    cfg,
 		Pool:      pool,
@@ -140,6 +148,7 @@ func runServe() error {
 		Snapshots: snapshot.New(cfg.DataDir + "/recordings"),
 		Segments:  segments.NewStore(pool),
 		Whep:      whepReg,
+		CamStates: camStates,
 	})
 
 	httpSrv := &http.Server{

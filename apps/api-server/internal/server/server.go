@@ -32,10 +32,11 @@ type Server struct {
 	cameras  *camera.Store
 	pipeline pipeline.Client
 	events   *events.Bus
-	rules    *rules.Store
-	snaps    *snapshot.Service
-	segments *segments.Store
-	whep     *whep.Registry
+	rules     *rules.Store
+	snaps     *snapshot.Service
+	segments  *segments.Store
+	whep      *whep.Registry
+	camStates *camera.StateTracker
 }
 
 type Deps struct {
@@ -49,20 +50,22 @@ type Deps struct {
 	Snapshots *snapshot.Service
 	Segments  *segments.Store
 	Whep      *whep.Registry
+	CamStates *camera.StateTracker
 }
 
 func New(d Deps) *Server {
 	return &Server{
-		cfg:      d.Config,
-		pool:     d.Pool,
-		auth:     d.Auth,
-		cameras:  d.Cameras,
-		pipeline: d.Pipeline,
-		events:   d.Events,
-		rules:    d.Rules,
-		snaps:    d.Snapshots,
-		segments: d.Segments,
-		whep:     d.Whep,
+		cfg:       d.Config,
+		pool:      d.Pool,
+		auth:      d.Auth,
+		cameras:   d.Cameras,
+		pipeline:  d.Pipeline,
+		events:    d.Events,
+		rules:     d.Rules,
+		snaps:     d.Snapshots,
+		segments:  d.Segments,
+		whep:      d.Whep,
+		camStates: d.CamStates,
 	}
 }
 
@@ -231,7 +234,37 @@ func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, cams)
+	writeJSON(w, http.StatusOK, decorateCameras(cams, s.camStates))
+}
+
+// decorateCameras attaches the latest-known pipeline state to each camera
+// ("starting" | "running" | "failed" | "unknown"). This is derived from
+// NATS so it reflects current reality rather than the DB row.
+func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[string]any {
+	out := make([]map[string]any, 0, len(cams))
+	for _, c := range cams {
+		state := "unknown"
+		if states != nil {
+			if st, ok := states.State(c.ID); ok {
+				state = st
+			}
+		}
+		out = append(out, map[string]any{
+			"id":             c.ID,
+			"name":           c.Name,
+			"url":            c.URL,
+			"substream":      c.Substream,
+			"record_mode":    c.RecordMode,
+			"enabled":        c.Enabled,
+			"retention_days": c.RetentionDays,
+			"quota_gb":       c.QuotaGB,
+			"group_id":       c.GroupID,
+			"created_at":     c.CreatedAt,
+			"updated_at":     c.UpdatedAt,
+			"state":          state,
+		})
+	}
+	return out
 }
 
 func (s *Server) handleCreateCamera(w http.ResponseWriter, r *http.Request) {

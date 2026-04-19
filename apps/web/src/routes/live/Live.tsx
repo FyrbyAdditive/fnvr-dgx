@@ -4,7 +4,11 @@ import { api } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
 
 export function Live() {
-  const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
+  const { data: cameras = [] } = useQuery({
+    queryKey: ["cameras"],
+    queryFn: api.listCameras,
+    refetchInterval: 3_000,
+  });
   const events = useRecentDetections(100);
 
   // Group detections by camera, keeping only the freshest few per cam so
@@ -39,6 +43,7 @@ export function Live() {
               key={c.id}
               id={c.id}
               name={c.name}
+              state={c.state}
               detections={boxesByCamera.get(c.id) ?? []}
             />
           ))}
@@ -48,9 +53,10 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, detections }: {
+function CameraTile({ id, name, state, detections }: {
   id: string;
   name: string;
+  state?: "starting" | "running" | "failed" | "unknown";
   detections: DetectionEvent[];
 }) {
   // WebRTC live view. Falls back to the 1-fps JPEG snapshot below if the
@@ -181,6 +187,26 @@ function CameraTile({ id, name, detections }: {
           {latest.class_name} {(latest.confidence * 100).toFixed(0)}%
         </div>
       )}
+      {state && state !== "running" && <StateBadge state={state} />}
+    </div>
+  );
+}
+
+function StateBadge({ state }: { state: "starting" | "failed" | "unknown" | string }) {
+  const label =
+    state === "starting" ? "starting (building inference engine)" :
+    state === "failed"   ? "pipeline failed" :
+                           "pipeline offline";
+  const color =
+    state === "starting" ? "bg-amber-600/85" :
+    state === "failed"   ? "bg-red-600/85" :
+                           "bg-neutral-600/85";
+  return (
+    <div className={`absolute top-2 left-2 text-xs ${color} px-2 py-0.5 rounded flex items-center gap-1.5`}>
+      {state === "starting" && (
+        <span className="w-2 h-2 rounded-full bg-amber-200 animate-pulse" />
+      )}
+      {label}
     </div>
   );
 }

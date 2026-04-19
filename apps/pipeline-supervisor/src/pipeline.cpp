@@ -269,14 +269,19 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              // bitrate budget within shouting distance of the old H.265.
              "nvv4l2h264enc bitrate=6000000 insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
              "h264parse name=recparse config-interval=-1 ! "
-             // splitmuxsink is fragile on USB sources: it g_asserts if the
-             // first buffer isn't a keyframe, which happens on NVENC start.
-             // Segment rotation is done application-side (supervisor
-             // restarts the pipeline hourly, so files already rotate per
-             // hour via the directory layout).
+             "video/x-h264,stream-format=avc,alignment=au ! "
+             // Write plain (non-fragmented) MP4 with moov reserved up-front
+             // and refreshed every second. This produces a browser-playable
+             // file that's valid mid-write, unlike:
+             //   - mp4mux fragmented: no sidx, Firefox refused to play
+             //   - qtmux faststart=true: needs EOS to finalise; if the
+             //     worker is SIGKILLed, the .mp4 never appears (all data
+             //     lives in the .faststart temp file).
+             // 4500s headroom covers the hourly rotation with margin.
              "queue max-size-buffers=300 max-size-time=2000000000 "
              "  max-size-bytes=0 ! "
-             "mp4mux streamable=true fragment-duration=2000 ! "
+             "qtmux reserved-max-duration=4500000000000 "
+             "      reserved-moov-update-period=1000000000 ! "
              "filesink location=" << dir.string() << "/rec.mp4 "
              "         append=false ";
     } else {

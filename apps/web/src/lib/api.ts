@@ -36,6 +36,7 @@ export type Camera = {
   record_mode: string;
   enabled: boolean;
   created_at: string;
+  state?: "starting" | "running" | "failed" | "unknown";
 };
 
 export type LocalDevice = { path: string; label: string; capabilities: string[] };
