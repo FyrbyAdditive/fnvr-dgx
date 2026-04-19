@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, HistoricDetection, Segment } from "@/lib/api";
 
 // Timeline: one day (local time) for one camera. Segments render as solid
@@ -15,12 +15,37 @@ const ZOOM_DRAG_THRESHOLD_PX = 6;
 
 export function Timeline() {
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
+  const [searchParams, setSearchParams] = useSearchParams();
   const [cameraId, setCameraId] = useState<string>("");
   const [dayKey, setDayKey] = useState<string>(() => todayKey());
+  const [cursorMs, setCursorMs] = useState<number | null>(null);
 
   useEffect(() => {
     if (!cameraId && cameras.length > 0) setCameraId(cameras[0].id);
   }, [cameras, cameraId]);
+
+  // Deeplink: `?camera=X&ts=<ISO>` jumps straight to the right day with
+  // the cursor on that timestamp. Used by the Events page to open an
+  // incident's moment. Consumed once, then the params are cleared so
+  // later interactions don't get re-yanked back to the link target.
+  useEffect(() => {
+    const cam = searchParams.get("camera");
+    const tsStr = searchParams.get("ts");
+    if (!cam && !tsStr) return;
+    if (cam) setCameraId(cam);
+    if (tsStr) {
+      const ts = new Date(tsStr);
+      if (!Number.isNaN(ts.getTime())) {
+        const key = dayKeyFrom(ts);
+        setDayKey(key);
+        const { from: dayStart } = dayRange(key);
+        setCursorMs(ts.getTime() - dayStart.getTime());
+      }
+    }
+    // Strip query so a later refresh/share of the URL reflects the
+    // current view, not the original deeplink.
+    setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const { from, to } = useMemo(() => dayRange(dayKey), [dayKey]);
 
@@ -39,8 +64,6 @@ export function Timeline() {
     refetchInterval: 10_000,
     refetchIntervalInBackground: false,
   });
-
-  const [cursorMs, setCursorMs] = useState<number | null>(null);
 
   // Zoom as fractions of the day (0..1). Full day = {0, 1}.
   const [zoom, setZoom] = useState<{ from: number; to: number }>({ from: 0, to: 1 });
@@ -624,7 +647,9 @@ function TimelineRuler({
 }
 
 function todayKey(): string {
-  const d = new Date();
+  return dayKeyFrom(new Date());
+}
+function dayKeyFrom(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function pad(n: number): string { return n < 10 ? `0${n}` : `${n}`; }

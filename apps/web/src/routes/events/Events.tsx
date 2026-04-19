@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useRecentDetections } from "@/lib/events";
 
 export function Events() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const detections = useRecentDetections(200);
   const { data: incidents = [] } = useQuery({
     queryKey: ["incidents"],
@@ -14,6 +16,11 @@ export function Events() {
     mutationFn: api.ackIncident,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["incidents"] }),
   });
+
+  const openInTimeline = (cameraId: string, startedAt: string) =>
+    navigate(
+      `/timeline?camera=${encodeURIComponent(cameraId)}&ts=${encodeURIComponent(startedAt)}`,
+    );
 
   return (
     <div className="p-4 grid gap-6 md:grid-cols-2">
@@ -28,16 +35,23 @@ export function Events() {
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm">
             {incidents.map((i) => (
-              <li key={i.id} className={`p-2 grid grid-cols-[8rem_1fr_6rem] gap-2 items-center
+              <li key={i.id} className={`grid grid-cols-[8rem_1fr_6rem] gap-2 items-center
                 ${i.acknowledged ? "opacity-50" : ""}`}>
-                <span className="text-neutral-500 tabular-nums">
-                  {new Date(i.started_at).toLocaleTimeString()}
-                </span>
-                <span>
-                  <span className={`font-medium ${severityColor(i.severity)}`}>{i.severity}</span>
-                  <span className="text-neutral-400"> · {i.summary}</span>
-                </span>
-                <button className={`text-xs ${i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}`}
+                <button
+                  type="button"
+                  className="col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-center text-left p-2 hover:bg-neutral-900 rounded-l"
+                  onClick={() => openInTimeline(i.camera_id, i.started_at)}
+                  title="Open the recording at this moment"
+                >
+                  <span className="text-neutral-500 tabular-nums">
+                    {new Date(i.started_at).toLocaleTimeString()}
+                  </span>
+                  <span>
+                    <span className={`font-medium ${severityColor(i.severity)}`}>{i.severity}</span>
+                    <span className="text-neutral-400"> · {i.summary}</span>
+                  </span>
+                </button>
+                <button className={`text-xs px-2 py-2 text-right ${i.acknowledged ? "text-neutral-600" : "text-blue-400 hover:underline"}`}
                   onClick={() => !i.acknowledged && ack.mutate(i.id)}
                   disabled={i.acknowledged}>
                   {i.acknowledged ? "ack'd" : "acknowledge"}
