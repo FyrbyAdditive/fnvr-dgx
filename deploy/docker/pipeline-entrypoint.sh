@@ -52,4 +52,152 @@ if [ -d "$DS_SAMPLES" ] && [ ! -f "$DEST/resnet18_trafficcamnet_pruned.onnx" ]; 
     echo "entrypoint: seeded $DEST from $DS_SAMPLES"
 fi
 
+# ---- YOLO26 model bootstrap ----
+#
+# Seed /var/lib/fnvr/models/yolo26/ with the ONNX weights baked into the
+# image. This is idempotent — cp -n only writes files that don't already
+# exist, so a newer image with a re-exported ONNX only lands after the
+# user manually removes the old file (avoids invalidating cached TRT
+# engines mid-upgrade, which would force a ~10-minute rebuild).
+YOLO_SRC=/opt/fnvr/yolo26
+YOLO_DEST=/var/lib/fnvr/models/yolo26
+if [ -d "$YOLO_SRC" ]; then
+    mkdir -p "$YOLO_DEST"
+    for f in "$YOLO_SRC"/*.onnx; do
+        [ -f "$f" ] || continue
+        cp -n "$f" "$YOLO_DEST/"
+    done
+    # Labels — copied from the repo's coco.labels via the COPY into
+    # /etc/fnvr/nvinfer; always refresh since it's tiny and text.
+    if [ -f /etc/fnvr/nvinfer/coco.labels ]; then
+        cp /etc/fnvr/nvinfer/coco.labels "$YOLO_DEST/labels.txt"
+    fi
+    echo "entrypoint: yolo26 weights ready under $YOLO_DEST"
+fi
+
+# ---- Resolve detector settings & render nvinfer config ----
+#
+# Reads settings from the api via FNVR_SETTINGS_URL. If unreachable (api
+# still starting, or single-service test), fall back to env defaults.
+# Announces calibrating / compiling_engine states on NATS so the UI
+# banner can explain the delay.
+
+VARIANT="${FNVR_YOLO_VARIANT:-yolo26x}"
+PRECISION="${FNVR_YOLO_PRECISION:-fp16}"
+
+SETTINGS_URL="${FNVR_SETTINGS_URL:-http://api:8081/api/v1/settings/detector}"
+if command -v curl >/dev/null 2>&1; then
+    # Best-effort fetch; ignore failure. 5s timeout because the api may be
+    # starting in parallel.
+    SETTINGS_JSON=$(curl -s --max-time 5 -H "X-Fnvr-Internal: 1" "$SETTINGS_URL" 2>/dev/null || true)
+    if [ -n "$SETTINGS_JSON" ]; then
+        V=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_variant":"\([^"]*\)".*/\1/p')
+        P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
+        [ -n "$V" ] && VARIANT="$V"
+        [ -n "$P" ] && PRECISION="$P"
+    fi
+fi
+
+echo "entrypoint: detector variant=$VARIANT precision=$PRECISION"
+
+# Simple NATS publisher via nats-box would be ideal, but it's not in the
+# image. Use nats.c's `natsConnection_Publish` from a tiny helper? Too
+# much. Instead, publish via nats-pub if available, else rely on the
+# supervisor publishing "ready" once it reaches the main loop. For
+# calibration (which can run minutes) we write a marker to stderr the
+# supervisor picks up on startup — but for the banner UX to work we
+# really do need a publish here. Use a one-shot Python NATS client if
+# python3 is present (it is — we installed it for ONNX export).
+publish_state() {
+    if [ -z "$FNVR_NATS_URL" ]; then return; fi
+    state_name="$1"; message="$2"
+    python3 - <<PY 2>/dev/null || true
+import os, sys, json, socket, struct, threading, time
+# Minimal NATS protocol publisher — no external deps beyond stdlib.
+url = os.environ.get("FNVR_NATS_URL", "nats://nats:4222")
+host, _, port = url.replace("nats://", "").partition(":")
+port = int(port or "4222")
+try:
+    s = socket.create_connection((host, port), timeout=2)
+    # Eat INFO line.
+    s.recv(4096)
+    s.sendall(b"CONNECT {}\r\n")
+    payload = json.dumps({"state": "$state_name", "variant": "$VARIANT",
+                          "precision": "$PRECISION", "message": """$message"""})
+    msg = f"PUB fnvr.state.pipeline {len(payload)}\r\n{payload}\r\n"
+    s.sendall(msg.encode())
+    time.sleep(0.1)
+    s.close()
+except Exception:
+    pass
+PY
+}
+
+# If INT8 is selected and no calib.table exists yet for this variant,
+# kick off the calibration. Blocks container start until done (~3-5
+# minutes). Use publish_state to surface progress to the UI banner.
+if [ "$PRECISION" = "int8" ]; then
+    CALIB_FILE="$YOLO_DEST/${VARIANT}.calib.table"
+    if [ ! -f "$CALIB_FILE" ]; then
+        publish_state "calibrating" "Calibrating INT8 for $VARIANT (one-shot, ~5 min). Subsequent starts are instant."
+        echo "entrypoint: running INT8 calibration for $VARIANT"
+        if [ -x /usr/local/bin/calibrate-yolo26.sh ]; then
+            if ! /usr/local/bin/calibrate-yolo26.sh "$VARIANT" "$CALIB_FILE"; then
+                publish_state "failed" "INT8 calibration for $VARIANT failed — falling back to FP16. Check /var/lib/fnvr/models/yolo26/calib_images/."
+                echo "entrypoint: calibration failed, falling back to FP16"
+                PRECISION="fp16"
+            fi
+        else
+            publish_state "failed" "calibrate-yolo26.sh missing in image — falling back to FP16"
+            PRECISION="fp16"
+        fi
+    fi
+fi
+
+# TRT engine cache check. If missing, we're about to trigger a multi-
+# minute compile — announce it for the UI banner.
+ENGINE_SUFFIX="fp16"
+NETWORK_MODE="2"
+INT8_LINE="#"
+if [ "$PRECISION" = "int8" ]; then
+    ENGINE_SUFFIX="int8"
+    NETWORK_MODE="1"
+    INT8_LINE="int8-calib-file=$YOLO_DEST/${VARIANT}.calib.table"
+fi
+
+ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
+if [ ! -f "$ENGINE_FILE" ]; then
+    publish_state "compiling_engine" "Building TensorRT engine for $VARIANT ($PRECISION). First-time only, up to ~10 minutes."
+    echo "entrypoint: engine $ENGINE_FILE missing — nvinfer will compile it"
+fi
+
+# Render effective config.
+export MODEL="$VARIANT"
+export NETWORK_MODE ENGINE_SUFFIX INT8_LINE
+if command -v envsubst >/dev/null 2>&1; then
+    envsubst '$MODEL $NETWORK_MODE $ENGINE_SUFFIX $INT8_LINE' \
+        < /etc/fnvr/nvinfer/yolo26.txt.template \
+        > /etc/fnvr/nvinfer/yolo26.effective.txt
+else
+    # envsubst lives in gettext-base; belt-and-braces fallback using sed.
+    sed \
+        -e "s|\$MODEL|$MODEL|g" \
+        -e "s|\$NETWORK_MODE|$NETWORK_MODE|g" \
+        -e "s|\$ENGINE_SUFFIX|$ENGINE_SUFFIX|g" \
+        -e "s|\$INT8_LINE|$INT8_LINE|g" \
+        /etc/fnvr/nvinfer/yolo26.txt.template \
+        > /etc/fnvr/nvinfer/yolo26.effective.txt
+fi
+
+# Default to YOLO26 unless the operator has pinned a specific config via
+# the env (e.g. the old trafficcamnet for rollback).
+if [ -z "$FNVR_INFER_CONFIG" ] || [ "$FNVR_INFER_CONFIG" = "/etc/fnvr/nvinfer/trafficcamnet.txt" ]; then
+    : "${FNVR_INFER_CONFIG:=/etc/fnvr/nvinfer/yolo26.effective.txt}"
+    if [ -f /var/lib/fnvr/models/yolo26/"$VARIANT".onnx ]; then
+        export FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/yolo26.effective.txt
+    fi
+fi
+
+echo "entrypoint: FNVR_INFER_CONFIG=$FNVR_INFER_CONFIG"
+
 exec /usr/local/bin/pipeline-supervisor "$@"

@@ -1,0 +1,37 @@
+# DeepStream nvinfer — YOLO26 (via marcoslucianops/DeepStream-Yolo parser).
+# Not for direct nvinfer consumption — the entrypoint envsubst's this
+# template into /etc/fnvr/nvinfer/yolo26.effective.txt with the variant
+# and precision chosen in Settings, then points FNVR_INFER_CONFIG at the
+# effective file.
+#
+# Placeholders resolved by the entrypoint:
+#   $MODEL         e.g. yolo26x / yolo26s
+#   $NETWORK_MODE  2 for FP16, 1 for INT8
+#   $ENGINE_SUFFIX fp16 or int8 (in the engine filename, for cache keying)
+#   $INT8_LINE     empty line for FP16; "int8-calib-file=..." for INT8
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx
+model-engine-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx_b1_gpu0_$ENGINE_SUFFIX.engine
+labelfile-path=/var/lib/fnvr/models/yolo26/labels.txt
+batch-size=1
+network-mode=$NETWORK_MODE
+$INT8_LINE
+num-detected-classes=80
+interval=0
+gie-unique-id=1
+process-mode=1
+# YOLO26 is NMS-free; DeepStream-Yolo's parser handles clustering. See
+# https://github.com/marcoslucianops/DeepStream-Yolo/blob/master/docs/YOLO26.md
+maintain-aspect-ratio=1
+symmetric-padding=1
+cluster-mode=4
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_Yolo.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.25
+topk=300

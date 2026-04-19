@@ -178,6 +178,34 @@ export const api = {
 
   recentDeliveries: (limit = 50) =>
     req<NotificationDelivery[]>(`/notifications/deliveries?limit=${limit}`),
+
+  // Primary detector settings (YOLO26 variant + precision).
+  getDetectorSettings: () => req<DetectorSettings>("/settings/detector"),
+  updateDetectorSettings: (body: DetectorSettings) =>
+    req<void>("/settings/detector", { method: "PUT", body: JSON.stringify(body) }),
+
+  // Pipeline lifecycle.
+  getPipelineState: () => req<PipelineStateResponse>("/system/pipeline/state"),
+  restartPipeline: () =>
+    req<void>("/system/pipeline/restart", { method: "POST" }),
+};
+
+export type DetectorSettings = {
+  yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
+  yolo26_precision: "fp16" | "int8";
+};
+
+export type PipelineState = {
+  state: "unknown" | "calibrating" | "compiling_engine" | "ready" | "failed" | string;
+  variant?: string;
+  precision?: string;
+  message?: string;
+  stamped?: string;
+};
+
+export type PipelineStateResponse = {
+  known: boolean;
+  state: PipelineState;
 };
 
 export type NotificationChannel = {

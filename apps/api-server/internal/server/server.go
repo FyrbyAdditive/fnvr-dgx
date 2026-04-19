@@ -21,6 +21,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
+	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/system"
 	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
@@ -37,8 +38,11 @@ type Server struct {
 	snaps     *snapshot.Service
 	segments  *segments.Store
 	whep      *whep.Registry
-	camStates *camera.StateTracker
-	notifs    *notifications.Store
+	camStates    *camera.StateTracker
+	notifs       *notifications.Store
+	settings     *settings.Store
+	pipelineStat *pipeline.StateTracker
+	natsPublish  func(subject string, data []byte) error
 }
 
 type Deps struct {
@@ -54,6 +58,9 @@ type Deps struct {
 	Whep          *whep.Registry
 	CamStates     *camera.StateTracker
 	Notifications *notifications.Store
+	Settings      *settings.Store
+	PipelineStat  *pipeline.StateTracker
+	NatsPublish   func(subject string, data []byte) error
 }
 
 func New(d Deps) *Server {
@@ -68,8 +75,11 @@ func New(d Deps) *Server {
 		snaps:     d.Snapshots,
 		segments:  d.Segments,
 		whep:      d.Whep,
-		camStates: d.CamStates,
-		notifs:    d.Notifications,
+		camStates:    d.CamStates,
+		notifs:       d.Notifications,
+		settings:     d.Settings,
+		pipelineStat: d.PipelineStat,
+		natsPublish:  d.NatsPublish,
 	}
 }
 
@@ -145,6 +155,17 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/notifications/deliveries", s.handleRecentDeliveries)
 		}
 
+		if s.settings != nil {
+			protected.HandleFunc("GET /api/v1/settings/detector", s.handleGetDetector)
+			protected.HandleFunc("PUT /api/v1/settings/detector", s.handleUpdateDetector)
+		}
+		if s.pipelineStat != nil {
+			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
+		}
+		if s.natsPublish != nil {
+			protected.HandleFunc("POST /api/v1/system/pipeline/restart", s.handlePipelineRestart)
+		}
+
 		guarded := s.auth.Middleware(protected)
 		mux.Handle("/api/v1/auth/logout", guarded)
 		mux.Handle("/api/v1/me", guarded)
@@ -173,6 +194,15 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/notifications/subscriptions", guarded)
 			mux.Handle("/api/v1/notifications/subscriptions/", guarded)
 			mux.Handle("/api/v1/notifications/deliveries", guarded)
+		}
+		if s.settings != nil {
+			mux.Handle("/api/v1/settings/detector", guarded)
+		}
+		if s.pipelineStat != nil {
+			mux.Handle("/api/v1/system/pipeline/state", guarded)
+		}
+		if s.natsPublish != nil {
+			mux.Handle("/api/v1/system/pipeline/restart", guarded)
 		}
 	}
 

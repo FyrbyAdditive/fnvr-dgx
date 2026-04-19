@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 
@@ -17,6 +17,14 @@ export function Layout() {
     queryFn: api.systemInfo,
     staleTime: 60_000,
   });
+  const { data: pipelineState } = useQuery({
+    queryKey: ["pipeline-state"],
+    queryFn: api.getPipelineState,
+    refetchInterval: 3_000,
+  });
+  const ps = pipelineState?.state;
+  const showBanner = ps && ps.state !== "ready" && ps.state !== "unknown";
+
   return (
     <div className="flex flex-col h-full">
       <header className="border-b border-neutral-800 px-6 py-3 flex items-center gap-6">
@@ -42,6 +50,30 @@ export function Layout() {
           {info ? `${info.milestone} · ${info.version}` : ""}
         </div>
       </header>
+      {showBanner && ps && (
+        <Link
+          to="/settings"
+          className={`px-6 py-2 text-sm flex items-center gap-3 ${
+            ps.state === "failed"
+              ? "bg-red-900/60 text-red-100"
+              : "bg-amber-900/60 text-amber-100"
+          }`}
+        >
+          {ps.state !== "failed" && (
+            <span className="inline-block w-2 h-2 rounded-full bg-amber-300 animate-pulse" />
+          )}
+          <span>
+            {ps.message ??
+              (ps.state === "calibrating"
+                ? "Calibrating INT8…"
+                : ps.state === "compiling_engine"
+                ? "Building TensorRT engine…"
+                : `Pipeline ${ps.state}`)}
+          </span>
+          {ps.variant && <span className="opacity-70">({ps.variant} · {ps.precision})</span>}
+          <span className="ml-auto underline opacity-80">Settings →</span>
+        </Link>
+      )}
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>

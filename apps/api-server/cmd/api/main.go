@@ -21,6 +21,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/server"
+	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
 )
@@ -138,19 +139,30 @@ func runServe() error {
 		return fmt.Errorf("camera state start: %w", err)
 	}
 
+	pipelineStat, err := pipeline.NewStateTracker(cfg.NATSURL)
+	if err != nil {
+		return fmt.Errorf("pipeline state tracker: %w", err)
+	}
+	if err := pipelineStat.Start(ctx); err != nil {
+		return fmt.Errorf("pipeline state start: %w", err)
+	}
+
 	srv := server.New(server.Deps{
-		Config:    cfg,
-		Pool:      pool,
-		Auth:      authStore,
-		Cameras:   camera.NewStore(pool),
-		Pipeline:  pipeline.LoggingClient{}, // swap for the generated gRPC client when ready
-		Events:    bus,
-		Rules:     rules.NewStore(pool),
-		Snapshots: snapshot.New(cfg.DataDir + "/recordings"),
+		Config:        cfg,
+		Pool:          pool,
+		Auth:          authStore,
+		Cameras:       camera.NewStore(pool),
+		Pipeline:      pipeline.LoggingClient{}, // swap for the generated gRPC client when ready
+		Events:        bus,
+		Rules:         rules.NewStore(pool),
+		Snapshots:     snapshot.New(cfg.DataDir + "/recordings"),
 		Segments:      segments.NewStore(pool),
 		Whep:          whepReg,
 		CamStates:     camStates,
 		Notifications: notifications.NewStore(pool),
+		Settings:      settings.NewStore(pool),
+		PipelineStat:  pipelineStat,
+		NatsPublish:   pipelineStat.Publish,
 	})
 
 	httpSrv := &http.Server{

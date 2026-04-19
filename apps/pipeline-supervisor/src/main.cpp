@@ -114,12 +114,40 @@ int main(int argc, char** argv) {
         std::cerr << "pipeline-supervisor: continuing without NATS (degraded mode)\n";
     }
 
+    // Subscribe to the restart signal published by api-server when the
+    // operator picks a new YOLO variant / precision. On receipt, set the
+    // stop flag — docker compose's restart=unless-stopped brings us back
+    // up, and the entrypoint re-reads settings from the DB before the
+    // supervisor starts.
+    natsConnection* restart_conn = nullptr;
+    natsSubscription* restart_sub = nullptr;
+    if (nats.Connected()) {
+        natsStatus st = natsConnection_ConnectTo(&restart_conn, cfg.nats_url.c_str());
+        if (st == NATS_OK) {
+            natsConnection_Subscribe(&restart_sub, restart_conn,
+                "fnvr.system.pipeline.restart",
+                [](natsConnection*, natsSubscription*, natsMsg* msg, void*) {
+                    std::cerr << "pipeline-supervisor: received restart signal\n";
+                    g_stop = 1;
+                    natsMsg_Destroy(msg);
+                }, nullptr);
+        } else {
+            std::cerr << "pipeline-supervisor: restart subscriber failed: "
+                      << natsStatus_GetText(st) << "\n";
+        }
+    }
+
+    // Announce ready to the pipeline-state stream so the UI banner clears.
+    nats.Publish("fnvr.state.pipeline", "{\"state\":\"ready\"}");
+
     fnvr::Supervisor sup(cfg, &nats);
     std::thread runner([&sup] { sup.Run(); });
 
     while (!g_stop) pause();
 
     std::cerr << "pipeline-supervisor: shutting down\n";
+    if (restart_sub) natsSubscription_Destroy(restart_sub);
+    if (restart_conn) natsConnection_Destroy(restart_conn);
     sup.Stop();
     if (runner.joinable()) runner.join();
     gst_deinit();
