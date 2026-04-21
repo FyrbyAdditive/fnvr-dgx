@@ -16,10 +16,12 @@ package rules
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
+	"math/bits"
 	"os"
 	"sort"
 	"strconv"
@@ -90,6 +92,15 @@ type Engine struct {
 	// negative is retracted.
 	faceNegatives       []dismissedEmbedding
 	negPenaltyWeight    float64
+
+	// Object-flag suppression library. Keyed as
+	//   objectFlags[camera_id][class_original] = []phash
+	// so the per-detection check is an O(1) map lookup + a short
+	// linear Hamming scan (typical branch length single digits even on
+	// busy setups). Reloaded every 30 s from object_flags WHERE
+	// dismissed_at IS NULL.
+	objectFlags   map[string]map[string][]uint64
+	phashHamming  int // setting detections.suppression_hamming_threshold
 
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
@@ -283,6 +294,8 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		cooldowns:         map[string]time.Time{},
 		tracks:            map[string]trackEntry{},
 		sequenceSightings: map[string][]sequenceSighting{},
+		objectFlags:       map[string]map[string][]uint64{},
+		phashHamming:      8,
 	}, nil
 }
 
@@ -567,6 +580,14 @@ func (e *Engine) reload(ctx context.Context) error {
 	}
 	penaltyWeight := loadNegPenaltyWeight(ctx, e.pool)
 
+	// Object-flag suppression library. Loaded from object_flags WHERE
+	// dismissed_at IS NULL. Missing table = empty library.
+	flagLib, flagCount, err := e.loadObjectFlags(ctx)
+	if err != nil {
+		return err
+	}
+	phashHamming := loadPHashHamming(ctx, e.pool)
+
 	e.mu.Lock()
 	e.rules = compiled
 	e.zones = zones
@@ -578,10 +599,13 @@ func (e *Engine) reload(ctx context.Context) error {
 	e.faceMarginThresh = margin
 	e.faceNegatives = negs
 	e.negPenaltyWeight = penaltyWeight
+	e.objectFlags = flagLib
+	e.phashHamming = phashHamming
 	e.mu.Unlock()
 	metrics.RulesLoaded.Set(float64(len(compiled)))
 	metrics.EnrolledEmbeddings.Set(float64(len(enrols)))
 	metrics.FaceNegatives.Set(float64(len(negs)))
+	metrics.ObjectFlagsLoaded.Set(float64(flagCount))
 	slog.Info("rules reloaded",
 		"rules", len(compiled),
 		"zone_cameras", len(zones),
@@ -592,7 +616,9 @@ func (e *Engine) reload(ctx context.Context) error {
 		"face_threshold", thresh,
 		"face_margin", margin,
 		"face_negatives", len(negs),
-		"neg_penalty_weight", penaltyWeight)
+		"neg_penalty_weight", penaltyWeight,
+		"object_flags", flagCount,
+		"phash_hamming", phashHamming)
 	return nil
 }
 
@@ -613,6 +639,8 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	faceMargin := e.faceMarginThresh
 	faceNegatives := e.faceNegatives
 	negPenaltyW := e.negPenaltyWeight
+	objectFlagsByClass := e.objectFlags[d.CameraID]
+	phashHamming := e.phashHamming
 	e.mu.RUnlock()
 
 	// Per-camera detector whitelist — e.g. ANPR is pointless on indoor
@@ -639,6 +667,35 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	if muted != nil {
 		if _, hit := muted[d.ClassName]; hit {
 			return nil
+		}
+	}
+
+	// Object-flag suppression. If the operator has flagged a visually
+	// similar bbox on this same camera with the same class as a false
+	// positive, drop the detection before it reaches persistence,
+	// SSE, or rule evaluation. Match is pHash Hamming distance on the
+	// 64-bit bbox-crop perceptual hash; cost is a handful of XORs +
+	// popcounts per detection. Only runs when:
+	//   - the detection is an "object" kind (not face / anpr),
+	//   - there are active flags for this (camera, class) pair, and
+	//   - the pipeline emitted a `phash` attribute on the detection.
+	if len(objectFlagsByClass) > 0 {
+		if phashes, ok := objectFlagsByClass[d.ClassName]; ok && len(phashes) > 0 {
+			if hashStr := d.Attributes["phash"]; hashStr != "" {
+				if probe, ok := parsePHash(hashStr); ok {
+					for _, flagHash := range phashes {
+						if bits.OnesCount64(probe^flagHash) <= phashHamming {
+							slog.Debug("suppressed by flag",
+								"camera", d.CameraID,
+								"class", d.ClassName,
+								"phash", hashStr)
+							metrics.DetectionsSuppressed.
+								WithLabelValues(d.CameraID, d.ClassName).Inc()
+							return nil
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -1375,6 +1432,85 @@ func loadNegPenaltyWeight(ctx context.Context, pool *pgxpool.Pool) float64 {
 		w = 2
 	}
 	return w
+}
+
+// parsePHash decodes a detection's attributes.phash — a 16-char
+// lowercase hex string — into a uint64. Returns false on any
+// decoding failure so the caller just skips the suppression check.
+func parsePHash(s string) (uint64, bool) {
+	if len(s) != 16 {
+		return 0, false
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return 0, false
+	}
+	var p uint64
+	for _, v := range b {
+		p = (p << 8) | uint64(v)
+	}
+	return p, true
+}
+
+// loadPHashHamming reads settings.detections.suppression_hamming_threshold.
+// Default 8 is the well-known pHash identity cutoff; clamped to
+// [4, 16] on read so a typo can't disable suppression entirely nor
+// suppress unrelated detections.
+func loadPHashHamming(ctx context.Context, pool *pgxpool.Pool) int {
+	const def = 8
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'detections.suppression_hamming_threshold'`).Scan(&raw)
+	if err != nil {
+		return def
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return def
+	}
+	if n < 4 {
+		n = 4
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n
+}
+
+// loadObjectFlags pulls the active suppression library and groups by
+// (camera_id, class_original). phash comes out as int64 from pgx —
+// reinterpret as uint64 so bits.OnesCount64 works directly.
+// Missing table (fresh install predating migration 0024) returns
+// empty / no error, consistent with loadFaceNegatives.
+func (e *Engine) loadObjectFlags(ctx context.Context) (map[string]map[string][]uint64, int, error) {
+	rows, err := e.pool.Query(ctx, `
+		SELECT camera_id, class_original, phash
+		FROM object_flags
+		WHERE dismissed_at IS NULL`)
+	if err != nil {
+		if isRelationMissing(err) {
+			return map[string]map[string][]uint64{}, 0, nil
+		}
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := map[string]map[string][]uint64{}
+	n := 0
+	for rows.Next() {
+		var camera, class string
+		var signed int64
+		if err := rows.Scan(&camera, &class, &signed); err != nil {
+			return nil, 0, err
+		}
+		byClass, ok := out[camera]
+		if !ok {
+			byClass = map[string][]uint64{}
+			out[camera] = byClass
+		}
+		byClass[class] = append(byClass[class], uint64(signed))
+		n++
+	}
+	return out, n, rows.Err()
 }
 
 // parseVectorLiteral parses pgvector's "[v0,v1,...]" text form into a

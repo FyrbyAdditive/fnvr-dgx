@@ -10,6 +10,7 @@ const tabs = [
   { to: "/timeline", label: "Timeline" },
   { to: "/plates", label: "Plates" },
   { to: "/faces", label: "Faces" },
+  { to: "/flags", label: "Flags" },
   { to: "/storage", label: "Storage" },
   { to: "/settings", label: "Settings" },
 ];

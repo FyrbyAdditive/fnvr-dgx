@@ -13,6 +13,7 @@ import { Plates } from "@/routes/plates/Plates";
 import { Rules } from "@/routes/rules/Rules";
 import { Settings } from "@/routes/settings/Settings";
 import { Storage } from "@/routes/storage/Storage";
+import { Flags } from "@/routes/flags/Flags";
 import "./index.css";
 
 const qc = new QueryClient();
@@ -33,6 +34,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
             <Route path="/plates" element={<Plates />} />
             <Route path="/faces" element={<Faces />} />
             <Route path="/storage" element={<Storage />} />
+            <Route path="/flags" element={<Flags />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
         </Routes>

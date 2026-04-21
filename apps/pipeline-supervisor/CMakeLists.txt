@@ -26,6 +26,7 @@ add_executable(pipeline-supervisor
   src/main.cpp
   src/pipeline.cpp
   src/face_crop_jpeg.cpp
+  src/object_phash.cpp
   src/supervisor.cpp
   src/nats_publisher.cpp
   src/config.cpp

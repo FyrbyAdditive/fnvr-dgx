@@ -93,6 +93,29 @@ Open **Storage**; the GB/day column tells you who. Common causes in order:
 
 Don't lower `storage.min_free_pct` as a "let me use more disk" dial — it's a safety net.
 
+## Something we want to see is being suppressed
+
+You flagged a detection earlier, and now similar real detections aren't showing up.
+
+1. Open **Flags** (sidebar). Find the flag responsible — each row is tagged with camera + class + a thumbnail of the bbox.
+2. Click **dismiss** to drop it from the suppression library. Event-processor picks up the change within 30 s. The dataset entry on disk stays put for future training; use **dismiss + purge** if you also want the JPEG + label file gone.
+3. If the pHash threshold is too loose system-wide:
+
+   ```sql
+   UPDATE settings SET value = '6'::jsonb
+    WHERE key = 'detections.suppression_hamming_threshold';
+   ```
+
+   Smaller = tighter matches (fewer false suppressions). Range [4, 16]. See [architecture/rules-engine.md § object-flag suppression](../architecture/rules-engine.md#object-flag-suppression).
+
+4. Sanity-check the counter:
+
+   ```bash
+   curl -s http://localhost:9091/metrics | grep fnvr_detections_suppressed_total
+   ```
+
+   A bump in `fnvr_detections_suppressed_total{camera_id, class}` matches exactly one flag firing; if the counter isn't moving, the pHash threshold is too tight and nothing's being caught.
+
 ## Clean reset of Face-ID
 
 Only nuclear option — loses all enrolments + dismissals + clusters. Useful if the pool is so compromised you'd rather start over.

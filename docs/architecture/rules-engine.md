@@ -89,6 +89,39 @@ Settings:
 
 See [operations/face-id.md](../operations/face-id.md) for tuning advice.
 
+## Object-flag suppression
+
+False-positive object detections flagged via the Live UI's bbox click
+(see [operations/false-positive-flags.md](../operations/false-positive-flags.md))
+feed a per-`(camera, class)` pHash library. Every object detection is
+checked against it BEFORE rule evaluation, incident firing, or even
+persistence — suppressed detections leave no trace.
+
+The pipeline emits a 64-bit perceptual hash (`attributes.phash`,
+16-char lowercase hex) for each object-kind detection. It's computed
+from an 8×8 luma downsample of the bbox crop; same NvBufSurfTransform
+primitive as face thumbnails.
+
+Match algorithm: for each flag in `objectFlagsByClass[d.CameraID][d.ClassName]`,
+compute `bits.OnesCount64(probe ^ flag)`. Distance ≤
+`detections.suppression_hamming_threshold` (default 8) → suppress.
+
+Effects of suppression:
+- Detection is not INSERTed into `detections`.
+- Not added to the per-segment JSONL sidecar.
+- Not published over SSE to the UI.
+- Not evaluated against rules.
+- Counted as `fnvr_detections_suppressed_total{camera_id, class}`.
+
+The library is loaded in `reload()` (30 s cadence), same shape as face
+negatives. Soft-deleting a flag via the Flags page removes it from the
+library within ≤ 30 s.
+
+Settings:
+- `detections.suppression_hamming_threshold` — default 8, clamped to
+  [4, 16]. Smaller = tighter match, fewer false suppressions, more
+  missed suppressions. See [operations/settings.md](../operations/settings.md).
+
 ## Plate hotlist
 
 `plate_hotlist` rows hold `pattern` (SQL LIKE-shape, uppercase alphanumerics + `%`), `label`, `severity`. Every ANPR detection's normalised plate is checked; matches fire an incident with `rule_id=NULL`, severity from the entry, summary `"hotlist: <label> (<plate>) on <camera>"`. Cooldown is 30 s keyed on `"hotlist:<entry_id>:<camera>"`.

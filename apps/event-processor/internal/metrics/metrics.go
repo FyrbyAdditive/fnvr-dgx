@@ -61,6 +61,19 @@ var (
 			Help: "Enabled rules loaded at last reload.",
 		},
 	)
+	ObjectFlagsLoaded = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "fnvr_object_flags_loaded",
+			Help: "Active object-flag suppression library size at last reload.",
+		},
+	)
+	DetectionsSuppressed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fnvr_detections_suppressed_total",
+			Help: "Detections dropped by the object-flag suppression library (pHash match).",
+		},
+		[]string{"camera_id", "class"},
+	)
 )
 
 func init() {
@@ -72,6 +85,8 @@ func init() {
 		EnrolledEmbeddings,
 		FaceNegatives,
 		RulesLoaded,
+		ObjectFlagsLoaded,
+		DetectionsSuppressed,
 	)
 }
 

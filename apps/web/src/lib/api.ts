@@ -480,6 +480,33 @@ export const api = {
   getPipelineState: () => req<PipelineStateResponse>("/system/pipeline/state"),
   restartPipeline: () =>
     req<void>("/system/pipeline/restart", { method: "POST" }),
+
+  // Object-detection false-positive / relabel flags. `eventID` is the
+  // detection's event_id (short hex string, the one the SSE stream
+  // publishes as `id`) — the server resolves it to the PG row id.
+  flagDetection: (eventID: string, classCorrected: string | null) =>
+    req<ObjectFlag>(`/detections/${eventID}/flag`, {
+      method: "POST",
+      body: JSON.stringify({ class_corrected: classCorrected }),
+    }),
+  listObjectFlags: (params?: {
+    camera_id?: string;
+    class_original?: string;
+    dismissed?: boolean;
+    limit?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (params?.camera_id) p.set("camera_id", params.camera_id);
+    if (params?.class_original) p.set("class_original", params.class_original);
+    if (params?.dismissed) p.set("dismissed", "1");
+    if (params?.limit) p.set("limit", String(params.limit));
+    return req<ObjectFlag[]>(`/object-flags${p.size ? `?${p}` : ""}`);
+  },
+  dismissObjectFlag: (id: number, purge = false) =>
+    req<ObjectFlag>(`/object-flags/${id}${purge ? "?purge=true" : ""}`, {
+      method: "DELETE",
+    }),
+  objectFlagStats: () => req<ObjectFlagStats>("/object-flags/stats"),
 };
 
 export type DetectorSettings = {
@@ -656,3 +683,54 @@ export type NotificationDelivery = {
   status_code?: number;
   error?: string;
 };
+
+// Object-detection flag. Created when an operator clicks a bounding
+// box on the Live view and marks it as a false positive or relabels
+// it. Each flag both drives real-time suppression (via event-processor
+// pHash matching) AND writes an entry to the YOLO-format dataset tree
+// under /var/lib/fnvr/datasets/objects/ for future off-device training.
+export type ObjectFlag = {
+  id: number;
+  detection_id: number;
+  camera_id: string;
+  ts: string;
+  class_original: string;
+  class_corrected: string | null;
+  bbox: { x: number; y: number; w: number; h: number };
+  phash: number;
+  frame_path: string;
+  label_path: string;
+  created_by: string | null;
+  created_at: string;
+  dismissed_at: string | null;
+};
+
+export type ObjectFlagStats = {
+  total: number;
+  active: number;
+  dismissed: number;
+  by_camera: Record<string, number>;
+  by_class: Record<string, number>;
+};
+
+// COCO-80 class list — same order + spellings as the YOLO26
+// detector emits, and the Go CocoClasses slice in
+// apps/api-server/internal/flags/dataset.go. Used by the relabel
+// dropdown and the Flags page's class filter. Keep in sync if the
+// detector ever swaps classes.
+export const COCO_CLASSES = [
+  "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+  "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+  "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+  "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+  "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+  "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+  "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+  "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+  "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+  "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+  "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+  "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+  "scissors", "teddy bear", "hair drier", "toothbrush",
+] as const;
+export type CocoClass = typeof COCO_CLASSES[number];

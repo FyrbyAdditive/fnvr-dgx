@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -225,6 +226,14 @@ void Supervisor::workerMain(Worker* w) {
     std::uniform_int_distribution<int> jitter(0, 1000);
     int backoff_ms = 1000;
 
+    // Flapping detection — rolling window of recent (non-rotation)
+    // worker-exit times. When a worker dies ≥3 times in a 60 s window,
+    // we publish `failed` on the per-camera state subject so the UI
+    // shows "pipeline failed" instead of forever-"starting". The worker
+    // keeps retrying; the state clears on the next successful PLAYING
+    // publish.
+    std::deque<std::chrono::steady_clock::time_point> recent_exits;
+
     while (!stop_ && !w->stop) {
         // Defensive: if a prior worker died mid-engine-serialize (e.g.
         // SIGTERM from hourly rotation during a first-time TRT build),
@@ -332,6 +341,22 @@ void Supervisor::workerMain(Worker* w) {
             // Healthy restart; don't back off.
             backoff_ms = 1000;
             continue;
+        }
+
+        // Flapping check. Trim the window to the last 60 s, then count.
+        auto now = std::chrono::steady_clock::now();
+        recent_exits.push_back(now);
+        while (!recent_exits.empty() &&
+               now - recent_exits.front() > std::chrono::seconds(60)) {
+            recent_exits.pop_front();
+        }
+        if (recent_exits.size() >= 3 && nats_) {
+            std::cerr << "worker[" << w->cam.id << "]: flapping ("
+                      << recent_exits.size() << " exits in 60s) — publishing failed\n";
+            std::string subj = "fnvr.state.camera." + w->cam.id;
+            std::string payload = "{\"camera_id\":\"" + w->cam.id +
+                "\",\"state\":\"failed\"}";
+            nats_->Publish(subj, payload, /*flush=*/true);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));

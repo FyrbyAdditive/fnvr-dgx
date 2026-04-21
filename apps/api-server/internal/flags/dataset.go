@@ -1,0 +1,218 @@
+package flags
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// (context is used by Stats below.)
+
+// DatasetRoot is the on-disk YOLO dataset tree we maintain. Relative
+// to FNVR_DATA_DIR. Writes land under train/ or val/ based on a
+// deterministic hash of the flag id (90/10 split). dataset.yaml is
+// regenerated from the current set of active flags every time a flag
+// is created or dismissed.
+const DatasetRoot = "datasets/objects"
+
+// YOLO 80-class COCO index. Used to translate class_corrected to a
+// numeric class id in the label file. Anything not in this list is
+// skipped (label file is written without that row). For this slice
+// we restrict class_corrected to the COCO list; new classes are a
+// deferred slice.
+//
+// Source: the pipeline's detector parser emits these names verbatim;
+// this map must stay in lock-step with deploy/config/nvinfer/coco.labels.
+var CocoClasses = []string{
+	"person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+	"truck", "boat", "traffic light", "fire hydrant", "stop sign",
+	"parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+	"elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+	"handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+	"sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+	"surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+	"knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+	"broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+	"couch", "potted plant", "bed", "dining table", "toilet", "tv",
+	"laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+	"oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+	"scissors", "teddy bear", "hair drier", "toothbrush",
+}
+
+var cocoClassIndex = func() map[string]int {
+	m := make(map[string]int, len(CocoClasses))
+	for i, c := range CocoClasses {
+		m[c] = i
+	}
+	return m
+}()
+
+// SplitFor picks train/ or val/ based on a stable hash of the flag
+// id. 10 % of flags end up under val/. Deterministic so calling it
+// before and after a dismiss produces the same directory; the
+// dataset.yaml regenerator relies on this.
+func SplitFor(flagID int64) string {
+	h := fnv.New32a()
+	_, _ = fmt.Fprintf(h, "%d", flagID)
+	if h.Sum32()%10 == 0 {
+		return "val"
+	}
+	return "train"
+}
+
+// WriteArtifacts writes the frame JPEG + YOLO label .txt for a flag.
+// Returns the paths (relative to dataDir) that should be stored on
+// the flag row. Creates directories as needed.
+//
+// jpegSrc is the path on disk (absolute) of the full-frame JPEG to
+// copy into the dataset (typically the most recent live-preview ring
+// file for the camera). If jpegSrc doesn't exist the caller should
+// bail before calling; we don't synthesise images.
+func WriteArtifacts(dataDir string, flagID int64, jpegSrc string,
+	bbox BBox, classCorrected *string) (framePath, labelPath string, err error) {
+
+	split := SplitFor(flagID)
+	absImgDir := filepath.Join(dataDir, DatasetRoot, "images", split)
+	absLblDir := filepath.Join(dataDir, DatasetRoot, "labels", split)
+	for _, d := range []string{absImgDir, absLblDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", "", err
+		}
+	}
+
+	baseName := fmt.Sprintf("%d", flagID)
+	framePath = filepath.Join(DatasetRoot, "images", split, baseName+".jpg")
+	labelPath = filepath.Join(DatasetRoot, "labels", split, baseName+".txt")
+
+	if err := copyFile(jpegSrc, filepath.Join(dataDir, framePath)); err != nil {
+		return "", "", fmt.Errorf("copy frame: %w", err)
+	}
+
+	// Label file. YOLO format: `<class_id> <xc> <yc> <w> <h>` with all
+	// four box values normalised [0,1]. Our bbox already is.
+	//
+	// class_corrected NULL → empty label file ("no objects in this
+	// image at this bbox") — YOLO-trains the detector away from the
+	// false positive.
+	//
+	// class_corrected non-null and in CocoClasses → one line.
+	//
+	// class_corrected non-null but NOT in CocoClasses (shouldn't
+	// happen in slice 1; defensive) → empty file + log.
+	var labelContent string
+	if classCorrected != nil {
+		if idx, ok := cocoClassIndex[*classCorrected]; ok {
+			xc := bbox.X + bbox.W/2
+			yc := bbox.Y + bbox.H/2
+			labelContent = fmt.Sprintf("%d %.6f %.6f %.6f %.6f\n",
+				idx, xc, yc, bbox.W, bbox.H)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, labelPath),
+		[]byte(labelContent), 0o644); err != nil {
+		return "", "", fmt.Errorf("write label: %w", err)
+	}
+	return framePath, labelPath, nil
+}
+
+// RegenerateDatasetYAML writes dataset.yaml to the dataset root. We
+// regenerate this on every flag create/dismiss — it's only a couple
+// of hundred bytes of text and keeps the on-disk tree fully
+// self-describing for when an off-device training box rsyncs it.
+//
+// The YAML is Ultralytics' canonical format:
+//
+//	path: /var/lib/fnvr/datasets/objects
+//	train: images/train
+//	val: images/val
+//	names:
+//	  0: person
+//	  1: bicycle
+//	  ...
+func RegenerateDatasetYAML(dataDir string) error {
+	root := filepath.Join(dataDir, DatasetRoot)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+
+	var b strings.Builder
+	b.WriteString("# Regenerated by fnvr api-server on every flag create/dismiss.\n")
+	b.WriteString("# Last update: " + time.Now().UTC().Format(time.RFC3339) + "\n")
+	fmt.Fprintf(&b, "path: %s\n", root)
+	b.WriteString("train: images/train\n")
+	b.WriteString("val: images/val\n")
+	b.WriteString("names:\n")
+	// Write classes in id order so the numeric labels in .txt files
+	// line up when trainers consume this.
+	for i, name := range CocoClasses {
+		fmt.Fprintf(&b, "  %d: %s\n", i, name)
+	}
+
+	return os.WriteFile(filepath.Join(root, "dataset.yaml"), []byte(b.String()), 0o644)
+}
+
+// Stats is a quick summary for the Flags page header.
+type Stats struct {
+	Total        int                      `json:"total"`
+	Active       int                      `json:"active"`
+	Dismissed    int                      `json:"dismissed"`
+	ByCamera     map[string]int           `json:"by_camera"`
+	ByClass      map[string]int           `json:"by_class"`
+}
+
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	out := Stats{
+		ByCamera: map[string]int{},
+		ByClass:  map[string]int{},
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT camera_id, class_original, dismissed_at IS NULL AS active, COUNT(*)
+		FROM object_flags
+		GROUP BY camera_id, class_original, active`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var camID, class string
+		var active bool
+		var n int
+		if err := rows.Scan(&camID, &class, &active, &n); err != nil {
+			return out, err
+		}
+		out.Total += n
+		if active {
+			out.Active += n
+			out.ByCamera[camID] += n
+			out.ByClass[class] += n
+		} else {
+			out.Dismissed += n
+		}
+	}
+	return out, rows.Err()
+}
+
+// --- plumbing ---
+
+func copyFile(src, dst string) error {
+	sf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	df, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if _, err := io.Copy(df, sf); err != nil {
+		return err
+	}
+	return df.Sync()
+}
+

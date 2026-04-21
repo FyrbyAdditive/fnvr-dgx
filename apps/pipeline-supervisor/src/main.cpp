@@ -111,8 +111,26 @@ int main(int argc, char** argv) {
             }
             return TRUE;
         }, nullptr);
-        std::thread stop_watcher([&loop, &p] {
+        // Watchdog + fault-latch. If the pipeline doesn't reach PLAYING
+        // within 60 s of Start(), we fault the pipeline ourselves so the
+        // supervisor respawns instead of wedging on a silent rtspsrc
+        // SETUP hang. rtspsrc with tcp-timeout=15s normally errors out
+        // long before 60 s; this is belt-and-braces for cases where the
+        // element doesn't surface the failure on the bus.
+        std::thread stop_watcher([&loop, &p, &cam, subj, &nats] {
+            const auto startup_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(60);
             while (!g_stop && !p.Faulted()) {
+                if (!p.Playing() &&
+                    std::chrono::steady_clock::now() > startup_deadline) {
+                    std::cerr << "worker[" << cam.id
+                              << "]: did not reach PLAYING within 60s — faulting\n";
+                    std::string payload = "{\"camera_id\":\"" + cam.id +
+                        "\",\"state\":\"failed\"}";
+                    nats.Publish(subj, payload, /*flush=*/true);
+                    p.Fault();
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
             g_main_loop_quit(loop);

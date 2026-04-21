@@ -26,6 +26,7 @@
 - [Settings reference](operations/settings.md) — every `settings` row, what it does, safe ranges.
 - [Storage management](operations/storage-management.md) — Storage page, retention, quota, disk-pressure floor.
 - [Face-ID guide](operations/face-id.md) — enrol people, tune the matcher, read the drift pill, clean up an enrolment pool.
+- [Object false-positive flags](operations/false-positive-flags.md) — flag wrong detections on Live, tune suppression, curate the YOLO dataset for future training.
 - [Upgrades](operations/upgrade.md) — `docker compose pull`, what migrations do.
 - [Troubleshooting](operations/troubleshooting.md) — symptoms we've hit, with the actual fixes.
 - [Known issues](operations/known-issues.md) — upstream bugs we cannot fix; their workarounds.

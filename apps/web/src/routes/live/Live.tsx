@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api } from "@/lib/api";
+import { api, COCO_CLASSES } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
+import { useMe } from "@/lib/me";
 
 export function Live() {
+  const { data: me } = useMe();
+  const isAdmin = !!me?.is_admin;
   const { data: cameras = [] } = useQuery({
     queryKey: ["cameras"],
     queryFn: api.listCameras,
@@ -101,6 +104,7 @@ export function Live() {
               inferenceFps={fpsByCamera.get(c.id) ?? 0}
               showStats={showStats}
               focus={focusCameraId === c.id}
+              isAdmin={isAdmin}
             />
           ))}
         </div>
@@ -109,7 +113,7 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus }: {
+function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
   id: string;
   name: string;
   state?: "starting" | "running" | "failed" | "unknown";
@@ -118,7 +122,14 @@ function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps
   inferenceFps: number;
   showStats: boolean;
   focus?: boolean;
+  isAdmin: boolean;
 }) {
+  // Flag-popover state. `pickedDetection` is the detection the
+  // operator clicked on; `pickedFrozenBoxes` is the snapshot of boxes
+  // at the moment of click so the grid stops flickering behind the
+  // popover. Clicking outside or hitting escape resumes live.
+  const [pickedDetection, setPickedDetection] = useState<DetectionEvent | null>(null);
+  const [pickedFrozenBoxes, setPickedFrozenBoxes] = useState<DetectionEvent[] | null>(null);
   // When opened from Timeline's "now" click, scroll this tile into
   // view and run a short highlight animation so the user sees where
   // they landed without hunting the grid.
@@ -291,10 +302,35 @@ function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps
           </div>
         )}
 
-        {/* bbox overlay — coords are normalised 0..1 of the source frame */}
-        {detections.map((d) => (
-          <BBox key={d.id} d={d} />
+        {/* bbox overlay — coords are normalised 0..1 of the source frame.
+            When the popover is open we render the frozen boxes so the
+            clicked one stays put while the operator confirms. */}
+        {(pickedFrozenBoxes ?? detections).map((d) => (
+          <BBox
+            key={d.id}
+            d={d}
+            highlighted={pickedDetection?.id === d.id}
+            onPick={
+              // Only `object` kind is flaggable; faces / plates have
+              // their own dedicated review surfaces. Admin-only.
+              isAdmin && (d.kind === undefined || d.kind === "object")
+                ? () => {
+                    setPickedDetection(d);
+                    setPickedFrozenBoxes(detections);
+                  }
+                : undefined
+            }
+          />
         ))}
+        {pickedDetection && (
+          <FlagPopover
+            detection={pickedDetection}
+            onClose={() => {
+              setPickedDetection(null);
+              setPickedFrozenBoxes(null);
+            }}
+          />
+        )}
       </div>
 
       <div className="absolute bottom-2 left-2 text-xs bg-black/60 px-2 py-0.5 rounded">
@@ -361,14 +397,27 @@ function formatRelativeAge(d: Date): string {
   return `${Math.round(secs / 86400)}d ago`;
 }
 
-function BBox({ d }: { d: DetectionEvent }) {
+function BBox({
+  d,
+  highlighted,
+  onPick,
+}: {
+  d: DetectionEvent;
+  highlighted?: boolean;
+  /** Non-nullable enables pointer events + hover + click-to-flag. */
+  onPick?: () => void;
+}) {
   const isPlate = d.kind === "anpr";
   const isFace = d.kind === "face";
   const person = isFace ? d.attributes?.person : undefined;
   // Fixed-colour boxes for the special detectors so they stand apart
   // from the COCO palette: green for plates, sky-blue for matched
   // faces. Unmatched faces fall back to the class-palette "face".
-  const color = isPlate
+  // Highlighted box (operator clicked it) gets an amber border so it
+  // stands out above everything else.
+  const color = highlighted
+    ? "#fbbf24"
+    : isPlate
     ? "#22c55e"
     : person
     ? "#38bdf8"
@@ -379,9 +428,13 @@ function BBox({ d }: { d: DetectionEvent }) {
     top: `${d.bbox.y * 100}%`,
     width: `${d.bbox.w * 100}%`,
     height: `${d.bbox.h * 100}%`,
-    border: `2px solid ${color}`,
+    border: `${highlighted ? 3 : 2}px solid ${color}`,
     boxShadow: `0 0 0 1px rgba(0,0,0,0.5)`,
-    pointerEvents: "none",
+    // Only bboxes an operator can act on accept pointer events.
+    // Everything else stays click-through so WHEP gestures reach the
+    // video underneath.
+    pointerEvents: onPick ? "auto" : "none",
+    cursor: onPick ? "pointer" : "default",
   };
   // Label priority: plate text → matched-person name + similarity →
   // class + detection confidence.
@@ -397,7 +450,11 @@ function BBox({ d }: { d: DetectionEvent }) {
     label = `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
   }
   return (
-    <div style={style}>
+    <div
+      style={style}
+      onClick={onPick ? (e) => { e.stopPropagation(); onPick(); } : undefined}
+      title={onPick ? "Flag this detection" : undefined}
+    >
       <div
         className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight tabular-nums"
         style={{ background: color, color: "#000", transform: "translateY(-100%)" }}
@@ -427,5 +484,109 @@ function EmptyState() {
         </div>
       </div>
     </div>
+  );
+}
+
+// FlagPopover floats near the clicked bbox inside the CameraTile and
+// lets the operator mark the detection as a false positive or relabel
+// it. Either choice hits `POST /detections/{event_id}/flag` via the
+// api client; on success the popover closes and the caller's state
+// unfreezes the bbox overlay.
+function FlagPopover({
+  detection,
+  onClose,
+}: {
+  detection: DetectionEvent;
+  onClose: () => void;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Close on Escape. Mouse-outside is handled by a full-tile
+  // invisible overlay behind the popover so the main Live click
+  // handlers on the video layer aren't disturbed.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Auto-close after 15 s so an abandoned popover doesn't wedge the
+  // tile forever.
+  useEffect(() => {
+    const t = setTimeout(onClose, 15000);
+    return () => clearTimeout(t);
+  }, [onClose]);
+
+  async function submit(classCorrected: string | null) {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.flagDetection(detection.id, classCorrected);
+      onClose();
+    } catch (e) {
+      setError((e as Error).message || "flag failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  // Position relative to the bbox: anchor the popover just below the
+  // box, clamped to the tile. Popover uses absolute% so it scales
+  // with the tile.
+  const left = `${Math.max(0, Math.min(70, detection.bbox.x * 100))}%`;
+  const top = `${Math.min(90, (detection.bbox.y + detection.bbox.h) * 100)}%`;
+
+  return (
+    <>
+      {/* Click-outside overlay. Captures the click so it doesn't
+          reach the WHEP video. */}
+      <div
+        className="absolute inset-0 z-10"
+        style={{ background: "rgba(0,0,0,0.25)" }}
+        onClick={onClose}
+      />
+      <div
+        className="absolute z-20 bg-neutral-900 border border-neutral-700 rounded p-2 text-xs shadow-xl min-w-[14rem]"
+        style={{ left, top, transform: "translate(0, 0.25rem)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-neutral-400 mb-2">
+          Flag <span className="font-medium text-neutral-200">{detection.class_name}</span> on this camera?
+        </div>
+        <div className="space-y-1">
+          <button
+            className="w-full text-left px-2 py-1 rounded bg-red-900/60 hover:bg-red-800 disabled:opacity-50"
+            disabled={submitting}
+            onClick={() => submit(null)}
+          >
+            False positive — suppress future matches
+          </button>
+          <details className="px-1">
+            <summary className="cursor-pointer text-neutral-400 hover:text-neutral-200 py-1">
+              Relabel as…
+            </summary>
+            <div className="max-h-40 overflow-auto mt-1 grid grid-cols-2 gap-1">
+              {COCO_CLASSES.filter((c) => c !== detection.class_name).map((c) => (
+                <button
+                  key={c}
+                  className="text-left px-1 py-0.5 rounded hover:bg-neutral-800 disabled:opacity-50"
+                  disabled={submitting}
+                  onClick={() => submit(c)}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+          </details>
+        </div>
+        {error && <div className="text-red-400 mt-2">{error}</div>}
+        <div className="text-neutral-500 text-[10px] mt-2">
+          Esc or click outside to cancel.
+        </div>
+      </div>
+    </>
   );
 }

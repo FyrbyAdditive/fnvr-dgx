@@ -44,6 +44,10 @@ private:
     GstElement*      pipeline_ = nullptr;
     guint            bus_watch_id_ = 0;
     std::atomic<bool> faulted_{false};
+    // Flips true the first time the bus reports GST_STATE_PLAYING.
+    // Used by main.cpp's watchdog to detect "pipeline never rolled"
+    // — e.g. rtspsrc hung between TCP connect and SETUP reply.
+    std::atomic<bool> playing_{false};
     std::unique_ptr<WhepServer> whep_;
 
     // Target dimensions for the recording / inference branch. Zero until
@@ -54,6 +58,8 @@ private:
 
 public:
     bool Faulted() const { return faulted_.load(); }
+    bool Playing() const { return playing_.load(); }
+    void Fault() { faulted_.store(true); }
 };
 
 }  // namespace fnvr

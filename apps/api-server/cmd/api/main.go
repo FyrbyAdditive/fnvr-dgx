@@ -17,6 +17,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/db"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
+	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
 	"github.com/fnvr/fnvr/apps/api-server/internal/mlworker"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
@@ -171,6 +172,7 @@ func runServe() error {
 		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),
 		Plates:        plates.NewStore(pool),
 		Persons:       persons.NewStore(pool),
+		Flags:         flags.NewStore(pool),
 		MLWorker:      mlworker.NewClient(),
 	})
 

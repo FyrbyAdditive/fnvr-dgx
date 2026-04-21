@@ -19,6 +19,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
+	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
 	"github.com/fnvr/fnvr/apps/api-server/internal/metrics"
 	"github.com/fnvr/fnvr/apps/api-server/internal/mlworker"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
@@ -52,6 +53,7 @@ type Server struct {
 	detections   *detections.Store
 	plates       *plates.Store
 	persons      *persons.Store
+	flags        *flags.Store
 	mlWorker     *mlworker.Client
 }
 
@@ -74,6 +76,7 @@ type Deps struct {
 	Detections    *detections.Store
 	Plates        *plates.Store
 	Persons       *persons.Store
+	Flags         *flags.Store
 	MLWorker      *mlworker.Client
 }
 
@@ -97,6 +100,7 @@ func New(d Deps) *Server {
 		detections:   d.Detections,
 		plates:       d.Plates,
 		persons:      d.Persons,
+		flags:        d.Flags,
 		mlWorker:     d.MLWorker,
 	}
 }
@@ -221,6 +225,15 @@ func (s *Server) Handler() http.Handler {
 			protected.Handle("POST /api/v1/clusters/{id}/enrol", auth.AdminFunc(s.handleEnrolCluster))
 			protected.Handle("DELETE /api/v1/clusters/{id}", auth.AdminFunc(s.handleDeleteCluster))
 			protected.Handle("POST /api/v1/clusters/{id}/dismiss_not_a_face", auth.AdminFunc(s.handleDismissClusterAsNotAFace))
+
+			// Object-flag surface. Create + dismiss are admin-only
+			// (they drive real-time suppression); list + stats +
+			// thumbnail are viewer-safe.
+			protected.Handle("POST /api/v1/detections/{id}/flag", auth.AdminFunc(s.handleFlagDetection))
+			protected.HandleFunc("GET /api/v1/object-flags", s.handleListFlags)
+			protected.HandleFunc("GET /api/v1/object-flags/stats", s.handleFlagStats)
+			protected.Handle("DELETE /api/v1/object-flags/{id}", auth.AdminFunc(s.handleDismissFlag))
+			protected.HandleFunc("GET /api/v1/object-thumbnail/{detection_id}", s.handleObjectThumbnail)
 			protected.HandleFunc("GET /api/v1/ml/drift/status", s.handleDriftStatus)
 		}
 
@@ -303,6 +316,12 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/clusters", guarded)
 			mux.Handle("/api/v1/clusters/", guarded)
 			mux.Handle("/api/v1/ml/drift/status", guarded)
+		}
+		if s.flags != nil {
+			mux.Handle("/api/v1/detections/", guarded)   // catches .../flag
+			mux.Handle("/api/v1/object-flags", guarded)
+			mux.Handle("/api/v1/object-flags/", guarded)
+			mux.Handle("/api/v1/object-thumbnail/", guarded)
 		}
 		if s.notifs != nil {
 			mux.Handle("/api/v1/notifications/channels", guarded)

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "face_crop_jpeg.h"
+#include "object_phash.h"
 #include "rtsp_probe.h"
 #include "whep_server.h"
 
@@ -73,6 +74,10 @@ struct ProbeCtx {
     // in PG, so event-processor can rename to {pg_id}.jpg on INSERT).
     // Empty when face_id is off — saveFaceCrop short-circuits.
     std::string           thumbs_dir;
+    // Output directory for per-detection OBJECT crop JPEGs (smaller;
+    // 128x128 @ quality 75). Used by the Flags page to show what was
+    // flagged. Empty = don't write (probe still computes phash).
+    std::string           thumbs_dir_objects;
 };
 
 // JSON-escape minimal — only the fields we emit. Labels are small ASCII, IDs
@@ -316,6 +321,129 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
     gst_buffer_unmap(gst_buf, &map);
 }
 
+// Object-detection thumbnail dims. Smaller than face (objects matter
+// less as thumbnails and we may write a lot more of them); 128×128
+// JPEGs at quality 75 are ~2.5 KB.
+constexpr int OBJ_CROP_OUT_W = 128;
+constexpr int OBJ_CROP_OUT_H = 128;
+
+// saveObjectCropAndHash mirrors saveFaceCrop but for non-face / non-
+// plate detections. Returns the 64-bit average-hash of the bbox
+// crop so the probe can attach it to the NATS payload. Writes a
+// 128×128 JPEG thumbnail to {thumbs_dir_objects}/{short_id}.jpg.
+//
+// Returns 0 on any failure (missing thumbs dir, bbox too small, VIC
+// transform error). Caller can still emit the detection without a
+// phash — suppression just doesn't apply.
+//
+// No 1.4x padding (unlike faces): the bbox shape for objects is
+// already larger + less aspect-sensitive, and padding would dilute
+// the hash's signal from the object itself.
+std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
+                                    NvDsFrameMeta* frame,
+                                    float nx, float ny, float nw, float nh,
+                                    const std::string& short_id) {
+    if (!gst_buf || !frame) return 0;
+
+    float x0 = nx, y0 = ny, x1 = nx + nw, y1 = ny + nh;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 1) x1 = 1;
+    if (y1 > 1) y1 = 1;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(gst_buf, &map, GST_MAP_READ)) return 0;
+    auto* in_surf = reinterpret_cast<NvBufSurface*>(map.data);
+    if (!in_surf || frame->batch_id >= in_surf->numFilled) {
+        gst_buffer_unmap(gst_buf, &map);
+        return 0;
+    }
+    NvBufSurfaceParams& in_p = in_surf->surfaceList[frame->batch_id];
+    const int W = int(in_p.width);
+    const int H = int(in_p.height);
+
+    int px = int(x0 * W);
+    int py = int(y0 * H);
+    int pw_px = int((x1 - x0) * W);
+    int ph_px = int((y1 - y0) * H);
+    if (pw_px <= 8 || ph_px <= 8) {
+        // Tiny detections — pHash on an 8x8 downsample of a sub-8x8
+        // source is nonsense. Skip.
+        gst_buffer_unmap(gst_buf, &map);
+        return 0;
+    }
+
+    NvBufSurfaceCreateParams cp{};
+    cp.gpuId        = in_surf->gpuId;
+    cp.width        = guint(OBJ_CROP_OUT_W);
+    cp.height       = guint(OBJ_CROP_OUT_H);
+    cp.size         = 0;
+    cp.isContiguous = true;
+    cp.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    cp.layout       = NVBUF_LAYOUT_PITCH;
+    cp.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    NvBufSurface* dst = nullptr;
+    if (NvBufSurfaceCreate(&dst, 1, &cp) != 0 || !dst) {
+        gst_buffer_unmap(gst_buf, &map);
+        return 0;
+    }
+
+    NvBufSurfTransformRect src_rect {
+        guint(py), guint(px), guint(pw_px), guint(ph_px)
+    };
+    NvBufSurfTransformRect dst_rect {
+        0, 0, guint(OBJ_CROP_OUT_W), guint(OBJ_CROP_OUT_H)
+    };
+    NvBufSurfTransformParams tp{};
+    tp.src_rect = &src_rect;
+    tp.dst_rect = &dst_rect;
+    tp.transform_flag =
+        NVBUFSURF_TRANSFORM_FILTER |
+        NVBUFSURF_TRANSFORM_CROP_SRC |
+        NVBUFSURF_TRANSFORM_CROP_DST;
+    tp.transform_filter = NvBufSurfTransformInter_Default;
+
+    NvBufSurface tmp_in = *in_surf;
+    tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
+    tmp_in.numFilled   = 1;
+    tmp_in.batchSize   = 1;
+
+    if (NvBufSurfTransform(&tmp_in, dst, &tp) != NvBufSurfTransformError_Success) {
+        NvBufSurfaceDestroy(dst);
+        gst_buffer_unmap(gst_buf, &map);
+        return 0;
+    }
+
+    if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
+        NvBufSurfaceDestroy(dst);
+        gst_buffer_unmap(gst_buf, &map);
+        return 0;
+    }
+    NvBufSurfaceSyncForCpu(dst, 0, 0);
+
+    NvBufSurfaceParams& dp = dst->surfaceList[0];
+    const auto* rgba = static_cast<const std::uint8_t*>(dp.mappedAddr.addr[0]);
+    const int pitch = int(dp.planeParams.pitch[0]);
+
+    // Compute pHash from an 8×8 luma downsample of the 128×128 crop.
+    std::uint8_t luma[64];
+    downsampleToLuma8x8(rgba, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H, pitch, luma);
+    std::uint64_t hash = computeAverageHash64(luma);
+
+    // Best-effort JPEG thumbnail. A failed write is fine — the flag
+    // path can fall back to the live-preview ring. Gate on the
+    // thumbs_dir_objects being configured; empty means "don't write".
+    if (!ctx.thumbs_dir_objects.empty()) {
+        std::string out_path = ctx.thumbs_dir_objects + "/" + short_id + ".jpg";
+        (void)encodeJpegRGBA(rgba, pitch, 0, 0, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H, 75, out_path);
+    }
+
+    NvBufSurfaceUnMap(dst, 0, 0);
+    NvBufSurfaceDestroy(dst);
+    gst_buffer_unmap(gst_buf, &map);
+    return hash;
+}
+
 // Called for every batched frame leaving the last nvinfer (LPRNet
 // when ANPR is enabled, tracker otherwise). Emits two payload
 // shapes — kind="object" for pgie detections, kind="anpr" for
@@ -406,6 +534,14 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 saveFaceCrop(*ctx, buf, frame, x, y, w, h, det_id);
             }
 
+            // Object pHash + thumbnail. Only for plain object
+            // detections (not face / plate — those have their own
+            // matching paths). Zero cost when the crop fails.
+            std::uint64_t obj_phash = 0;
+            if (!is_face && !is_plate) {
+                obj_phash = saveObjectCropAndHash(*ctx, buf, frame, x, y, w, h, det_id);
+            }
+
             std::ostringstream js;
             js << "{"
                << "\"id\":\""         << det_id               << "\","
@@ -427,6 +563,10 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             } else if (is_face) {
                 js << ",\"attributes\":{"
                    << "\"embedding\":\""     << embedding_b64       << "\""
+                   << "}";
+            } else if (obj_phash != 0) {
+                js << ",\"attributes\":{"
+                   << "\"phash\":\""         << uint64ToHex16(obj_phash) << "\""
                    << "}";
             }
             js << "}";
@@ -557,7 +697,15 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
             std::cerr << "pipeline[" << cam_.id
                       << "]: recording target=" << tw << "x" << th << "\n";
 
-            p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
+            // tcp-timeout=15s + retry=3 so a hung RTSP SETUP bails instead of
+// blocking a worker forever (observed: Reolink firmware hang where
+// TCP/554 accepts connects but SETUP never completes, starving the
+// whole worker). On timeout, rtspsrc posts an error message — our
+// bus watch flips faulted_ and main.cpp exits, letting the
+// supervisor respawn with its backoff.
+p << "rtspsrc location=" << url
+  << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3"
+  << " name=src ! "
                  "rtph265depay ! h265parse config-interval=1 ! "
                  "video/x-h265,stream-format=byte-stream,alignment=au ! "
                  // Re-mux H.265 → H.264 via NVDEC+NVENC so the rest of
@@ -575,7 +723,15 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
             // Source is already H.264 — pass through the parsed elementary
             // stream; downstream infers dims from the caps. Record at
             // source resolution.
-            p << "rtspsrc location=" << url << " latency=200 protocols=tcp name=src ! "
+            // tcp-timeout=15s + retry=3 so a hung RTSP SETUP bails instead of
+// blocking a worker forever (observed: Reolink firmware hang where
+// TCP/554 accepts connects but SETUP never completes, starving the
+// whole worker). On timeout, rtspsrc posts an error message — our
+// bus watch flips faulted_ and main.cpp exits, letting the
+// supervisor respawn with its backoff.
+p << "rtspsrc location=" << url
+  << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3"
+  << " name=src ! "
                  "rtph264depay ! h264parse config-interval=1 ! ";
             if (probe.width > 0 && probe.height > 0) {
                 rec_width_ = probe.width;
@@ -765,6 +921,15 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                     std::error_code _ec;
                     std::filesystem::create_directories(ctx->thumbs_dir, _ec);
                 }
+                // Object detections always get a small thumbnail +
+                // pHash, independent of face_id. The Flags page
+                // needs the thumbnail so the operator can see what
+                // they're flagging.
+                {
+                    ctx->thumbs_dir_objects = "/var/lib/fnvr/thumbs/objects";
+                    std::error_code _ec;
+                    std::filesystem::create_directories(ctx->thumbs_dir_objects, _ec);
+                }
                 gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe, ctx, nullptr);
                 gst_object_unref(src);
             }
@@ -806,11 +971,14 @@ gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer use
             if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->pipeline_)) {
                 GstState oldS, newS;
                 gst_message_parse_state_changed(msg, &oldS, &newS, nullptr);
-                if (newS == GST_STATE_PLAYING && self->nats_) {
-                    // Last-value stream on api-server side — see state.go.
-                    std::string subj = "fnvr.state.camera." + self->cam_.id;
-                    std::string payload = "{\"camera_id\":\"" + self->cam_.id + "\",\"state\":\"running\"}";
-                    self->nats_->Publish(subj, payload, /*flush=*/true);
+                if (newS == GST_STATE_PLAYING) {
+                    self->playing_.store(true);
+                    if (self->nats_) {
+                        // Last-value stream on api-server side — see state.go.
+                        std::string subj = "fnvr.state.camera." + self->cam_.id;
+                        std::string payload = "{\"camera_id\":\"" + self->cam_.id + "\",\"state\":\"running\"}";
+                        self->nats_->Publish(subj, payload, /*flush=*/true);
+                    }
                 }
             }
             break;

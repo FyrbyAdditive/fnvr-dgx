@@ -35,6 +35,7 @@ See [face-id.md](face-id.md) for tuning advice.
 |---|---|---|---|
 | `storage.min_free_pct` | `10.0` | [0, 50] | Free-disk floor below which storage-manager purges oldest segments across all cameras. |
 | `detections_hot_hours` | `168` | > 0 | Detection rows older than this are pruned from Postgres on each storage-manager tick. Per-segment sidecar JSONL preserves history for the timeline. |
+| `detections.suppression_hamming_threshold` | `8` | [4, 16] | pHash Hamming-distance threshold for the object-flag suppression library. Smaller = only near-identical crops suppress; larger = suppresses loosely similar things too. See [face-id.md / object-flag-suppression](../architecture/rules-engine.md#object-flag-suppression). |
 
 ## ML worker
 
