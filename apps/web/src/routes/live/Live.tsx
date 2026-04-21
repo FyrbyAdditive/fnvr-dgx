@@ -35,6 +35,19 @@ export function Live() {
   // Group detections by camera, keeping only the freshest few per cam so
   // stale bboxes don't pile up. The SSE stream is already filtered to
   // recent-only, but we additionally time-gate to the last 2s.
+  //
+  // The filter depends on `Date.now()`, which useMemo can't observe
+  // on its own. Without the tick below, when the scene goes idle
+  // events stops changing, the memo never re-runs, and the last
+  // batch of boxes sits on screen until a new event arrives —
+  // which on an empty scene is never. Ticking every 500 ms is
+  // enough: the filter wakes up, finds every detection older than
+  // 2 s, and prunes them before render.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => (t + 1) & 0xffff), 500);
+    return () => clearInterval(id);
+  }, []);
   const boxesByCamera = useMemo(() => {
     const now = Date.now();
     const m = new Map<string, DetectionEvent[]>();
@@ -45,7 +58,9 @@ export function Live() {
       m.set(e.camera_id, arr);
     }
     return m;
-  }, [events]);
+    // `tick` in deps is deliberate — see above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, tick]);
 
   // Inference FPS per camera. Unique-timestamps-per-5s-window heuristic:
   // one inference frame publishes N events sharing the same ts, so the
@@ -66,7 +81,10 @@ export function Live() {
       out.set(cam, set.size / (WINDOW_MS / 1000));
     }
     return out;
-  }, [events]);
+    // Same reason as boxesByCamera: needs a timer tick so idle
+    // cameras drop to 0 fps instead of freezing on their last value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, tick]);
 
   const grid =
     cameras.length <= 1 ? "grid-cols-1" :

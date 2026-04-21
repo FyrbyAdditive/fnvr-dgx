@@ -23,7 +23,14 @@ TargetManagement:
   minIouDiff4NewTarget: 0.7418    # If the IOU between the newly detected object and any of the existing targets is higher than this threshold, this newly detected object will be discarded.
   minTrackerConfidence: 0.4009    # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
   probationAge: 2    # If the target's age exceeds this, the target will be considered to be valid.
-  maxShadowTrackingAge: 51    # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.
+  # Tuned down from the NVIDIA default of 51 (people-counting bench).
+  # At ~10 fps ingest that was ~5 s of "ghost" bbox staying on the
+  # Live overlay after an object occluded or left the frame. 10
+  # frames ≈ 1 s, which is perceptually "blink-and-gone" and better
+  # matches the NVR UX ("show me what's on screen right now") than
+  # identity-preservation across long occlusions, which we don't
+  # care about for object-class detection anyway.
+  maxShadowTrackingAge: 10
   earlyTerminationAge: 1    # If the shadowTrackingAge reaches this threshold while in TENTATIVE period, the target will be terminated prematurely.
 
 TrajectoryManagement:
