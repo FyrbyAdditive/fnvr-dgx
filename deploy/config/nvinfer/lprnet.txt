@@ -10,8 +10,10 @@
 [property]
 gpu-id=0
 net-scale-factor=0.00392156862745098
-onnx-file=/opt/fnvr/anpr/LPRNet_usa.onnx
-model-engine-file=/var/lib/fnvr/models/anpr/LPRNet_usa.engine
+onnx-file=/var/lib/fnvr/models/anpr/LPRNet_usa.onnx
+# Match nvinfer's auto-derived name so subsequent boots reuse the
+# built engine.
+model-engine-file=/var/lib/fnvr/models/anpr/LPRNet_usa.onnx_b16_gpu0_fp16.engine
 labelfile-path=/etc/fnvr/nvinfer/lprnet.labels
 batch-size=16
 network-mode=2

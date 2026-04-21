@@ -1,0 +1,81 @@
+# Pipeline
+
+The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A supervisor parent launches, watches, and restarts children. Each camera is isolated: a single bad RTSP feed cannot take the stack down.
+
+## Per-camera GStreamer graph
+
+```
+  uridecodebin (RTSP / MediaMTX-proxied USB)
+    → h264parse (or h265parse, codec-autodetected by ffprobe)
+    → tee
+        ├─ nvv4l2decoder → nvstreammux (batch 1)
+        │                → nvinfer  pgie   (yolo26 detector)
+        │                → nvtracker  (NvDCF, IDs + bbox smoothing)
+        │                → nvinfer  lpdnet (plate detector SGIE, optional)
+        │                → nvinfer  lprnet (plate OCR SGIE, optional)
+        │                → nvinfer  scrfd  (face detector SGIE, optional)
+        │                → nvinfer  arcface (face embedder SGIE, optional)
+        │                → nvvideoconvert
+        │                → nvv4l2h264enc
+        │                → h264parse → qtmux
+        │                → filesink  (hourly-rotated rec.mp4)
+        ├─ videorate → jpegenc → multifilesink (low-fps JPEG preview ring)
+        └─ rtph264pay → tee + fakesink   (WHEP subscribers tap in here)
+```
+
+Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp). Codec auto-detection — so H.264 *and* H.265 sources both work — is in `pipeline.cpp`'s preamble via a small `ffprobe` run before the pipeline is built.
+
+Per-camera choices baked into the graph:
+- **Codec.** Recording is always H.264 regardless of source, so the browser can play segments back natively (no decoded-via-WASM fallback). H.265 sources are transcoded once in the pipeline on the NVENC.
+- **Aspect ratio.** Preserved end-to-end; the live mosaic tiles letterbox non-16:9 cameras rather than stretching.
+- **USB cameras** come in via a `mediamtx` sidecar that re-publishes a V4L2 webcam as RTSP on the internal docker network, so the pipeline code path is the same for USB and IP cameras.
+
+## Detections → NATS
+
+Each `nvinfer` + tracker hit is attached to the buffer as `NvDsObjectMeta`. A bus-watch probe after the trackers walks the metadata, builds a [`Detection` payload](../../apps/event-processor/internal/rules/engine.go), and publishes it on `fnvr.events.detection.<camera_id>`. Face probes additionally extract the 512-d ArcFace embedding from tensor-meta and base64-encode it into `attributes.embedding` for the matcher to read downstream.
+
+The probe does NOT query the DB. Person labels are resolved afterwards in [event-processor](rules-engine.md) so the pipeline stays stateless.
+
+A thumbnail JPEG is cropped directly on the GPU via `NvBufSurfTransform` for every face detection and written to `/var/lib/fnvr/thumbs/faces/<detection-event-id>.jpg`. Event-processor renames this on insert to `<pg-detection-id>.jpg` so the thumbnail URL is stable.
+
+## WHEP live view
+
+The RTP tee output feeds a small WHEP server bound to a random port per camera. The api-server's `whep.Registry` ([camera/state.go](../../apps/api-server/internal/whep/registry.go)) tracks port → camera and proxies the browser's SDP offer. No media flows through the api-server — it's pure signaling.
+
+## Camera health heartbeat
+
+Every worker publishes `{"camera_id":"...","state":"running"}` to `fnvr.state.camera.<id>` on a 30 s loop once the pipeline reaches `GST_STATE_PLAYING`. The api-server stores these in a JetStream last-value stream (`FNVR_CAMERA_STATE`, `MaxMsgsPerSubject=1`) so a restart replays the latest state per camera immediately instead of waiting for the next heartbeat.
+
+Stale-heartbeat windows:
+- `running`: 10 min
+- `starting`: 15 min (first-time TRT engine compiles can take 5–15 min per worker)
+- anything else: 2 min
+
+The UI surfaces the stamped time when a camera goes to `unknown`, so "pipeline offline · last heartbeat 12m ago" is visible at a glance.
+
+## Why the NATS client is wrapped
+
+The pipeline uses the `nats-c` library. The default reconnect behaviour gives up after 60 attempts (~2 min), after which `natsConnection_Publish` still returns `NATS_OK` but the messages are dropped into the pending queue and never delivered. [nats_publisher.cpp](../../apps/pipeline-supervisor/src/nats_publisher.cpp) wraps the default:
+
+- Unlimited reconnect (`MaxReconnect=-1`), 8 MB reconnect buffer.
+- Explicit `natsConnection_Status == CLOSED` check before every publish, with rate-limited log on detection + automatic rebuild of the connection.
+
+Without this, the detection *and* heartbeat publish paths can silently die without the process noticing — we've hit that in production and spent hours diagnosing it.
+
+## First-run engine compilation
+
+DeepStream `nvinfer` elements lazy-compile their TensorRT engines on first use. For yolo26x on Orin AGX this takes ~30 s per worker (cached thereafter under `/var/lib/fnvr/models/yolo26/*.engine`). The container entrypoint publishes `{"state":"starting"}` heartbeats during compile, and the UI's 15-min "starting" freshness window covers that.
+
+Pre-bake path: a `trtexec` invocation in [deploy/docker/calibrate-yolo26.sh](../../deploy/docker/calibrate-yolo26.sh) can produce the engine ahead of time.
+
+## Secondary inference (SGIEs)
+
+ANPR and face-ID run as secondary `nvinfer` elements chained after the primary detector + tracker. They only process objects whose class ID matches their "operate-on" list (cars for LPDNet, persons for SCRFD), so the GPU cost on a camera with no people in frame is near zero.
+
+Per-camera enable/disable lives in `cameras.enabled_detectors` (a text array) + `settings.detector.anpr_enabled` / `settings.detector.face_id_enabled` (process-wide kill switches). The pipeline rebuilds its graph when those settings change.
+
+## Capacity
+
+With YOLO26x FP16 on an Orin AGX 64 GB at nvpmodel MAXN, 3 × 1080p cameras at 10 fps ingest use roughly half the GPU. Adding ANPR + face-ID roughly doubles the load. Real numbers come from `tegrastats` + `/metrics`; the [benchmark tool](../../tools/benchmark/) (not yet shipped) will automate this.
+
+INT8 yolo26x calibration is blocked on [TRT 10.3 bug #3937](../operations/known-issues.md), not on our code. Resume path: JetPack 7.2 (Q2 2026).

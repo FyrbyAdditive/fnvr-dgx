@@ -1,10 +1,26 @@
 [project]
 name = "fnvr-ml"
-version = "0.0.0"
-description = "fnvr training / active-learning worker"
-requires-python = ">=3.10"
-dependencies = []
+version = "0.1.0"
+description = "fnvr face-id worker: photo-upload enrol + unknown-face clustering + drift detection"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110,<0.116",
+    "uvicorn[standard]>=0.29,<0.32",
+    "onnxruntime==1.17.*",
+    "numpy>=1.26,<2.0",
+    "opencv-python-headless>=4.9,<4.11",
+    "hdbscan>=0.8.33,<0.9",
+    "apscheduler>=3.10,<3.11",
+    "psycopg[binary]>=3.1,<3.3",
+    "pillow>=10.0,<11.0",
+    "httpx>=0.27,<0.29",
+    "nats-py>=2.7,<2.10",
+    "python-multipart>=0.0.9",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["fnvr_ml*"]

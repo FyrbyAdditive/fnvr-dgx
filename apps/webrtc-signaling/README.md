@@ -1,5 +1,5 @@
 # webrtc-signaling
 
-WHEP/WHIP signaling endpoint for browser ↔ `pipeline-supervisor` WebRTC live view. Deliberately tiny — SDP negotiation only, no media. May fold into `api-server` if it stays this small.
+Folded into api-server. WHEP offer proxy lives at [apps/api-server/internal/whep/registry.go](../../apps/api-server/internal/whep/registry.go) + the `POST /api/v1/cameras/{id}/whep` handler in [server.go](../../apps/api-server/internal/server/server.go).
 
-Lands in M1/M2. M1 stub only.
+This directory is kept as a stub for historical reasons; nothing here is built or run.

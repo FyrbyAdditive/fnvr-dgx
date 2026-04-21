@@ -1,0 +1,32 @@
+# ArcFace R100 — insightface face embedder, runs as SGIE on SCRFD's
+# face crops. Outputs a 512-d float vector that we surface via
+# tensor-meta (output-tensor-meta=1) and the InferSrcProbe
+# base64-encodes into the NATS detection payload's attributes.
+# network-type=100 ("other") so nvinfer doesn't try to parse the
+# output as a detector or classifier — we iterate the raw tensor
+# ourselves.
+
+[property]
+gpu-id=0
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/faceid/arcface.onnx
+# Match nvinfer's auto-derived name so subsequent boots reuse the
+# built engine. Without this the configured path never matches
+# what nvinfer writes and each restart forces a ~3min rebuild.
+model-engine-file=/var/lib/fnvr/models/faceid/arcface.onnx_b16_gpu0_fp16.engine
+batch-size=16
+network-mode=2
+gie-unique-id=5
+operate-on-gie-id=4
+operate-on-class-ids=0
+process-mode=2
+network-type=100
+output-tensor-meta=1
+# Name ArcFace's output layer so nvinfer exposes the host buffer.
+# buffalo_l's ONNX emits a numeric output name "683" (512-d embedding).
+output-blob-names=683
+maintain-aspect-ratio=1
+# No parse function — embeddings are raw tensor, nvinfer hands
+# them to our probe via NvDsInferTensorMeta.

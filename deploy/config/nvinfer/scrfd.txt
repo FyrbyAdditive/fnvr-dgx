@@ -1,0 +1,56 @@
+# Face detector — RetinaFace MobileNet-0.25 (biubug6) running as a
+# secondary GIE on YOLO26's person-class crops. File kept named
+# scrfd.txt because the gst element name in pipeline.cpp is "scrfd";
+# we rewrote what it points at without changing the pipeline wiring.
+#
+# Runs on crops, not the whole frame, so we pay face-detect cost only
+# where a person actually is. Outputs one class: "face". ArcFace
+# downstream keys off gie-unique-id=4.
+
+[property]
+gpu-id=0
+# RetinaFace preprocessing: subtract ImageNet-style means, no scale.
+net-scale-factor=1.0
+offsets=104.0;117.0;123.0
+# BGR (the .pth was trained on OpenCV BGR).
+model-color-format=1
+onnx-file=/var/lib/fnvr/models/faceid/face_detector.onnx
+# Match nvinfer's auto-derived name so subsequent boots can reuse
+# the built engine — without this nvinfer writes to the auto name
+# but then can't find model-engine-file on the next run and rebuilds.
+model-engine-file=/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine
+labelfile-path=/etc/fnvr/nvinfer/scrfd.labels
+infer-dims=3;640;640
+# biubug6's export uses a fixed batch=1 graph (no dynamic_axes).
+# nvinfer refuses to use a built engine whose profile doesn't match
+# configured batch-size, so we must match the ONNX — batch=1 means
+# one face-detect call per person crop per frame. Orin eats it.
+batch-size=1
+# 512MB workspace — TRT's per-tactic budget otherwise defaults tiny
+# and asserts "!cost.empty()" when every viable tactic gets skipped.
+workspace-size=512
+# FP16.
+network-mode=2
+num-detected-classes=1
+# Distinct from pgie=1, lpdnet=2, lprnet=3.
+gie-unique-id=4
+# SGIE mode, operating on YOLO26's person class (class 0 in coco).
+process-mode=2
+operate-on-gie-id=1
+operate-on-class-ids=0
+network-type=0
+# Parser does its own NMS, so DS should not cluster.
+cluster-mode=4
+maintain-aspect-ratio=1
+symmetric-padding=1
+# Order matters: parser reads these by index from output_layers_info.
+output-blob-names=bbox;conf;lmk
+parse-bbox-func-name=NvDsInferParseCustomRetinaface
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_retinaface.so
+# Skip crops too small to yield a useful face.
+input-object-min-width=48
+input-object-min-height=48
+force-implicit-batch-dim=0
+
+[class-attrs-all]
+pre-cluster-threshold=0.5

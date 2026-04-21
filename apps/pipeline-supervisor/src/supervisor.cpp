@@ -95,6 +95,21 @@ void Supervisor::reconcileOnce() {
     // on failure disables the gate (falls back to old 3s stagger).
     std::string engine_path = readEnginePathFromInferConfig();
 
+    // Optional face-id engine gates. When face_id is enabled, the SGIE
+    // chain (face detector + arcface) also needs to build on worker #1
+    // before siblings spawn — otherwise 3 workers each build these
+    // concurrently, triple-spike GPU memory, and get OOM-killed. Both
+    // engines are auto-written by nvinfer to derived paths next to
+    // their ONNX.
+    std::vector<std::string> faceid_engines;
+    const char* face_env = std::getenv("FNVR_USE_FACEID");
+    if (face_env && std::string(face_env) == "1") {
+        faceid_engines.push_back(
+            "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine");
+        faceid_engines.push_back(
+            "/var/lib/fnvr/models/faceid/arcface.onnx_b16_gpu0_fp16.engine");
+    }
+
     bool first_start = true;
     for (const auto& cam : want) {
         if (workers_.find(cam.id) != workers_.end()) continue;
@@ -107,6 +122,13 @@ void Supervisor::reconcileOnce() {
                        std::chrono::steady_clock::now() < deadline &&
                        !stop_) {
                     std::this_thread::sleep_for(2s);
+                }
+                for (const auto& fe : faceid_engines) {
+                    while (!std::filesystem::exists(fe) &&
+                           std::chrono::steady_clock::now() < deadline &&
+                           !stop_) {
+                        std::this_thread::sleep_for(2s);
+                    }
                 }
                 // Small additional delay so the first worker finishes
                 // its own deserialize / nvinfer init before siblings load.
@@ -154,12 +176,64 @@ std::string Supervisor::readEnginePathFromInferConfig() const {
 void Supervisor::startWorker(const CameraConfig& /*cam*/) { /* inlined above */ }
 void Supervisor::stopWorker(const std::string& /*id*/)    { /* inlined above */ }
 
+// Remove an engine file on disk if it looks corrupt (missing is fine —
+// nvinfer will rebuild). Called before every worker (re)exec so that a
+// truncated engine written by a SIGKILL'd prior worker doesn't send the
+// next process into a "deserialize fails → rebuild → SIGKILL mid-build"
+// loop. Threshold is per-engine because engine sizes vary by ~1000x.
+void validateEngineFile(const std::string& path, std::size_t min_bytes) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return;
+    auto size = std::filesystem::file_size(path, ec);
+    if (ec) return;
+    if (size < min_bytes) {
+        std::cerr << "supervisor: engine " << path << " is " << size
+                  << " bytes (< " << min_bytes << ") — removing for rebuild\n";
+        std::filesystem::remove(path, ec);
+    }
+}
+
+// Check all known engine files. Paths gated by their respective env
+// vars so we don't complain about engines for features that are off.
+void validateAllEngines(const std::string& pgie_engine_path) {
+    // YOLO26 pgie engine: path parsed from the rendered nvinfer config.
+    if (!pgie_engine_path.empty()) {
+        validateEngineFile(pgie_engine_path, 1 * 1024 * 1024);
+    }
+    // ANPR chain: LPDNet + LPRNet live under /var/lib/fnvr/models/anpr/.
+    if (const char* e = std::getenv("FNVR_USE_ANPR"); e && std::string(e) == "1") {
+        validateEngineFile(
+            "/var/lib/fnvr/models/anpr/LPDNet_usa.onnx_b16_gpu0_fp16.engine",
+            256 * 1024);
+        validateEngineFile(
+            "/var/lib/fnvr/models/anpr/LPRNet_usa.onnx_b16_gpu0_fp16.engine",
+            256 * 1024);
+    }
+    // Face chain: RetinaFace batch=1 + ArcFace batch=16.
+    if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
+        validateEngineFile(
+            "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine",
+            256 * 1024);
+        validateEngineFile(
+            "/var/lib/fnvr/models/faceid/arcface.onnx_b16_gpu0_fp16.engine",
+            1 * 1024 * 1024);
+    }
+}
+
 void Supervisor::workerMain(Worker* w) {
     std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<int> jitter(0, 1000);
     int backoff_ms = 1000;
 
     while (!stop_ && !w->stop) {
+        // Defensive: if a prior worker died mid-engine-serialize (e.g.
+        // SIGTERM from hourly rotation during a first-time TRT build),
+        // the engine file on disk may be truncated. Deserialising it
+        // fails deep inside nvinfer and falls back to a full rebuild,
+        // which can itself be interrupted on the next rotation. Checking
+        // here — before the new process runs nvinfer — breaks the loop.
+        validateAllEngines(readEnginePathFromInferConfig());
+
         // fork+exec the same binary in --worker mode. Per-camera process
         // isolation: a splitmuxsink / nvinfer / gst assertion in one camera
         // can't crash the parent supervisor or its sibling cameras.
@@ -215,7 +289,11 @@ void Supervisor::workerMain(Worker* w) {
                           << "]: hourly rotation — restarting pid " << pid << "\n";
                 hourly_rotate = true;
                 kill(pid, SIGTERM);
-                for (int i = 0; i < 50 && waitpid(pid, &status, WNOHANG) == 0; i++) {
+                // Generous grace (15s) — if nvinfer is serializing an
+                // engine when we SIGTERM, a premature SIGKILL leaves a
+                // truncated file on disk that the next worker can't
+                // deserialize. Engines of our scale serialize in ≤10s.
+                for (int i = 0; i < 150 && waitpid(pid, &status, WNOHANG) == 0; i++) {
                     std::this_thread::sleep_for(100ms);
                 }
                 if (waitpid(pid, &status, WNOHANG) == 0) {

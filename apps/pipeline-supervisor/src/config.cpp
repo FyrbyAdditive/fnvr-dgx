@@ -25,6 +25,7 @@ Config LoadFromEnv() {
     cfg.inference_config = env_or("FNVR_INFER_CONFIG", "/etc/fnvr/nvinfer/trafficcamnet.txt");
     cfg.use_deepstream   = env_or("FNVR_USE_DEEPSTREAM", "1") != "0";
     cfg.use_anpr         = env_or("FNVR_USE_ANPR", "0") == "1";
+    cfg.use_face_id      = env_or("FNVR_USE_FACEID", "0") == "1";
     cfg.reconcile_interval_sec = env_int("FNVR_RECONCILE_SEC", 5);
     return cfg;
 }

@@ -35,9 +35,13 @@ type Rule struct {
 }
 
 type Incident struct {
-	ID           string     `json:"id"`
-	RuleID       *string    `json:"rule_id"`
-	CameraID     string     `json:"camera_id"`
+	ID    string  `json:"id"`
+	RuleID *string `json:"rule_id"`
+	// CameraID is nullable so system-scope incidents (drift alerts,
+	// future global ML events) can be represented alongside
+	// per-camera ones. Callers that open the recording must guard on
+	// this being non-nil.
+	CameraID     *string    `json:"camera_id"`
 	StartedAt    time.Time  `json:"started_at"`
 	EndedAt      *time.Time `json:"ended_at"`
 	Severity     string     `json:"severity"`

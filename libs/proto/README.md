@@ -1,37 +1,35 @@
 # proto
 
 Shared protocol buffers for:
+
 - `pipeline.proto` — gRPC control surface between `api-server` and `pipeline-supervisor`.
-- `events.proto` — detection / incident payloads on NATS (`fnvr.events.*`).
+- `events.proto` — detection / incident payloads on NATS.
 
 ## Building
 
-Install `buf`:
-```
-brew install bufbuild/buf/buf
-# or download from https://github.com/bufbuild/buf/releases
-```
-
-Regenerate after proto edits:
-```
+```sh
+brew install bufbuild/buf/buf            # or via apt / the github release
 cd libs/proto
 buf generate
 ```
 
 Outputs:
-- Go: `libs/go-common/gen/fnvr/…/*.pb.go` (api-server imports this)
-- C++: `apps/pipeline-supervisor/src/gen/` (linked into the pipeline supervisor)
+- Go: `libs/go-common/gen/fnvr/…/*.pb.go`.
+- C++: `apps/pipeline-supervisor/src/gen/`.
 
-## Wire transport
+## Wire format
 
-- Control (api-server → pipeline-supervisor): gRPC over TCP, unencrypted on the
-  internal docker network. Add mTLS in M5 when federation lands.
-- Events (pipeline-supervisor → api-server + event-processor): NATS JetStream,
-  JSON-encoded proto3 for M2 (easier debugging), binary proto in M3.
+- **NATS payloads are JSON**, not binary proto. The proto definitions are the source of truth for field names + shapes but the on-wire format is JSON-encoded for debuggability. Keep it that way until a measurable payload-size problem appears.
+- **Control RPCs are gRPC over TCP** on the internal docker bridge, unencrypted. mTLS would land with federation (PLAN.md §7).
 
 ## Subjects
 
+Full taxonomy in [docs/developer/nats-subjects.md](../../docs/developer/nats-subjects.md). Summary:
+
 - `fnvr.events.detection.<camera_id>` — per-frame inference hits.
-- `fnvr.events.incident.<camera_id>` — rule-matched, correlated events.
-- `fnvr.events.system.<kind>` — camera state changes, health, etc.
-- `fnvr.jobs.ml.<kind>` — training / evaluation job requests.
+- `fnvr.events.incident.<camera_id>` — rule / hotlist / face / drift incidents. `__system` for system-scope.
+- `fnvr.state.camera.<camera_id>` — JetStream last-value per-camera heartbeat.
+- `fnvr.state.pipeline` — parent supervisor state.
+- `fnvr.alerts.drift` — ml-worker drift alert.
+- `fnvr.models.faceid.reload` — ask pipeline to reload `arcface.onnx`.
+- `fnvr.whep.registry` — pipeline publishes `{camera_id, port}` when a WHEP listener binds.

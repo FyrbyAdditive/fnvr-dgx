@@ -24,8 +24,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     try { body = await res.text(); } catch { /* ignore */ }
     throw new ApiError(res.status, body || `${res.status} ${res.statusText}`);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export type Camera = {
@@ -41,6 +42,11 @@ export type Camera = {
   unmute_classes_override?: string[];
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
+  /** Last time the api-server saw a heartbeat on
+   *  `fnvr.state.camera.<id>`. Null means the tracker has never heard
+   *  from this camera; a non-null value with state="unknown" indicates
+   *  a stale heartbeat (previously running, now gone quiet). */
+  last_heartbeat_at?: string | null;
 };
 
 export type ClassMutes = {
@@ -50,6 +56,37 @@ export type ClassMutes = {
 };
 
 export type LocalDevice = { path: string; label: string; capabilities: string[] };
+
+export type DriftStatus = {
+  baseline: number | null;
+  last_check_at: string | null;
+  last_current: number | null;
+  last_delta: number | null;
+  last_status: string;
+  threshold: number;
+};
+
+export type SystemStorage = {
+  disk: {
+    path: string;
+    total_bytes: number;
+    free_bytes: number;
+    free_pct: number;
+  };
+  min_free_pct: number;
+  cameras: Array<{
+    id: string;
+    name: string;
+    retention_days: number;
+    quota_gb: number;
+    bytes_used: number;
+    oldest_segment: string | null;
+    newest_segment: string | null;
+    segment_count: number;
+    gb_per_day: number;
+    days_of_headroom: number | null;
+  }>;
+};
 
 export type Zone = {
   id: string;
@@ -67,6 +104,8 @@ export type Rule = {
   name: string;
   enabled: boolean;
   definition: {
+    /** Omitted/"single" = original per-detection rule. "sequence" = cross-camera chain. */
+    kind?: "sequence";
     camera_id?: string;
     classes: string[];
     min_confidence: number;
@@ -76,6 +115,13 @@ export type Rule = {
     cooldown_sec: number;
     severity: "info" | "warning" | "critical";
     schedule?: { start_minute: number; end_minute: number; days: number[]; timezone?: string };
+    /** Sequence-rule fields (kind=="sequence" only). */
+    steps?: Array<{
+      camera_id: string;
+      classes?: string[];
+      min_confidence?: number;
+    }>;
+    window_sec?: number;
   };
   created_at: string;
   updated_at: string;
@@ -84,7 +130,8 @@ export type Rule = {
 export type Incident = {
   id: string;
   rule_id: string | null;
-  camera_id: string;
+  /** null for system-scope incidents (e.g. ML drift alerts). */
+  camera_id: string | null;
   started_at: string;
   ended_at: string | null;
   severity: "info" | "warning" | "critical";
@@ -182,6 +229,11 @@ export const api = {
       unmute_classes_override?: string[];
     },
   ) => req<void>(`/cameras/${id}/classes`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateCameraStorage: (
+    id: string,
+    body: { retention_days?: number; quota_gb?: number },
+  ) => req<void>(`/cameras/${id}/storage`, { method: "PATCH", body: JSON.stringify(body) }),
+  systemStorage: () => req<SystemStorage>("/system/storage"),
 
   listZones: (cameraId?: string) =>
     req<Zone[]>(`/zones${cameraId ? `?camera_id=${encodeURIComponent(cameraId)}` : ""}`),
@@ -268,6 +320,11 @@ export const api = {
   updateDetectorSettings: (body: DetectorSettings) =>
     req<void>("/settings/detector", { method: "PUT", body: JSON.stringify(body) }),
 
+  // INT8 calibration workflow for yolo26 (admin-only trigger).
+  getCalibrationStatus: () => req<CalibrationStatus>("/settings/detector/calibration"),
+  prepareCalibration: () =>
+    req<void>("/settings/detector/prepare_calibration", { method: "POST" }),
+
   // Class-mute hierarchy (global + indoor/outdoor buckets).
   getClassMutes: () => req<ClassMutes>("/settings/class_mutes"),
   updateClassMutes: (body: ClassMutes) =>
@@ -279,6 +336,146 @@ export const api = {
   updateHAConfig: (body: HAConfig) =>
     req<void>("/settings/ha", { method: "PUT", body: JSON.stringify(body) }),
 
+  // Face ID: persons CRUD + recent-faces view for enrolment.
+  listPersons: () => req<Person[]>("/persons"),
+  createPerson: (body: Partial<Person>) =>
+    req<Person>("/persons", { method: "POST", body: JSON.stringify(body) }),
+  updatePerson: (id: string, body: Partial<Person>) =>
+    req<void>(`/persons/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  // Erasure flow: cascades to embeddings, matched detection rows,
+  // cached thumbnails, and writes an audit row. Returns the counts
+  // so the UI can show the operator the scope of what happened.
+  deletePerson: (id: string) =>
+    req<ErasureReport>(`/persons/${id}`, { method: "DELETE" }),
+
+  // Photo-upload enrolment. Accepts a single-face JPEG/PNG; on
+  // multi-face photos the server replies 409 with the list of
+  // faces so the client can pick one via face_index.
+  uploadEnrol: (
+    file: File,
+    opts: { person_id?: string; new_label?: string; face_index?: number },
+  ) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (opts.person_id) fd.append("person_id", opts.person_id);
+    if (opts.new_label) fd.append("new_label", opts.new_label);
+    if (opts.face_index !== undefined) fd.append("face_index", String(opts.face_index));
+    // req() sets Content-Type:application/json which breaks
+    // multipart boundary detection; go via fetch directly.
+    return fetch(`${base}/persons/upload_enrol`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    }).then(async (res) => {
+      if (res.status === 401) {
+        if (typeof window !== "undefined" && !window.location.pathname.endsWith("/login")) {
+          window.location.href = "/login";
+        }
+        throw new ApiError(401, "unauthorized");
+      }
+      if (res.status === 409) {
+        // Multi-face disambiguation payload.
+        const body = await res.json();
+        throw new ApiError(409, JSON.stringify(body));
+      }
+      if (!res.ok) {
+        const body = await res.text();
+        throw new ApiError(res.status, body || `${res.status} ${res.statusText}`);
+      }
+      return res.json();
+    });
+  },
+
+  // Unknown-face clusters.
+  clustersList: (unenrolledOnly = true) =>
+    req<Cluster[]>(
+      `/clusters${unenrolledOnly ? "?unenrolled=true" : ""}`,
+    ),
+  clusterMembers: (id: string) =>
+    req<ClusterMember[]>(`/clusters/${id}/members`),
+  clusterRunNow: () =>
+    req<void>(`/clusters/run_now`, { method: "POST" }),
+  clusterStatus: () =>
+    req<{ last_run_state: unknown }>(`/clusters/status`),
+  driftStatus: () => req<DriftStatus>(`/ml/drift/status`),
+  clusterEnrol: (
+    id: string,
+    body: { person_id?: string; new_label?: string },
+  ) =>
+    req<{ added: number; person_id: string }>(`/clusters/${id}/enrol`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  clusterDismissNotAFace: (id: string) =>
+    req<{ dismissed: number }>(`/clusters/${id}/dismiss_not_a_face`, {
+      method: "POST",
+    }),
+  clusterDelete: (id: string) =>
+    req<void>(`/clusters/${id}`, { method: "DELETE" }),
+  listPersonEmbeddings: (id: string) =>
+    req<PersonEmbedding[]>(`/persons/${id}/embeddings`),
+  deletePersonEmbedding: (personID: string, embeddingID: string) =>
+    req<void>(`/persons/${personID}/embeddings/${embeddingID}`, {
+      method: "DELETE",
+    }),
+  bulkDeletePersonEmbeddings: (personID: string, ids: string[]) =>
+    req<{ deleted: number }>(
+      `/persons/${personID}/embeddings/delete_bulk`,
+      { method: "POST", body: JSON.stringify({ ids }) },
+    ),
+  addPersonEmbedding: (
+    id: string,
+    vector: number[],
+    source: string,
+    detectionID?: number,
+  ) =>
+    req<{ id: string; person_id: string; source: string; created_at: string }>(
+      `/persons/${id}/embeddings`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          vector,
+          source,
+          detection_id: detectionID ?? 0,
+        }),
+      },
+    ),
+  addPersonEmbeddingsBulk: (
+    id: string,
+    items: Array<{ vector: number[]; source: string; detection_id?: number }>,
+  ) =>
+    req<{ added: number }>(`/persons/${id}/embeddings_bulk`, {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    }),
+  recentFaces: (
+    opts: { hours?: number; limit?: number; unmatched?: boolean; collapse?: boolean } = {},
+  ) => {
+    const p = new URLSearchParams();
+    if (opts.hours) p.set("hours", String(opts.hours));
+    if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.unmatched) p.set("unmatched", "true");
+    if (opts.collapse) p.set("collapse", "true");
+    return req<RecentFace[]>(`/faces/recent${p.size ? `?${p}` : ""}`);
+  },
+  dismissFaces: (
+    items: Array<{
+      detection_id: number;
+      vector: number[];
+      reason: "not_a_face" | "duplicate" | "deleted" | "enrolled";
+    }>,
+  ) =>
+    req<{ dismissed: number }>(`/faces/dismiss`, {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    }),
+  personMatches: (id: string, opts: { hours?: number; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.hours) p.set("hours", String(opts.hours));
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return req<RecentFace[]>(`/persons/${id}/matches${p.size ? `?${p}` : ""}`);
+  },
+
   // Pipeline lifecycle.
   getPipelineState: () => req<PipelineStateResponse>("/system/pipeline/state"),
   restartPipeline: () =>
@@ -289,6 +486,106 @@ export type DetectorSettings = {
   yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
   yolo26_precision: "fp16" | "int8";
   anpr_enabled?: boolean;
+  face_id_enabled?: boolean;
+};
+
+// Current INT8 calibration state. image_count reflects the on-disk
+// sampler output; last_run / last_error come from the pipeline
+// entrypoint's POST to /internal/detector/calibration_report after
+// each trtexec attempt. engine_size + table_sha256 are populated on
+// success.
+export type CalibrationStatus = {
+  image_count: number;
+  last_run?: string;
+  last_error?: string;
+  engine_size?: number;
+  table_sha256?: string;
+};
+
+export type Person = {
+  id: string;
+  label: string;
+  notes?: string;
+  enabled: boolean;
+  alert_on_match: boolean;
+  embedding_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+// One enrolled embedding for a person. The 512-d vector itself is
+// never returned by the list endpoint (it's ~2KB × N rows and the UI
+// doesn't need it); `source` identifies where the embedding came from
+// (e.g. "enrol-live-{detection_id}" or "enrol-cluster-{detection_id}").
+// `detection_id` is the PG id of the detection the embedding was
+// enrolled from, populated for all post-0017 rows; the UI uses it to
+// render the face thumbnail next to each embedding.
+export type PersonEmbedding = {
+  id: string;
+  person_id: string;
+  source: string;
+  created_at: string;
+  detection_id?: number;
+  /** Mean cosine similarity to the 3 NEAREST neighbours in the same
+   *  person's pool. Unlike a whole-pool mean, this stays high for
+   *  legitimate pose/lighting variants as long as a few similar
+   *  siblings exist, and drops for true outliers that have no kin
+   *  anywhere in the pool. 0 when the pool has fewer than 2 rows. */
+  nearest_neighbour_similarity: number;
+};
+
+// Returned by DELETE /persons/{id}: summary of the right-to-erasure
+// cascade for display in a confirmation banner.
+export type ErasureReport = {
+  person_id: string;
+  label: string;
+  erased_at: string;
+  thumbs_removed: number;
+  detections_nulled: number;
+  embeddings_removed: number;
+};
+
+// One row of face_clusters, shaped for the review grid.
+export type Cluster = {
+  id: string;
+  member_count: number;
+  representative_detection_id?: number;
+  representative_thumbnail_url?: string;
+  algorithm: string;
+  created_at: string;
+  updated_at: string;
+  enrolled_person_id?: string;
+  first_seen?: string;
+  last_seen?: string;
+};
+
+// One member of a cluster. The UI renders via thumbnail_url which
+// goes through the existing /faces/thumbnail endpoint.
+export type ClusterMember = {
+  cluster_id: string;
+  detection_id: number;
+  similarity_to_centroid: number;
+  added_at: string;
+  thumbnail_url: string;
+};
+
+export type RecentFace = {
+  detection_id: number;
+  event_id: string;
+  camera_id: string;
+  ts: string;
+  confidence: number;
+  bbox: { x: number; y: number; w: number; h: number };
+  person?: string;
+  similarity?: number;
+  vector?: number[];
+  thumbnail_url: string;
+  // Populated when /faces/recent was called with collapse=true. Members
+  // are other detection_ids in the same near-duplicate cluster; the
+  // representative tile's detection_id is NOT repeated here.
+  members?: number[];
+  member_vectors?: number[][];
+  count?: number;
 };
 
 export type HotlistEntry = {

@@ -50,9 +50,18 @@ export function Events() {
                 ${i.acknowledged ? "opacity-50" : ""}`}>
                 <button
                   type="button"
-                  className="col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-center text-left p-2 hover:bg-neutral-900 rounded-l"
-                  onClick={() => openInTimeline(i.camera_id, i.started_at)}
-                  title="Open the recording at this moment"
+                  className={`col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-center text-left p-2 rounded-l ${
+                    i.camera_id ? "hover:bg-neutral-900" : "cursor-default"
+                  }`}
+                  onClick={() => {
+                    if (i.camera_id) openInTimeline(i.camera_id, i.started_at);
+                  }}
+                  disabled={!i.camera_id}
+                  title={
+                    i.camera_id
+                      ? "Open the recording at this moment"
+                      : "System-scope incident — no clip to open"
+                  }
                 >
                   <span className="text-neutral-500 tabular-nums">
                     {new Date(i.started_at).toLocaleTimeString()}
@@ -104,18 +113,38 @@ export function Events() {
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm max-h-[70vh] overflow-auto">
             {detections.map((e) => {
               const isPlate = e.kind === "anpr";
+              const isFace = e.kind === "face";
+              const person = isFace ? e.attributes?.person : undefined;
+              // Primary label: plate text for ANPR, matched-person name
+              // for face detections (falls back to "face" when the
+              // embedding didn't cross the match threshold), otherwise
+              // the raw class name.
               const primary = isPlate
                 ? e.attributes?.plate ?? "plate"
-                : e.class_name;
+                : person ?? e.class_name;
+              const similarity = isFace ? e.attributes?.similarity : undefined;
               return (
                 <li key={e.id} className="p-2 grid grid-cols-[8rem_1fr_6rem] gap-2">
                   <span className="text-neutral-500 tabular-nums">
                     {new Date(e.ts).toLocaleTimeString()}
                   </span>
                   <span>
-                    <span className={`font-medium ${isPlate ? "text-emerald-400" : ""}`}>
+                    <span
+                      className={`font-medium ${
+                        isPlate
+                          ? "text-emerald-400"
+                          : person
+                          ? "text-sky-400"
+                          : ""
+                      }`}
+                    >
                       {primary}
                     </span>
+                    {similarity && (
+                      <span className="text-neutral-500 text-xs">
+                        {" "}({Math.round(Number(similarity) * 100)}%)
+                      </span>
+                    )}
                     <span className="text-neutral-500"> · {e.camera_id}</span>
                   </span>
                   <span className="text-right tabular-nums text-neutral-400">

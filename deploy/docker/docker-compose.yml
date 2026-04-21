@@ -84,6 +84,8 @@ services:
       - /sys/class/video4linux:/sys/class/video4linux:ro
       - /sys/devices:/sys/devices:ro
     ports:
+      # Public: web UI + JSON API (+ unauthenticated /metrics scrape
+      # endpoint for Prometheus).
       - "8081:8081"
 
   events:
@@ -100,6 +102,11 @@ services:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
       FNVR_NATS_URL: "nats://nats:4222"
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
+    # Prometheus scrape endpoint at :9091 on the compose network.
+    # Internal only — no external publish. When adding a `prometheus`
+    # service here, point scrape_configs at events:9091 and api:8081.
+    expose:
+      - "9091"
     volumes:
       # event-processor writes per-segment detection sidecar JSONL files
       # next to each rec.mp4. Storage-manager deletes them in lockstep
@@ -134,6 +141,30 @@ services:
     volumes:
       - fnvr-data:/var/lib/fnvr
       - fnvr-live:/var/lib/fnvr/live
+
+  # CPU-only Python sidecar for face-id side-operations the pipeline
+  # doesn't do: photo-upload enrolment (detect+embed a single JPEG),
+  # HDBSCAN clustering of unmatched embeddings (nightly + on-demand),
+  # weekly drift check, and scaffolding for future TAO fine-tune.
+  # Reachable on the docker bridge at http://ml-worker:8090; no
+  # published port — api-server is the only client.
+  ml-worker:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.ml
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
+      FNVR_NATS_URL: "nats://nats:4222"
+      FNVR_MODELS_DIR: "/var/lib/fnvr/models/faceid"
+      FNVR_TZ: "Europe/London"
+    volumes:
+      - fnvr-data:/var/lib/fnvr
 
   web:
     build:

@@ -1,17 +1,29 @@
 #!/bin/bash
-# Generate a DeepStream-Yolo INT8 calibration table for a YOLO26 variant.
+# Offline INT8 calibration for a YOLO26 variant via trtexec.
 #
 # Usage: calibrate-yolo26.sh <variant> <output-table-path>
 #
-# Reads ~1000 calibration images from:
-#   /var/lib/fnvr/models/yolo26/calib_images/     (user-supplied, preferred)
+# Reads calibration images from:
+#   /var/lib/fnvr/models/yolo26/calib_images/
 #
-# If that directory is empty, pulls a small COCO-val sample from the
-# DeepStream-Yolo repo as a fallback. The fallback is surveillance-agnostic
-# so users with unusual scenes should drop their own frames in.
+# The directory is populated by the api-server's sampler
+# (apps/api-server/internal/calibration/sampler.go) which extracts
+# representative frames from the operator's own camera recordings.
+# If the directory is empty or sparse this script exits non-zero
+# and the entrypoint falls back to FP16 — we deliberately do NOT
+# fetch a COCO surrogate, because INT8 quantisation tuned to the
+# wrong distribution silently degrades inference quality in prod.
 #
-# Writes the calibration table at the given path, plus a .engine as a
-# byproduct (nvinfer compiles one during calibration).
+# Writes calibration table at $2, and a b1/gpu0/int8 engine in the
+# model directory as a byproduct of the build.
+#
+# Exit codes:
+#   0   — success (table + engine present)
+#   1   — ONNX missing
+#   2   — calib_images empty / too few images
+#   3   — trtexec not found
+#   4   — trtexec failed (engine build error, inspect logs)
+#   5   — trtexec succeeded but no calibration table was emitted
 
 set -eu
 VARIANT="$1"
@@ -19,8 +31,6 @@ OUT_TABLE="$2"
 
 MODEL_DIR=/var/lib/fnvr/models/yolo26
 CALIB_DIR="$MODEL_DIR/calib_images"
-WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
 
 ONNX="$MODEL_DIR/$VARIANT.onnx"
 if [ ! -f "$ONNX" ]; then
@@ -28,51 +38,19 @@ if [ ! -f "$ONNX" ]; then
     exit 1
 fi
 
-# Populate calib directory if empty. The fallback is ~200 MB of COCO-val
-# pulled from the DeepStream-Yolo repo's calibration dataset reference.
-# Operators who care about INT8 quality should supply their own 500-1000
-# representative frames at $CALIB_DIR.
-if [ ! -d "$CALIB_DIR" ] || [ -z "$(ls -A "$CALIB_DIR" 2>/dev/null)" ]; then
-    mkdir -p "$CALIB_DIR"
-    echo "calibrate: $CALIB_DIR is empty — pulling default COCO-val sample"
-    # Use a small tarball of COCO-val2017 (first 500 images) published
-    # alongside DeepStream-Yolo's docs. This URL tracks upstream; if it
-    # goes away, the user sees a clear error and can drop frames in
-    # themselves.
-    URL="https://github.com/marcoslucianops/DeepStream-Yolo/releases/download/v1.2/calib_images_coco500.tar.gz"
-    if ! curl -fsSL "$URL" -o "$WORK_DIR/calib.tgz"; then
-        echo "calibrate: could not download default calibration set." >&2
-        echo "calibrate: drop ~500 representative JPEGs in $CALIB_DIR and retry." >&2
-        exit 2
-    fi
-    tar -xzf "$WORK_DIR/calib.tgz" -C "$CALIB_DIR" --strip-components=1
+if [ ! -d "$CALIB_DIR" ]; then
+    echo "calibrate: $CALIB_DIR does not exist — run Prepare calibration images first" >&2
+    exit 2
 fi
-
-# DeepStream-Yolo ships a Python-based calibrator wrapper under
-# utils/calibrator.py. Use it if present; otherwise bail — rebuilding
-# the calibrator from scratch is out of scope.
-CALIBRATOR=/usr/local/share/ds-yolo-calibrator.py
-if [ ! -f "$CALIBRATOR" ]; then
-    # Fetch it from the pinned DeepStream-Yolo repo (we already clone it
-    # in the Dockerfile; this path is populated there).
-    echo "calibrate: calibrator not baked in. Falling back to the nvinfer built-in path." >&2
-fi
-
-# The pragmatic Jetson path is to let nvinfer itself do the INT8 calibration
-# on first engine build by pointing at a calibration directory in the config
-# via int8-calib-file=<generated>. DeepStream-Yolo's parser supports this
-# via its calibrator helper.
-#
-# In practice: just touch the table path so nvinfer writes it, then run
-# trtexec with --int8 to build and capture the calib table.
-NUM_IMAGES=$(ls "$CALIB_DIR" | wc -l)
+NUM_IMAGES=$(find "$CALIB_DIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l)
 if [ "$NUM_IMAGES" -lt 100 ]; then
-    echo "calibrate: only $NUM_IMAGES images in $CALIB_DIR — INT8 quality will suffer" >&2
+    echo "calibrate: only $NUM_IMAGES images in $CALIB_DIR (need ≥100 — 500 recommended)" >&2
+    exit 2
 fi
-echo "calibrate: building engine + calib table for $VARIANT using $NUM_IMAGES images"
+echo "calibrate: building INT8 engine + calib table for $VARIANT using $NUM_IMAGES images"
 
-# Use trtexec directly — it understands --int8 and --calib= arguments. The
-# DeepStream-Yolo parser reads the table at runtime.
+# trtexec is shipped inside the tensorrt package that ships with the
+# DeepStream-L4T base image. Paths vary with JetPack; probe both.
 if command -v /usr/src/tensorrt/bin/trtexec >/dev/null 2>&1; then
     TRTEXEC=/usr/src/tensorrt/bin/trtexec
 elif command -v trtexec >/dev/null 2>&1; then
@@ -82,31 +60,54 @@ else
     exit 3
 fi
 
+# Generate the file list trtexec reads via the INT8 calibrator. The
+# DeepStream-Yolo INT8 calibrator (built with OPENCV=1) reads
+# INT8_CALIB_IMG_PATH to find the image list.
+CALIB_LIST="$MODEL_DIR/calibration.txt"
+find "$CALIB_DIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) \
+    > "$CALIB_LIST"
+export INT8_CALIB_IMG_PATH="$CALIB_LIST"
+export INT8_CALIB_BATCH_SIZE=1
+
 ENGINE_OUT="$MODEL_DIR/${VARIANT}.onnx_b1_gpu0_int8.engine"
+
+# Static input shape (images:1x3x640x640) is required on TRT 10.3
+# when the ONNX was exported with a fixed batch. yolo26 from the
+# upstream export-yolo26.py is static; --shapes is a no-op but
+# harmless and documents intent.
+# The ONNX input tensor is named "input" (see export_yolo26.py).
+# Because the ONNX is exported with dynamic axes, trtexec needs
+# min/opt/max shapes — the calibrator runs under optShapes.
 "$TRTEXEC" \
     --onnx="$ONNX" \
     --saveEngine="$ENGINE_OUT" \
     --int8 \
+    --fp16 \
     --calib="$OUT_TABLE" \
-    --workspace=4096 \
-    --buildOnly \
-    --useCudaGraph \
+    --minShapes=input:1x3x640x640 \
+    --optShapes=input:1x3x640x640 \
+    --maxShapes=input:1x3x640x640 \
+    --memPoolSize=workspace:4096 \
+    --skipInference \
     || {
         echo "calibrate: trtexec failed. See above for details." >&2
         exit 4
     }
 
-if [ -f "$OUT_TABLE" ]; then
-    echo "calibrate: wrote $OUT_TABLE"
-else
-    # trtexec may emit the calib cache under a different name; search.
-    FOUND=$(find "$MODEL_DIR" -maxdepth 1 -name "*.cache" -o -name "${VARIANT}*calib*" 2>/dev/null | head -1)
+# trtexec may write the calibration cache under a slightly different
+# name depending on version; search and rename if needed.
+if [ ! -f "$OUT_TABLE" ]; then
+    FOUND=$(find "$MODEL_DIR" -maxdepth 1 \
+        \( -name "*.cache" -o -name "${VARIANT}*calib*" \) 2>/dev/null | head -1)
     if [ -n "$FOUND" ] && [ "$FOUND" != "$OUT_TABLE" ]; then
         mv "$FOUND" "$OUT_TABLE"
         echo "calibrate: wrote $OUT_TABLE (renamed from $FOUND)"
     else
-        echo "calibrate: trtexec succeeded but no calib table found. Engine is built; INT8 runtime may use internal calibration." >&2
+        echo "calibrate: trtexec succeeded but no calib table produced" >&2
+        exit 5
     fi
 fi
 
+echo "calibrate: wrote $OUT_TABLE ($(stat -c %s "$OUT_TABLE") bytes)"
+echo "calibrate: wrote $ENGINE_OUT ($(stat -c %s "$ENGINE_OUT") bytes)"
 exit 0

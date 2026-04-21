@@ -132,6 +132,45 @@ func (s *Store) SetClassMuting(ctx context.Context, id string,
 	return nil
 }
 
+// UpdateStorage sets retention_days and/or quota_gb on a camera. Either
+// pointer may be nil to leave the column untouched, so the PATCH handler
+// accepts partial bodies without pre-reading the row. Both values are
+// validated against sane ceilings (3650 days / 10000 GB) so a typo can't
+// disable retention entirely or reserve absurd quota.
+func (s *Store) UpdateStorage(ctx context.Context, id string,
+	retentionDays, quotaGB *int) error {
+	sets := []string{"updated_at = NOW()"}
+	args := []any{id}
+	add := func(v any) string {
+		args = append(args, v)
+		return "$" + itoa(len(args))
+	}
+	if retentionDays != nil {
+		if *retentionDays < 1 || *retentionDays > 3650 {
+			return errors.New("retention_days must be in [1, 3650]")
+		}
+		sets = append(sets, "retention_days = "+add(*retentionDays))
+	}
+	if quotaGB != nil {
+		if *quotaGB < 1 || *quotaGB > 10000 {
+			return errors.New("quota_gb must be in [1, 10000]")
+		}
+		sets = append(sets, "quota_gb = "+add(*quotaGB))
+	}
+	if len(sets) == 1 {
+		return errors.New("no fields to update")
+	}
+	sql := "UPDATE cameras SET " + strings.Join(sets, ", ") + " WHERE id = $1"
+	tag, err := s.pool.Exec(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetEnabledDetectors replaces the camera's detector whitelist. Nil = "all
 // enabled" (empty array on disk). Returns ErrNotFound for unknown id.
 func (s *Store) SetEnabledDetectors(ctx context.Context, id string, kinds []string) error {

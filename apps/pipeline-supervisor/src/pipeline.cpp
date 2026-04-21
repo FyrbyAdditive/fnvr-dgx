@@ -2,12 +2,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <utility>
+#include <vector>
 
+#include "face_crop_jpeg.h"
 #include "rtsp_probe.h"
 #include "whep_server.h"
 
@@ -17,6 +21,14 @@
 #  define FNVR_HAS_DEEPSTREAM 1
 #  include <gstnvdsmeta.h>
 #  include <nvdsmeta.h>
+// NvDsInferTensorMeta + NVDSINFER_TENSOR_OUTPUT_META for ArcFace
+// output-tensor-meta extraction.
+#  include <gstnvdsinfer.h>
+// NvBufSurface + NvBufSurfTransform for in-probe face cropping:
+// we VIC-convert the batched NVMM buffer into a small pitch-linear
+// RGBA surface that libjpeg can read synchronously.
+#  include <nvbufsurface.h>
+#  include <nvbufsurftransform.h>
 #endif
 
 namespace fnvr {
@@ -25,13 +37,14 @@ namespace fs = std::filesystem;
 
 SingleCameraPipeline::SingleCameraPipeline(CameraConfig cam, std::string recordings_dir,
                                            std::string infer_config, bool use_deepstream,
-                                           bool use_anpr,
+                                           bool use_anpr, bool use_face_id,
                                            NatsPublisher* nats)
     : cam_(std::move(cam)),
       recordings_dir_(std::move(recordings_dir)),
       infer_config_(std::move(infer_config)),
       use_deepstream_(use_deepstream),
       use_anpr_(use_anpr),
+      use_face_id_(use_face_id),
       nats_(nats) {}
 
 SingleCameraPipeline::~SingleCameraPipeline() { Stop(); }
@@ -53,6 +66,13 @@ struct ProbeCtx {
     // Snapshot of the effective mute set, resolved at worker startup.
     // The probe short-circuits on empty so unmuted cameras pay zero.
     std::set<std::string> muted_classes;
+    // Output directory for per-detection face JPEGs. Written as
+    //   {thumbs_dir}/{event_id}.jpg
+    // where event_id is the detection's short hex id (same one that
+    // goes into the NATS payload and becomes the detection's event_id
+    // in PG, so event-processor can rename to {pg_id}.jpg on INSERT).
+    // Empty when face_id is off — saveFaceCrop short-circuits.
+    std::string           thumbs_dir;
 };
 
 // JSON-escape minimal — only the fields we emit. Labels are small ASCII, IDs
@@ -76,7 +96,72 @@ std::string json_escape(std::string_view s) {
 // with this component id is a plate crop, not a primary-detector
 // object. Pgie (YOLO26) = 1; LPRNet (classifier) only updates
 // classifier_meta on the plate's obj_meta — it doesn't add new objs.
-constexpr unsigned LPDNET_GIE_ID = 2;
+constexpr unsigned LPDNET_GIE_ID  = 2;
+// SCRFD detector is gie-unique-id=4 in scrfd.txt (arcface is 5).
+// Face obj_meta carry unique_component_id = SCRFD_GIE_ID.
+constexpr unsigned SCRFD_GIE_ID   = 4;
+// ArcFace's 512-d output lands on the face obj_meta's user meta as
+// NVDSINFER_TENSOR_OUTPUT_META.
+constexpr int      ARCFACE_DIM    = 512;
+// Minimum face bbox in pixels — below this, ArcFace output is noise.
+constexpr int      MIN_FACE_PX    = 30;
+
+// base64_encode is a tiny stdlib-free encoder for the 2048-byte
+// embedding blob (512 × float32). No padding variant because consumers
+// always receive a fixed length.
+std::string base64_encode(const void* data, size_t n) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t* b = static_cast<const uint8_t*>(data);
+    std::string out;
+    out.reserve(((n + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 3 <= n; i += 3) {
+        uint32_t v = (uint32_t(b[i]) << 16) | (uint32_t(b[i + 1]) << 8) | b[i + 2];
+        out.push_back(tbl[(v >> 18) & 0x3F]);
+        out.push_back(tbl[(v >> 12) & 0x3F]);
+        out.push_back(tbl[(v >> 6) & 0x3F]);
+        out.push_back(tbl[v & 0x3F]);
+    }
+    if (i < n) {
+        uint32_t v = uint32_t(b[i]) << 16;
+        if (i + 1 < n) v |= uint32_t(b[i + 1]) << 8;
+        out.push_back(tbl[(v >> 18) & 0x3F]);
+        out.push_back(tbl[(v >> 12) & 0x3F]);
+        out.push_back(i + 1 < n ? tbl[(v >> 6) & 0x3F] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+// extractFaceEmbedding finds the ArcFace 512-d output on the face's
+// user-meta list and base64-encodes it. Returns empty string if
+// ArcFace hasn't run on this object (e.g., face_id disabled or the
+// bbox was too small for the SGIE to bother). The output tensor has
+// shape [1,512] — we copy the 512 float32s directly as little-endian
+// IEEE754 bytes, matching the decoder in api-server/server/faces.go.
+std::string extractFaceEmbedding(NvDsObjectMeta* obj) {
+    for (NvDsMetaList* ul = obj->obj_user_meta_list; ul; ul = ul->next) {
+        auto* um = static_cast<NvDsUserMeta*>(ul->data);
+        if (!um) continue;
+        if (um->base_meta.meta_type != NVDSINFER_TENSOR_OUTPUT_META) continue;
+        auto* tm = static_cast<NvDsInferTensorMeta*>(um->user_meta_data);
+        if (!tm || tm->num_output_layers == 0) continue;
+        // For output-tensor-meta=1 SGIEs, the host copy lives on the
+        // meta's own out_buf_ptrs_host array — layers_info[i].buffer
+        // stays null in this mode. Ref: deepstream-infer-tensor-meta-test.
+        void* host_buf = tm->out_buf_ptrs_host ? tm->out_buf_ptrs_host[0] : nullptr;
+        if (!host_buf) continue;
+        auto& li = tm->output_layers_info[0];
+        unsigned total = 1;
+        for (unsigned d = 0; d < li.inferDims.numDims; d++) {
+            total *= li.inferDims.d[d];
+        }
+        if (total != ARCFACE_DIM) continue;
+        return base64_encode(host_buf, size_t(ARCFACE_DIM) * sizeof(float));
+    }
+    return {};
+}
 
 // extractPlateText pulls the plate string from the obj_meta's
 // classifier_meta_list, as populated by the LPRNet CTC parser
@@ -106,6 +191,129 @@ std::string parentVehicleClass(NvDsObjectMeta* obj) {
         return std::string(obj->parent->obj_label);
     }
     return {};
+}
+
+// saveFaceCrop extracts a crop of the current probe buffer's frame at
+// the given normalised bbox, converts it to a small RGBA host buffer
+// via VIC-accelerated NvBufSurfTransform (handles NV12 block-linear
+// → RGBA pitch-linear + resize in one pass), JPEG-encodes and writes.
+// Zero PTS drift — the buffer pixels are literally the ones the face
+// detection was produced from. short_id becomes {thumbs_dir}/{id}.jpg;
+// event-processor renames to {pg_id}.jpg after INSERT.
+//
+// 256x256 output — a cheap, face-sized canvas. Bbox aspect usually
+// fits a square crop with the 1.4x padding we apply below; the tile
+// UI is square anyway.
+constexpr int CROP_OUT_W = 256;
+constexpr int CROP_OUT_H = 256;
+
+void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
+                  NvDsFrameMeta* frame,
+                  float nx, float ny, float nw, float nh,
+                  const std::string& short_id) {
+    if (ctx.thumbs_dir.empty() || !gst_buf || !frame) return;
+
+    // Expand bbox 1.4x around centre, clip to [0,1].
+    float pad = 1.4f;
+    float cx = nx + nw / 2.0f;
+    float cy = ny + nh / 2.0f;
+    float pw = nw * pad;
+    float ph = nh * pad;
+    float x0 = cx - pw / 2.0f;
+    float y0 = cy - ph / 2.0f;
+    float x1 = cx + pw / 2.0f;
+    float y1 = cy + ph / 2.0f;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 1) x1 = 1;
+    if (y1 > 1) y1 = 1;
+
+    // Map the input surface. The NvBufSurface* is embedded in the
+    // gst buffer's map.data.
+    GstMapInfo map{};
+    if (!gst_buffer_map(gst_buf, &map, GST_MAP_READ)) return;
+    auto* in_surf = reinterpret_cast<NvBufSurface*>(map.data);
+    if (!in_surf || frame->batch_id >= in_surf->numFilled) {
+        gst_buffer_unmap(gst_buf, &map);
+        return;
+    }
+    NvBufSurfaceParams& in_p = in_surf->surfaceList[frame->batch_id];
+    const int W = int(in_p.width);
+    const int H = int(in_p.height);
+
+    int px = int(x0 * W);
+    int py = int(y0 * H);
+    int pw_px = int((x1 - x0) * W);
+    int ph_px = int((y1 - y0) * H);
+    if (pw_px <= 1 || ph_px <= 1) {
+        gst_buffer_unmap(gst_buf, &map);
+        return;
+    }
+
+    // Create a 1-frame pitch-linear RGBA destination we CAN CPU-map.
+    // Jetson-correct: memType=NVBUF_MEM_SURFACE_ARRAY + PITCH layout.
+    NvBufSurfaceCreateParams cp{};
+    cp.gpuId        = in_surf->gpuId;
+    cp.width        = guint(CROP_OUT_W);
+    cp.height       = guint(CROP_OUT_H);
+    cp.size         = 0;
+    cp.isContiguous = true;
+    cp.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    cp.layout       = NVBUF_LAYOUT_PITCH;
+    cp.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    NvBufSurface* dst = nullptr;
+    if (NvBufSurfaceCreate(&dst, 1, &cp) != 0 || !dst) {
+        gst_buffer_unmap(gst_buf, &map);
+        return;
+    }
+
+    // VIC-accelerated source crop + colour-format + resize in one pass.
+    NvBufSurfTransformRect src_rect {
+        guint(py), guint(px), guint(pw_px), guint(ph_px)  // top, left, width, height
+    };
+    NvBufSurfTransformRect dst_rect {
+        0, 0, guint(CROP_OUT_W), guint(CROP_OUT_H)
+    };
+    NvBufSurfTransformParams tp{};
+    tp.src_rect = &src_rect;
+    tp.dst_rect = &dst_rect;
+    tp.transform_flag =
+        NVBUFSURF_TRANSFORM_FILTER |
+        NVBUFSURF_TRANSFORM_CROP_SRC |
+        NVBUFSURF_TRANSFORM_CROP_DST;
+    tp.transform_filter = NvBufSurfTransformInter_Default;
+
+    // Narrow the source surface to just our batch slot (batch-size=1
+    // per worker, but this keeps us robust against future batching).
+    NvBufSurface tmp_in = *in_surf;
+    tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
+    tmp_in.numFilled   = 1;
+    tmp_in.batchSize   = 1;
+
+    if (NvBufSurfTransform(&tmp_in, dst, &tp) != NvBufSurfTransformError_Success) {
+        NvBufSurfaceDestroy(dst);
+        gst_buffer_unmap(gst_buf, &map);
+        return;
+    }
+
+    // CPU-map the destination, sync, read pixels.
+    if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
+        NvBufSurfaceDestroy(dst);
+        gst_buffer_unmap(gst_buf, &map);
+        return;
+    }
+    NvBufSurfaceSyncForCpu(dst, 0, 0);
+
+    NvBufSurfaceParams& dp = dst->surfaceList[0];
+    const auto* rgba = static_cast<const uint8_t*>(dp.mappedAddr.addr[0]);
+    const int pitch = int(dp.planeParams.pitch[0]);
+
+    std::string out_path = ctx.thumbs_dir + "/" + short_id + ".jpg";
+    (void)encodeJpegRGBA(rgba, pitch, 0, 0, CROP_OUT_W, CROP_OUT_H, 85, out_path);
+
+    NvBufSurfaceUnMap(dst, 0, 0);
+    NvBufSurfaceDestroy(dst);
+    gst_buffer_unmap(gst_buf, &map);
 }
 
 // Called for every batched frame leaving the last nvinfer (LPRNet
@@ -144,9 +352,12 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             float h = obj->rect_params.height / float(H);
 
             const bool is_plate = (obj->unique_component_id == LPDNET_GIE_ID);
+            const bool is_face  = (obj->unique_component_id == SCRFD_GIE_ID);
             const char* label = is_plate
                 ? "plate"
-                : (obj->obj_label[0] ? obj->obj_label : "object");
+                : is_face
+                    ? "face"
+                    : (obj->obj_label[0] ? obj->obj_label : "object");
 
             // Class-mute gate at source. Drops before NATS publish so
             // muted classes don't reach Live bboxes, SSE, or event-
@@ -166,16 +377,38 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 if (plate.empty()) continue;
                 parent = parentVehicleClass(obj);
             }
-            const char* kind = is_plate ? "anpr" : "object";
+            // Face branch: drop tiny faces (below MIN_FACE_PX on any
+            // axis — ArcFace output on 10×10 px crops is noise). Pull
+            // the 512-d embedding from tensor-meta; if ArcFace didn't
+            // run (SGIE off, or the stage errored), skip the publish.
+            std::string embedding_b64;
+            if (is_face) {
+                if (obj->rect_params.width < MIN_FACE_PX ||
+                    obj->rect_params.height < MIN_FACE_PX) {
+                    continue;
+                }
+                embedding_b64 = extractFaceEmbedding(obj);
+                if (embedding_b64.empty()) continue;
+            }
+            const char* kind = is_plate ? "anpr" : is_face ? "face" : "object";
             // Plate inherits its vehicle's track_id so the rules
             // engine can correlate plate ↔ car without extra state.
+            // Faces get their own SCRFD track_id (no parent).
             const uint64_t track_id = (is_plate && obj->parent)
                 ? obj->parent->object_id
                 : obj->object_id;
 
+            // Compute the detection id once — it doubles as the face
+            // thumbnail filename so the event-processor can rename
+            // from {event_id}.jpg to {pg_id}.jpg after INSERT.
+            const std::string det_id = short_id();
+            if (is_face) {
+                saveFaceCrop(*ctx, buf, frame, x, y, w, h, det_id);
+            }
+
             std::ostringstream js;
             js << "{"
-               << "\"id\":\""         << short_id() << "\","
+               << "\"id\":\""         << det_id               << "\","
                << "\"camera_id\":\""  << json_escape(ctx->camera_id) << "\","
                << "\"ts\":\""         << iso                  << "\","
                << "\"class_name\":\"" << json_escape(label)   << "\","
@@ -191,6 +424,10 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     js << ",\"parent_class\":\"" << json_escape(parent) << "\"";
                 }
                 js << "}";
+            } else if (is_face) {
+                js << ",\"attributes\":{"
+                   << "\"embedding\":\""     << embedding_b64       << "\""
+                   << "}";
             }
             js << "}";
             std::string payload = js.str();
@@ -376,6 +613,17 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
             "nvinfer name=lpdnet config-file-path=/etc/fnvr/nvinfer/lpdnet.txt ! "
             "nvinfer name=lprnet config-file-path=/etc/fnvr/nvinfer/lprnet.txt ! ";
     }
+    // SCRFD (face detect, gie-unique-id=4) + ArcFace (embed, id=5).
+    // Runs after ANPR so a single frame's nvinfer chain is:
+    //   pgie(1) → tracker → lpdnet(2) → lprnet(3) → scrfd(4) → arcface(5)
+    // ArcFace surfaces its 512-d output via tensor-meta; the probe
+    // base64-encodes it into attributes.embedding.
+    std::string face_chain;
+    if (use_face_id_) {
+        face_chain =
+            "nvinfer name=scrfd  config-file-path=/etc/fnvr/nvinfer/scrfd.txt ! "
+            "nvinfer name=arcface config-file-path=/etc/fnvr/nvinfer/arcface.txt ! ";
+    }
 
     if (use_deepstream_ && is_v4l2) {
         p << "nvv4l2decoder ! "
@@ -392,6 +640,7 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
              "  tracker-width=960 tracker-height=544 ! "
           << anpr_chain
+          << face_chain
           << "fakesink sync=false ";
     } else if (use_deepstream_) {
         // DeepStream detection needs decoded frames; re-decode from the
@@ -411,6 +660,7 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
              "  tracker-width=960 tracker-height=544 ! "
           << anpr_chain
+          << face_chain
           << "nvvideoconvert ! "
              // H.264 (not H.265) for the recording branch: browsers play
              // H.264-in-MP4 universally; H.265-in-MP4 works only in Safari
@@ -461,6 +711,9 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
          "multifilesink location=/var/lib/fnvr/live/" << cam_.id << ".%d.jpg "
          "  async=false sync=false post-messages=false max-files=4 index=0 ";
 
+    // (Face-crop branch removed — thumbnails now come from the probe
+    // directly via NvBufSurfTransform on the inference buffer.)
+
     // --- WebRTC live-view branch ---
     // A dedicated RTP payloader fed from the H.264 elementary stream;
     // a tee downstream lets multiple per-viewer webrtcbins (added at
@@ -487,12 +740,12 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
 
 #if FNVR_HAS_DEEPSTREAM
     if (use_deepstream_ && nats_) {
-        // Attach the detection probe to the last nvinfer in the chain:
-        //   lprnet (ANPR on)  →  tracker  →  pgie
-        // So the probe sees classifier_meta populated by LPRNet when
-        // ANPR is enabled, track_ids from NvDCF otherwise, and at
-        // worst pgie's bare output.
-        GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
+        // Attach the detection probe to the LAST nvinfer in the
+        // active chain. SGIE-produced obj_meta + user_meta only
+        // appears on buffers downstream of the SGIE, so a probe on
+        // e.g. tracker.src never sees face or plate objects.
+        GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
+        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
         if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
         if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
         if (attach) {
@@ -502,6 +755,16 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                 // when the process exits. Fine for M2, tighten when we have
                 // multi-pipeline lifecycle.
                 auto* ctx = new ProbeCtx{cam_.id, nats_, cam_.muted_classes};
+                // When face_id is on the probe also writes a JPEG
+                // crop of each face using NvBufSurfTransform on the
+                // same NVMM buffer the detection came from — zero
+                // temporal drift. Empty thumbs_dir disables crop
+                // writes without branching the probe.
+                if (use_face_id_) {
+                    ctx->thumbs_dir = "/var/lib/fnvr/thumbs/faces";
+                    std::error_code _ec;
+                    std::filesystem::create_directories(ctx->thumbs_dir, _ec);
+                }
                 gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe, ctx, nullptr);
                 gst_object_unref(src);
             }

@@ -44,3 +44,6 @@ models/engines/
 
 # CI artefacts
 .task/
+
+# Claude Code session artefacts
+.claude/

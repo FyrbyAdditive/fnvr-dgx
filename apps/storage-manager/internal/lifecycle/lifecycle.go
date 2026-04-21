@@ -184,13 +184,15 @@ func (m *Manager) applyDiskPressure(ctx context.Context) error {
 	if err != nil {
 		return nil // don't fail a tick over a stat error
 	}
-	// Log health every ~5 min (every 10 ticks at 30s interval).
-	if freePct < 10.0 {
-		slog.Warn("disk pressure: dropping oldest segments", "free_pct", freePct)
+	// Floor is tunable via settings.storage.min_free_pct so operators
+	// on tiny dev disks or giant archive setups can lower/raise without
+	// a restart. Cheap single-row SELECT every tick; falls back to 10%
+	// on any error.
+	minFreePct := loadMinFreePct(ctx, m.pool)
+	if freePct < minFreePct {
+		slog.Warn("disk pressure: dropping oldest segments",
+			"free_pct", freePct, "floor", minFreePct)
 	}
-	// Drop to maintain >= 10% free. Operators with larger safety needs can
-	// tune this later; 10% of 2TB = 200GB, plenty of headroom.
-	const minFreePct = 10.0
 	if freePct >= minFreePct {
 		return nil
 	}
@@ -366,4 +368,24 @@ func (m *Manager) applyQuota(ctx context.Context) error {
 		toDrop.Close()
 	}
 	return nil
+}
+
+// loadMinFreePct reads settings.storage.min_free_pct as a JSON number.
+// Falls back to 10.0 on any failure (missing row, bad JSON, out of the
+// [0, 50] sanity range) so a corrupt setting can't disable the
+// emergency-purge safety net. Same pattern api-server uses when
+// returning the value on /system/storage, so scraped values match.
+func loadMinFreePct(ctx context.Context, pool *pgxpool.Pool) float64 {
+	const def = 10.0
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'storage.min_free_pct'`).Scan(&raw)
+	if err != nil {
+		return def
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil || v < 0 || v > 50 {
+		return def
+	}
+	return v
 }

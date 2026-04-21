@@ -156,6 +156,22 @@ func (t *StateTracker) State(cameraID string) (string, bool) {
 	return e.State, true
 }
 
+// StateDetail returns the raw last-known state plus the stamped time,
+// even if the freshness window has expired. Callers use this to
+// distinguish "never heard from this camera" (zero time) from
+// "previously running, heartbeat now stale" (a non-zero time in the
+// past) so the UI can surface the age explicitly instead of just
+// saying "unknown".
+func (t *StateTracker) StateDetail(cameraID string) (state string, stamped time.Time, known bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	e, ok := t.entries[cameraID]
+	if !ok {
+		return "", time.Time{}, false
+	}
+	return e.State, e.Stamped, true
+}
+
 // Unused import guard — we want to surface jetstream.ErrNoStreamResponse
 // style errors clearly if the broker is unreachable, but errors.Is isn't
 // used yet. Left referenced so linters don't strip the import.

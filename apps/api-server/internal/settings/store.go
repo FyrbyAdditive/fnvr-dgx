@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -53,13 +54,14 @@ func (s *Store) Set(ctx context.Context, key string, value json.RawMessage) erro
 var validYoloVariants = map[string]struct{}{
 	"yolo26n": {}, "yolo26s": {}, "yolo26m": {}, "yolo26l": {}, "yolo26x": {},
 }
-// INT8 is technically wired but hits an upstream TRT assertion during
-// calibration on YOLO26 ONNX (see docs/known-issues.md). Disabled at
-// the validator layer until resolved. Remove the "commented" entry to
-// re-enable.
+// INT8 is served via offline trtexec calibration (see
+// docs/deployment/known-issues.md and deploy/docker/calibrate-yolo26.sh).
+// The in-process TRT calibrator hits an assertion on TRT 10.3 so the
+// entrypoint runs the offline path on first INT8 boot; this validator
+// accepts the setting and lets that flow take over.
 var validPrecisions = map[string]struct{}{
 	"fp16": {},
-	// "int8": {},  // disabled — see docs/known-issues.md
+	"int8": {},
 }
 
 type Detector struct {
@@ -70,6 +72,9 @@ type Detector struct {
 	// eat GPU on installs that don't care about plates. Takes effect
 	// on pipeline restart (Settings UI does this automatically).
 	AnprEnabled bool `json:"anpr_enabled"`
+	// FaceIDEnabled toggles the SCRFD + ArcFace SGIE chain for face
+	// detect + embed. Same scaling + restart story as AnprEnabled.
+	FaceIDEnabled bool `json:"face_id_enabled"`
 }
 
 // GetDetector reads the detector settings, falling back to defaults if a
@@ -92,6 +97,11 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
+	if raw, err := s.Get(ctx, "detector.face_id_enabled"); err == nil {
+		_ = json.Unmarshal(raw, &d.FaceIDEnabled)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
 	return d, nil
 }
 
@@ -107,13 +117,45 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	vb, _ := json.Marshal(d.YoloVariant)
 	pb, _ := json.Marshal(d.YoloPrecision)
 	ab, _ := json.Marshal(d.AnprEnabled)
+	fb, _ := json.Marshal(d.FaceIDEnabled)
 	if err := s.Set(ctx, "detector.yolo26_variant", vb); err != nil {
 		return err
 	}
 	if err := s.Set(ctx, "detector.yolo26_precision", pb); err != nil {
 		return err
 	}
-	return s.Set(ctx, "detector.anpr_enabled", ab)
+	if err := s.Set(ctx, "detector.anpr_enabled", ab); err != nil {
+		return err
+	}
+	return s.Set(ctx, "detector.face_id_enabled", fb)
+}
+
+// Face match threshold — cosine similarity floor above which a
+// detection is considered to match an enrolled person. Callable
+// from event-processor via a Postgres read; no Go code path today
+// reads it directly but API handlers may soon.
+func (s *Store) GetFaceMatchThreshold(ctx context.Context) (float64, error) {
+	const def = 0.40
+	raw, err := s.Get(ctx, "faces.match_threshold")
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return def, nil
+		}
+		return def, err
+	}
+	var t float64
+	if err := json.Unmarshal(raw, &t); err != nil || t <= 0 || t >= 1 {
+		return def, nil
+	}
+	return t, nil
+}
+
+func (s *Store) SetFaceMatchThreshold(ctx context.Context, t float64) error {
+	if t <= 0 || t >= 1 {
+		return fmt.Errorf("threshold must be in (0,1)")
+	}
+	b, _ := json.Marshal(t)
+	return s.Set(ctx, "faces.match_threshold", b)
 }
 
 // HAConfig is the Home Assistant bridge config surfaced via /settings/ha.
@@ -229,4 +271,100 @@ func normaliseClassList(in []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// CalibrationStatus surfaces yolo26 INT8 calibration state to the
+// UI. LastRun is null until the first attempt; LastError is null
+// when the most recent attempt succeeded (or none has run yet), so
+// the client can distinguish "not run" from "ran and failed".
+type CalibrationStatus struct {
+	ImageCount int        `json:"image_count"`
+	LastRun    *time.Time `json:"last_run,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
+	// EngineSize and TableSHA256 are populated by the entrypoint on
+	// successful calibration so the UI can show the user what was
+	// produced. Zero / empty when calibration hasn't succeeded.
+	EngineSize  int64  `json:"engine_size,omitempty"`
+	TableSHA256 string `json:"table_sha256,omitempty"`
+}
+
+// GetCalibrationStatus reads the three calibration.* rows. Missing
+// rows fall back to zero values (fresh install before migration 0018
+// ran — defensive).
+func (s *Store) GetCalibrationStatus(ctx context.Context) (CalibrationStatus, error) {
+	var c CalibrationStatus
+	if raw, err := s.Get(ctx, "calibration.image_count"); err == nil {
+		_ = json.Unmarshal(raw, &c.ImageCount)
+	} else if !errors.Is(err, ErrNotFound) {
+		return c, err
+	}
+	if raw, err := s.Get(ctx, "calibration.last_run"); err == nil {
+		// Stored as a JSON string (RFC3339) or JSON null.
+		var ts string
+		if err := json.Unmarshal(raw, &ts); err == nil && ts != "" {
+			if t, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
+				c.LastRun = &t
+			}
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return c, err
+	}
+	if raw, err := s.Get(ctx, "calibration.last_error"); err == nil {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			c.LastError = s
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return c, err
+	}
+	if raw, err := s.Get(ctx, "calibration.engine_size"); err == nil {
+		_ = json.Unmarshal(raw, &c.EngineSize)
+	}
+	if raw, err := s.Get(ctx, "calibration.table_sha256"); err == nil {
+		_ = json.Unmarshal(raw, &c.TableSHA256)
+	}
+	return c, nil
+}
+
+// SetCalibrationStatus upserts any subset of the calibration fields.
+// Nil pointers / empty strings / zero values are persisted as JSON
+// null so the UI can distinguish "not set" from "set to zero".
+func (s *Store) SetCalibrationStatus(ctx context.Context, c CalibrationStatus) error {
+	countB, _ := json.Marshal(c.ImageCount)
+	if err := s.Set(ctx, "calibration.image_count", countB); err != nil {
+		return err
+	}
+	var runB []byte
+	if c.LastRun != nil {
+		runB, _ = json.Marshal(c.LastRun.UTC().Format(time.RFC3339Nano))
+	} else {
+		runB = []byte("null")
+	}
+	if err := s.Set(ctx, "calibration.last_run", runB); err != nil {
+		return err
+	}
+	var errB []byte
+	if c.LastError != "" {
+		errB, _ = json.Marshal(c.LastError)
+	} else {
+		errB = []byte("null")
+	}
+	if err := s.Set(ctx, "calibration.last_error", errB); err != nil {
+		return err
+	}
+	sizeB, _ := json.Marshal(c.EngineSize)
+	if err := s.Set(ctx, "calibration.engine_size", sizeB); err != nil {
+		return err
+	}
+	shaB, _ := json.Marshal(c.TableSHA256)
+	return s.Set(ctx, "calibration.table_sha256", shaB)
+}
+
+// SetCalibrationImageCount updates just the image_count row.
+// Called repeatedly by the sampler goroutine so the UI progress bar
+// moves; keeping it separate from the full upsert avoids flapping
+// last_run / last_error on every increment.
+func (s *Store) SetCalibrationImageCount(ctx context.Context, n int) error {
+	b, _ := json.Marshal(n)
+	return s.Set(ctx, "calibration.image_count", b)
 }

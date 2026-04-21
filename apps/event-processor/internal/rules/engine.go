@@ -15,15 +15,22 @@ package rules
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 
+	"github.com/fnvr/fnvr/apps/event-processor/internal/metrics"
 	"github.com/fnvr/fnvr/apps/event-processor/internal/sidecar"
 )
 
@@ -61,6 +68,29 @@ type Engine struct {
 	// to uppercase alphanumerics + '%'.
 	hotlist []hotlistEntry
 
+	// Enrolled face embeddings joined with person metadata. Reload()
+	// fetches the current snapshot every 30s. Match at detection
+	// time is a cosine-similarity scan over this slice; at operator
+	// scale (tens to low hundreds of embeddings) a brute force scan
+	// costs ~50µs per face detection — cheaper than anything
+	// fancier to maintain.
+	faceEnrolments   []enrolledEmbedding
+	faceMatchThresh  float64
+	// faceMarginThresh is the minimum gap between the top-scoring
+	// person and the runner-up before a multi-person match is
+	// accepted. Prevents an ambiguous probe from matching either of
+	// two similar-looking enrolled people. Skipped when the pool
+	// contains only one person. Default 0.05.
+	faceMarginThresh float64
+	// Dismissed (not-a-face / duplicate) embeddings used to penalise
+	// false-positive matches at scoring time. Previously applied as a
+	// score haircut at every threshold comparison, which was lethal on
+	// a noisy negatives pool. Now applied as a late veto: only a
+	// probe that both clears the threshold AND lands close to a known
+	// negative is retracted.
+	faceNegatives       []dismissedEmbedding
+	negPenaltyWeight    float64
+
 	// Per-rule cooldown state: last-fired timestamp.
 	cooldowns map[string]time.Time
 
@@ -70,6 +100,12 @@ type Engine struct {
 	// observations of the same track. Entries older than 30s are
 	// pruned on insert so the map doesn't grow forever for ghost tracks.
 	tracks map[string]trackEntry
+
+	// Per-(rule,step) rolling sighting log for cross-camera sequence
+	// rules. Key is "<rule_id>|<step_idx>", value is timestamped
+	// sightings kept for up to the rule's window. Pruned lazily on
+	// each evaluation for that rule/step so the map stays bounded.
+	sequenceSightings map[string][]sequenceSighting
 }
 
 type trackEntry struct {
@@ -116,14 +152,34 @@ type Rule struct {
 }
 
 type RuleDef struct {
-	CameraID       string   `json:"camera_id,omitempty"` // empty → all cameras
-	Classes        []string `json:"classes"`             // e.g. ["person","car"]
-	MinConfidence  float32  `json:"min_confidence"`
-	ZoneID         string   `json:"zone_id,omitempty"`
-	Direction      string   `json:"direction,omitempty"` // "in" | "out" | "" for both
-	CooldownSec    int      `json:"cooldown_sec"`
-	Schedule       Schedule `json:"schedule"`
-	Severity       string   `json:"severity"` // info | warning | critical
+	// Kind selects the rule flavour. Empty / "single" = the original
+	// per-detection form (all fields below, minus Steps+WindowSec,
+	// apply). "sequence" = cross-camera ordered-sightings rule; fields
+	// Steps + WindowSec drive it, the top-level CameraID/Classes are
+	// ignored. Leaving Kind absent preserves compatibility with every
+	// existing rule row.
+	Kind           string          `json:"kind,omitempty"`
+	CameraID       string          `json:"camera_id,omitempty"` // empty → all cameras
+	Classes        []string        `json:"classes"`             // e.g. ["person","car"]
+	MinConfidence  float32         `json:"min_confidence"`
+	ZoneID         string          `json:"zone_id,omitempty"`
+	Direction      string          `json:"direction,omitempty"` // "in" | "out" | "" for both
+	CooldownSec    int             `json:"cooldown_sec"`
+	Schedule       Schedule        `json:"schedule"`
+	Severity       string          `json:"severity"` // info | warning | critical
+	// Sequence-rule fields. Ignored unless Kind=="sequence".
+	Steps          []SequenceStep  `json:"steps,omitempty"`
+	WindowSec      int             `json:"window_sec,omitempty"`
+}
+
+// SequenceStep is one hop in a cross-camera sequence rule. The
+// engine requires a sighting matching every step, in order, within
+// WindowSec seconds from first to last step. Per-hop filter is the
+// intersection of (camera_id) + (classes, if non-empty) + min_confidence.
+type SequenceStep struct {
+	CameraID      string   `json:"camera_id"`
+	Classes       []string `json:"classes,omitempty"`
+	MinConfidence float32  `json:"min_confidence,omitempty"`
 }
 
 type Schedule struct {
@@ -135,7 +191,45 @@ type Schedule struct {
 
 type compiledRule struct {
 	Rule
-	classes map[string]struct{}
+	classes  map[string]struct{}
+	// sequence is nil for single-camera rules. Populated only when
+	// reload() parses a Kind=="sequence" rule with at least two steps.
+	sequence *compiledSequence
+}
+
+// compiledSequence holds the parsed step list + window duration for a
+// cross-camera rule. steps[i].classes is pre-lowered into a set for
+// O(1) membership checks in onDetection.
+type compiledSequence struct {
+	steps  []compiledSequenceStep
+	window time.Duration
+}
+
+type compiledSequenceStep struct {
+	cameraID      string
+	classes       map[string]struct{} // empty set = match any
+	minConfidence float32
+}
+
+// sequenceSighting records that a sequence rule's step N has been
+// matched for a given detection. Kept in Engine.sequenceSightings for
+// up to the rule's window so a later step can look back and confirm
+// the chain. trackKey is retained for future per-track re-ID — not
+// used in slice 1.
+type sequenceSighting struct {
+	ts       time.Time
+	trackKey string
+}
+
+// DriftAlert is the payload ml-worker publishes to fnvr.alerts.drift
+// when the weekly face-embedding self-match check drops more than
+// _DRIFT_THRESHOLD below the baseline. Event-processor turns this
+// into a system-scope incident (rule_id=NULL, camera_id=NULL).
+type DriftAlert struct {
+	At       time.Time `json:"at"`
+	Current  float64   `json:"current"`
+	Baseline float64   `json:"baseline"`
+	Delta    float64   `json:"delta"`
 }
 
 // hotlistEntry is the match-time shape of a plate_hotlist row. We keep
@@ -147,6 +241,22 @@ type hotlistEntry struct {
 	Pattern  string // already normalised: uppercase alphanumerics + '%'
 	Label    string
 	Severity string
+}
+
+// enrolledEmbedding is a pgvector-backed face embedding pre-joined
+// with the owning person's label + alert flag. The vector is stored
+// L2-normalised so cosine similarity == dot product (cheap).
+type enrolledEmbedding struct {
+	PersonID     string
+	Label        string
+	AlertOnMatch bool
+	Vector       []float32 // normalised, len=512
+}
+
+// dismissedEmbedding is an operator-flagged false-positive (or
+// near-duplicate) kept so the matcher can score penalised.
+type dismissedEmbedding struct {
+	Vector []float32 // normalised, len=512
 }
 
 func New(ctx context.Context, cfg Config) (*Engine, error) {
@@ -170,8 +280,9 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		zones:            map[string][]Zone{},
 		enabledDetectors: map[string][]string{},
 		mutedClasses:     map[string]map[string]struct{}{},
-		cooldowns:        map[string]time.Time{},
-		tracks:           map[string]trackEntry{},
+		cooldowns:         map[string]time.Time{},
+		tracks:            map[string]trackEntry{},
+		sequenceSightings: map[string][]sequenceSighting{},
 	}, nil
 }
 
@@ -213,6 +324,25 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Drift alerts from ml-worker (weekly self-match check on the
+	// enrolled embeddings). Turn each alert into a system-scope
+	// incident; the notification dispatcher fans it out to any
+	// channel that isn't pinned to a specific camera.
+	_, err = e.nc.Subscribe("fnvr.alerts.drift", func(msg *nats.Msg) {
+		var a DriftAlert
+		if err := json.Unmarshal(msg.Data, &a); err != nil {
+			slog.Warn("bad drift alert", "err", err)
+			return
+		}
+		if err := e.fireDriftIncident(ctx, a); err != nil {
+			slog.Warn("fire drift incident", "err", err)
+		}
+	})
+	if err != nil {
+		return err
+	}
+
 	<-ctx.Done()
 	return nil
 }
@@ -233,6 +363,10 @@ func (e *Engine) periodicReload(ctx context.Context) {
 }
 
 func (e *Engine) reload(ctx context.Context) error {
+	reloadStart := time.Now()
+	defer func() {
+		metrics.ReloadDuration.Observe(time.Since(reloadStart).Seconds())
+	}()
 	// Zones + their optional mute arrays.
 	zrows, err := e.pool.Query(ctx, `
 		SELECT id::text, camera_id, kind, geometry, exclude_classes, exclude_kinds
@@ -279,7 +413,16 @@ func (e *Engine) reload(ctx context.Context) error {
 		for _, c := range r.Definition.Classes {
 			cls[c] = struct{}{}
 		}
-		compiled = append(compiled, compiledRule{Rule: r, classes: cls})
+		cr := compiledRule{Rule: r, classes: cls}
+		if r.Definition.Kind == "sequence" {
+			seq, serr := compileSequence(r.Definition)
+			if serr != nil {
+				slog.Warn("bad sequence rule", "id", r.ID, "err", serr)
+				continue
+			}
+			cr.sequence = seq
+		}
+		compiled = append(compiled, cr)
 	}
 
 	// Per-camera detector whitelist + class-mute overrides. Empty
@@ -393,29 +536,83 @@ func (e *Engine) reload(ctx context.Context) error {
 	}
 	hrows.Close()
 
+	// Face enrolments: join face_embeddings with persons, only
+	// enabled persons. The embedding column comes back as pgvector's
+	// text form "[v0,v1,...]" which we parse into []float32 and then
+	// L2-normalise so cosine similarity becomes a dot product.
+	enrols, err := e.loadFaceEnrolments(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Face match threshold — cosine-similarity floor. Default 0.4 if
+	// the setting is missing. On this codebase the recommended value
+	// after the top-K overhaul is 0.32 — lower because the score is
+	// now a mean over the top-3 matches, so a probe doesn't need a
+	// single near-perfect hit to clear the bar. Reload every cycle
+	// so the operator can tune it live without restarting anything.
+	thresh := loadFaceThreshold(ctx, e.pool)
+
+	// Multi-person match margin — how much the winning person's
+	// top-K score must exceed the runner-up's before a match is
+	// accepted when more than one person is enrolled. Skipped when
+	// only one person exists in the pool.
+	margin := loadFaceMargin(ctx, e.pool)
+
+	// Dismissed embeddings + their penalty weight. Missing table /
+	// missing setting degrade gracefully to "no penalty".
+	negs, err := e.loadFaceNegatives(ctx)
+	if err != nil {
+		return err
+	}
+	penaltyWeight := loadNegPenaltyWeight(ctx, e.pool)
+
 	e.mu.Lock()
 	e.rules = compiled
 	e.zones = zones
 	e.enabledDetectors = enabled
 	e.mutedClasses = muted
 	e.hotlist = hotlist
+	e.faceEnrolments = enrols
+	e.faceMatchThresh = thresh
+	e.faceMarginThresh = margin
+	e.faceNegatives = negs
+	e.negPenaltyWeight = penaltyWeight
 	e.mu.Unlock()
+	metrics.RulesLoaded.Set(float64(len(compiled)))
+	metrics.EnrolledEmbeddings.Set(float64(len(enrols)))
+	metrics.FaceNegatives.Set(float64(len(negs)))
 	slog.Info("rules reloaded",
 		"rules", len(compiled),
 		"zone_cameras", len(zones),
 		"detector_filtered_cameras", len(enabled),
 		"class_muted_cameras", len(muted),
-		"plate_hotlist", len(hotlist))
+		"plate_hotlist", len(hotlist),
+		"face_enrolments", len(enrols),
+		"face_threshold", thresh,
+		"face_margin", margin,
+		"face_negatives", len(negs),
+		"neg_penalty_weight", penaltyWeight)
 	return nil
 }
 
 func (e *Engine) onDetection(ctx context.Context, d Detection) error {
+	kindLabel := d.Kind
+	if kindLabel == "" {
+		kindLabel = "object"
+	}
+	metrics.DetectionsProcessed.WithLabelValues(d.CameraID, kindLabel).Inc()
 	e.mu.RLock()
 	rules := e.rules
 	zones := e.zones[d.CameraID]
 	allowed := e.enabledDetectors[d.CameraID]
 	muted := e.mutedClasses[d.CameraID]
 	hotlist := e.hotlist
+	faceEnrolments := e.faceEnrolments
+	faceThresh := e.faceMatchThresh
+	faceMargin := e.faceMarginThresh
+	faceNegatives := e.faceNegatives
+	negPenaltyW := e.negPenaltyWeight
 	e.mu.RUnlock()
 
 	// Per-camera detector whitelist — e.g. ANPR is pointless on indoor
@@ -445,18 +642,151 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		}
 	}
 
+	// Face match — for kind="face" detections with an embedding in
+	// attributes. Scoring is adaptive top-K mean per person: the
+	// matcher averages each person's three most-similar enrolment
+	// cosines against the probe, picks the person with the highest
+	// mean, and accepts when that mean clears the threshold. With
+	// multiple enrolled persons the runner-up must be at least
+	// faceMargin behind, so an ambiguous probe matches neither.
+	//
+	// Top-K mean replaces a plain best-of-N to reward probes that
+	// look like several of a person's enrolments, not just one —
+	// diverse same-person pools (different poses, lighting) become
+	// assets instead of a single rogue embedding defining a match.
+	//
+	// Negative penalty is applied as a late veto: a probe that
+	// clears the threshold but also lands close to a known
+	// dismissed embedding is retracted. This is less aggressive
+	// than the previous "subtract at scoring time" path which made
+	// the system unmatchable on a noisy negatives pool.
+	var matchedPerson enrolledEmbedding
+	var matchedSim float32
+	if d.Kind == "face" && len(faceEnrolments) > 0 {
+		if raw := d.Attributes["embedding"]; raw != "" {
+			probe := decodeEmbeddingBase64(raw)
+			if probe != nil {
+				// Group similarities by person.
+				simsByPerson := map[string][]float32{}
+				labelByPerson := map[string]enrolledEmbedding{}
+				for i := range faceEnrolments {
+					enrol := faceEnrolments[i]
+					s := cosineSim(probe, enrol.Vector)
+					simsByPerson[enrol.PersonID] = append(simsByPerson[enrol.PersonID], s)
+					labelByPerson[enrol.PersonID] = enrol
+				}
+
+				type personScore struct {
+					label enrolledEmbedding
+					topK  float32 // mean of the top-3 cosines (or best-of-N when pool < 3)
+				}
+				scores := make([]personScore, 0, len(simsByPerson))
+				for pid, sims := range simsByPerson {
+					sort.Slice(sims, func(i, j int) bool { return sims[i] > sims[j] })
+					k := 3
+					if len(sims) < k {
+						k = len(sims)
+					}
+					var sum float32
+					for i := 0; i < k; i++ {
+						sum += sims[i]
+					}
+					scores = append(scores, personScore{
+						label: labelByPerson[pid],
+						topK:  sum / float32(k),
+					})
+				}
+				sort.Slice(scores, func(i, j int) bool { return scores[i].topK > scores[j].topK })
+
+				// Adaptive acceptance. Single-person pool: just clear
+				// the threshold. Multi-person: also require a margin
+				// over the runner-up so ambiguity doesn't resolve into
+				// a false match.
+				accept := false
+				if len(scores) > 0 && float64(scores[0].topK) >= faceThresh {
+					if len(scores) == 1 || float64(scores[0].topK-scores[1].topK) >= faceMargin {
+						accept = true
+					}
+				}
+
+				// Late negative veto: if the probe is highly similar to
+				// a known dismissed embedding, withdraw the match.
+				if accept && negPenaltyW > 0 && len(faceNegatives) > 0 {
+					var negSim float32
+					for i := range faceNegatives {
+						s := cosineSim(probe, faceNegatives[i].Vector)
+						if s > negSim {
+							negSim = s
+						}
+					}
+					if float64(scores[0].topK-float32(negPenaltyW)*negSim) < faceThresh {
+						accept = false
+					}
+				}
+
+				if accept {
+					matchedPerson = scores[0].label
+					matchedSim = scores[0].topK
+				}
+			}
+		}
+	}
+	// Rewrite attributes on a face detection. Keep the raw embedding
+	// either way so the per-person matches view can let an operator
+	// flag a mis-matched tile as "not a face" (which records the
+	// embedding as a negative for future penalty scoring). Previously
+	// matched rows lost the blob; bloat is tolerable (~2KB/row) and
+	// hot-table retention trims it anyway.
+	if d.Kind == "face" {
+		if matchedPerson.PersonID != "" {
+			d.Attributes["person"] = matchedPerson.Label
+			d.Attributes["person_id"] = matchedPerson.PersonID
+			d.Attributes["similarity"] = strconv.FormatFloat(float64(matchedSim), 'f', 3, 32)
+		} else {
+			// Keep embedding so the enrolment UI can pick it up, plus
+			// a short hash for de-duping the "recent faces" grid.
+			if emb := d.Attributes["embedding"]; emb != "" {
+				// Hash the first 64 chars of base64 — cheap and
+				// distinguishing enough.
+				end := len(emb)
+				if end > 64 {
+					end = 64
+				}
+				d.Attributes["embedding_hash"] = strconv.FormatUint(fnv64(emb[:end]), 16)
+			}
+		}
+	}
+
 	// Persist raw detection — the timeline reads from here.
 	kind := d.Kind
 	if kind == "" {
 		kind = "object"
 	}
-	if _, err := e.pool.Exec(ctx, `
+	var pgID int64
+	if err := e.pool.QueryRow(ctx, `
 		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		RETURNING id`,
 		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
 		mustJSON(d.BBox), nullIfEmpty(d.TrackID), mustJSON(d.Attributes),
-	); err != nil {
+	).Scan(&pgID); err != nil {
 		return err
+	}
+
+	// Face thumbnail rename — the pipeline wrote a JPEG of the face
+	// crop under {event_id}.jpg at detection time. Rename to the PG
+	// row id so the api-server's thumbnail handler (keyed by PG id)
+	// serves it straight from disk without another live-snapshot
+	// crop. Best-effort: missing source file is fine (face_id off or
+	// crop write raced), we just fall through to the api's live-
+	// snapshot fallback.
+	if kind == "face" && pgID > 0 && d.ID != "" {
+		const dir = "/var/lib/fnvr/thumbs/faces/"
+		src := dir + d.ID + ".jpg"
+		dst := dir + strconv.FormatInt(pgID, 10) + ".jpg"
+		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
+			slog.Warn("face thumb rename", "src", src, "err", err)
+		}
 	}
 
 	// Mirror into the per-segment JSONL sidecar so older detections
@@ -499,7 +829,28 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		}
 	}
 
+	// Face-match incident. Parallel to the plate hotlist path: the
+	// match was computed pre-INSERT; here we just decide whether to
+	// escalate it into an incident when the person has alert_on_match
+	// set. Cooldown keyed by (person_id, camera) — walking past the
+	// same camera for 60 seconds should fire at most twice, not 60
+	// times.
+	if d.Kind == "face" && matchedPerson.PersonID != "" && matchedPerson.AlertOnMatch {
+		key := "face:" + matchedPerson.PersonID + ":" + d.CameraID
+		if e.cooldownOK(key, 30, d.TS) {
+			if err := e.fireFaceIncident(ctx, d, matchedPerson, matchedSim); err != nil {
+				slog.Warn("fire face incident",
+					"person_id", matchedPerson.PersonID, "err", err)
+			}
+		}
+	}
+
 	for _, r := range rules {
+		// Sequence rules are handled below; the per-detection loop
+		// applies only to the original single-camera kind.
+		if r.sequence != nil {
+			continue
+		}
 		if r.Definition.CameraID != "" && r.Definition.CameraID != d.CameraID {
 			continue
 		}
@@ -543,6 +894,21 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		}
 		if err := e.fireIncident(ctx, r, d); err != nil {
 			slog.Warn("fire incident", "rule", r.ID, "err", err)
+		}
+	}
+
+	// Cross-camera sequence rules. A detection can advance a sequence
+	// AND fire a single-camera rule in the same tick; the two loops
+	// are independent.
+	for _, r := range rules {
+		if r.sequence == nil {
+			continue
+		}
+		if !inSchedule(r.Definition.Schedule, d.TS) {
+			continue
+		}
+		if err := e.evalSequence(ctx, r, d); err != nil {
+			slog.Warn("eval sequence", "rule", r.ID, "err", err)
 		}
 	}
 
@@ -591,6 +957,179 @@ func (e *Engine) fireIncident(ctx context.Context, r compiledRule, d Detection) 
 		"severity":   severity,
 		"summary":    summary,
 	})
+	metrics.IncidentsFired.WithLabelValues(severity, "object").Inc()
+	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
+}
+
+// compileSequence parses a Kind=="sequence" rule definition into the
+// engine's runtime shape. Validates shape enough to guarantee
+// evalSequence never panics — deeper validation (e.g. camera existence)
+// is the api-server's job at create-time. Returns an error on anything
+// evalSequence couldn't sensibly interpret.
+func compileSequence(def RuleDef) (*compiledSequence, error) {
+	if len(def.Steps) < 2 {
+		return nil, fmt.Errorf("sequence rule needs >=2 steps, got %d", len(def.Steps))
+	}
+	if def.WindowSec <= 0 {
+		return nil, fmt.Errorf("sequence rule needs window_sec > 0")
+	}
+	out := &compiledSequence{
+		steps:  make([]compiledSequenceStep, 0, len(def.Steps)),
+		window: time.Duration(def.WindowSec) * time.Second,
+	}
+	for i, s := range def.Steps {
+		if s.CameraID == "" {
+			return nil, fmt.Errorf("sequence step %d missing camera_id", i)
+		}
+		cs := compiledSequenceStep{
+			cameraID:      s.CameraID,
+			minConfidence: s.MinConfidence,
+		}
+		if len(s.Classes) > 0 {
+			cs.classes = make(map[string]struct{}, len(s.Classes))
+			for _, c := range s.Classes {
+				cs.classes[c] = struct{}{}
+			}
+		}
+		out.steps = append(out.steps, cs)
+	}
+	return out, nil
+}
+
+// evalSequence advances a cross-camera sequence rule with the current
+// detection. If d matches step i, record the sighting; if it's the
+// final step AND every earlier step has a sighting within the rule's
+// window, fire one incident (subject to the rule's cooldown).
+func (e *Engine) evalSequence(ctx context.Context, r compiledRule, d Detection) error {
+	seq := r.sequence
+	// Identify which step(s) this detection matches. A rule that
+	// visits the same camera twice could match multiple indices; we
+	// advance each independently.
+	matched := make([]int, 0, 1)
+	for i, s := range seq.steps {
+		if s.cameraID != d.CameraID {
+			continue
+		}
+		if d.Confidence < s.minConfidence {
+			continue
+		}
+		if len(s.classes) > 0 {
+			if _, ok := s.classes[d.ClassName]; !ok {
+				continue
+			}
+		}
+		matched = append(matched, i)
+	}
+	if len(matched) == 0 {
+		return nil
+	}
+
+	cutoff := d.TS.Add(-seq.window)
+	trackKey := d.CameraID + "|" + d.TrackID
+
+	// Record sightings + prune stale ones for every step we'll touch
+	// (matched steps and earlier steps we'll look back at).
+	e.mu.Lock()
+	for _, idx := range matched {
+		key := r.ID + "|" + strconv.Itoa(idx)
+		kept := e.sequenceSightings[key][:0]
+		for _, s := range e.sequenceSightings[key] {
+			if s.ts.After(cutoff) {
+				kept = append(kept, s)
+			}
+		}
+		kept = append(kept, sequenceSighting{ts: d.TS, trackKey: trackKey})
+		e.sequenceSightings[key] = kept
+	}
+	// Prune earlier steps lazily too, so the lookback below sees a
+	// clean slice.
+	for i := 0; i < len(seq.steps); i++ {
+		key := r.ID + "|" + strconv.Itoa(i)
+		if _, ok := e.sequenceSightings[key]; !ok {
+			continue
+		}
+		kept := e.sequenceSightings[key][:0]
+		for _, s := range e.sequenceSightings[key] {
+			if s.ts.After(cutoff) {
+				kept = append(kept, s)
+			}
+		}
+		e.sequenceSightings[key] = kept
+	}
+	e.mu.Unlock()
+
+	// Chain-complete check: only when a matched step is the LAST step
+	// do we look back across earlier steps.
+	lastIdx := len(seq.steps) - 1
+	fired := false
+	for _, idx := range matched {
+		if idx != lastIdx {
+			continue
+		}
+		e.mu.RLock()
+		ok := true
+		for i := 0; i < lastIdx; i++ {
+			key := r.ID + "|" + strconv.Itoa(i)
+			if len(e.sequenceSightings[key]) == 0 {
+				ok = false
+				break
+			}
+		}
+		e.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if !e.cooldownOK(r.ID, r.Definition.CooldownSec, d.TS) {
+			continue
+		}
+		if err := e.fireSequenceIncident(ctx, r, d); err != nil {
+			return err
+		}
+		fired = true
+	}
+	if fired {
+		slog.Debug("sequence fired",
+			"rule", r.ID, "camera", d.CameraID, "class", d.ClassName)
+	} else {
+		slog.Debug("sequence step matched",
+			"rule", r.ID, "steps", matched, "camera", d.CameraID)
+	}
+	return nil
+}
+
+// fireSequenceIncident writes an incident row for a cross-camera
+// sequence rule. Mirrors fireIncident but the summary names both
+// endpoints + the window so operators can tell at a glance what
+// chained.
+func (e *Engine) fireSequenceIncident(ctx context.Context, r compiledRule, d Detection) error {
+	severity := r.Definition.Severity
+	if severity == "" {
+		severity = "info"
+	}
+	seq := r.sequence
+	first := seq.steps[0].cameraID
+	last := seq.steps[len(seq.steps)-1].cameraID
+	summary := fmt.Sprintf("sequence: %s → %s within %ds (%s)",
+		first, last, int(seq.window.Seconds()), r.Name)
+
+	var incidentID string
+	err := e.pool.QueryRow(ctx, `
+		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at, severity, summary)
+		VALUES ($1,$2,$3,$3,$4,$5) RETURNING id::text`,
+		r.ID, d.CameraID, d.TS, severity, summary).Scan(&incidentID)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"id":         incidentID,
+		"rule_id":    r.ID,
+		"camera_id":  d.CameraID,
+		"started_at": d.TS,
+		"severity":   severity,
+		"summary":    summary,
+		"rule_kind":  "sequence",
+	})
+	metrics.IncidentsFired.WithLabelValues(severity, "sequence").Inc()
 	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
 }
 
@@ -627,7 +1166,309 @@ func (e *Engine) fireHotlistIncident(ctx context.Context, d Detection, plate str
 		"hotlist_id": h.ID,
 		"plate":      plate,
 	})
+	metrics.IncidentsFired.WithLabelValues(severity, "hotlist").Inc()
 	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
+}
+
+// fireFaceIncident mirrors fireHotlistIncident for a face match: a
+// rule-less incident (rule_id NULL) with a warning severity and a
+// summary the operator can read at a glance. Downstream subscriptions
+// with s.rule_id IS NULL fire as usual.
+func (e *Engine) fireFaceIncident(ctx context.Context, d Detection, p enrolledEmbedding, sim float32) error {
+	summary := fmt.Sprintf("face: %s on %s (%.0f%%)", p.Label, d.CameraID, sim*100)
+	var incidentID string
+	err := e.pool.QueryRow(ctx, `
+		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at, severity, summary)
+		VALUES (NULL, $1, $2, $2, 'warning', $3) RETURNING id::text`,
+		d.CameraID, d.TS, summary).Scan(&incidentID)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"id":         incidentID,
+		"camera_id":  d.CameraID,
+		"started_at": d.TS,
+		"severity":   "warning",
+		"summary":    summary,
+		"person_id":  p.PersonID,
+		"person":     p.Label,
+		"similarity": sim,
+	})
+	metrics.IncidentsFired.WithLabelValues("warning", "face").Inc()
+	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
+}
+
+// fireDriftIncident records a system-scope incident for a face-ID
+// embedding drift alert. rule_id and camera_id are both NULL — drift
+// is not attributable to any one camera or rule — and the summary
+// carries enough numbers that an operator can read the email/push
+// without opening the app. 24 h cooldown prevents a flapping
+// baseline from spamming channels; publishes on the reserved
+// "__system" camera suffix so the dispatcher's wildcard catches it.
+func (e *Engine) fireDriftIncident(ctx context.Context, a DriftAlert) error {
+	const cooldownKey = "drift:global"
+	ts := a.At
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	if !e.cooldownOK(cooldownKey, 24*3600, ts) {
+		slog.Info("drift alert suppressed by cooldown",
+			"baseline", a.Baseline, "current", a.Current, "delta", a.Delta)
+		return nil
+	}
+	summary := fmt.Sprintf(
+		"face embedding drift: baseline %.3f → current %.3f (%+.1f%%)",
+		a.Baseline, a.Current, -a.Delta*100)
+	var incidentID string
+	err := e.pool.QueryRow(ctx, `
+		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at, severity, summary)
+		VALUES (NULL, NULL, $1, $1, 'warning', $2) RETURNING id::text`,
+		ts, summary).Scan(&incidentID)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"id":         incidentID,
+		"camera_id":  "",
+		"started_at": ts,
+		"severity":   "warning",
+		"summary":    summary,
+		"rule_kind":  "drift",
+		"baseline":   a.Baseline,
+		"current":    a.Current,
+		"delta":      a.Delta,
+	})
+	metrics.IncidentsFired.WithLabelValues("warning", "drift").Inc()
+	return e.nc.Publish("fnvr.events.incident.__system", payload)
+}
+
+// loadFaceEnrolments pulls every enabled person's embeddings joined
+// with that person's metadata, parses the pgvector text literal, and
+// L2-normalises so cosine similarity degenerates to a dot product.
+func (e *Engine) loadFaceEnrolments(ctx context.Context) ([]enrolledEmbedding, error) {
+	rows, err := e.pool.Query(ctx, `
+		SELECT p.id::text, p.label, p.alert_on_match, fe.embedding::text
+		FROM face_embeddings fe JOIN persons p ON p.id = fe.person_id
+		WHERE p.enabled = TRUE`)
+	if err != nil {
+		// If the migration hasn't run yet the table doesn't exist;
+		// return empty so the rest of reload() still succeeds.
+		if isRelationMissing(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]enrolledEmbedding, 0, 32)
+	for rows.Next() {
+		var e enrolledEmbedding
+		var vecStr string
+		if err := rows.Scan(&e.PersonID, &e.Label, &e.AlertOnMatch, &vecStr); err != nil {
+			return nil, err
+		}
+		v := parseVectorLiteral(vecStr)
+		if len(v) == 0 {
+			continue
+		}
+		l2normalise(v)
+		e.Vector = v
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// loadFaceThreshold reads settings.faces.match_threshold; defaults
+// 0.4 on any error / missing / out-of-range value.
+func loadFaceThreshold(ctx context.Context, pool *pgxpool.Pool) float64 {
+	const def = 0.40
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'faces.match_threshold'`).Scan(&raw)
+	if err != nil {
+		return def
+	}
+	var t float64
+	if err := json.Unmarshal(raw, &t); err != nil || t <= 0 || t >= 1 {
+		return def
+	}
+	return t
+}
+
+// loadFaceMargin reads settings.faces.match_margin — the minimum gap
+// required between the top-scoring person and the runner-up in a
+// multi-person pool before we accept the match. Defaults to 0.05 on
+// missing / out-of-range. Clamped to [0, 0.5] so a misconfiguration
+// can't make every probe fail the margin check or render it useless.
+func loadFaceMargin(ctx context.Context, pool *pgxpool.Pool) float64 {
+	const def = 0.05
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'faces.match_margin'`).Scan(&raw)
+	if err != nil {
+		return def
+	}
+	var m float64
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return def
+	}
+	if m < 0 {
+		m = 0
+	}
+	if m > 0.5 {
+		m = 0.5
+	}
+	return m
+}
+
+// loadFaceNegatives pulls dismissed embeddings that carry training
+// signal — "not a face" and "duplicate". Other reasons ("deleted",
+// "enrolled") are UI-only hides and must not influence scoring.
+// L2-normalises so cosine similarity is a plain dot product. Missing
+// table returns empty.
+func (e *Engine) loadFaceNegatives(ctx context.Context) ([]dismissedEmbedding, error) {
+	rows, err := e.pool.Query(ctx,
+		`SELECT embedding::text FROM face_dismissals
+		 WHERE reason IN ('not_a_face', 'duplicate')`)
+	if err != nil {
+		if isRelationMissing(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]dismissedEmbedding, 0, 32)
+	for rows.Next() {
+		var vecStr string
+		if err := rows.Scan(&vecStr); err != nil {
+			return nil, err
+		}
+		v := parseVectorLiteral(vecStr)
+		if len(v) == 0 {
+			continue
+		}
+		l2normalise(v)
+		out = append(out, dismissedEmbedding{Vector: v})
+	}
+	return out, rows.Err()
+}
+
+// loadNegPenaltyWeight reads settings.faces.negative_penalty_weight;
+// defaults 1.0. Values <0 clamp to 0 (penalty disabled); values >2
+// clamp to 2 (aggressive cap, prevents a single close negative from
+// nuking a solid positive below 0).
+func loadNegPenaltyWeight(ctx context.Context, pool *pgxpool.Pool) float64 {
+	const def = 1.0
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM settings WHERE key = 'faces.negative_penalty_weight'`).Scan(&raw)
+	if err != nil {
+		return def
+	}
+	var w float64
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return def
+	}
+	if w < 0 {
+		w = 0
+	}
+	if w > 2 {
+		w = 2
+	}
+	return w
+}
+
+// parseVectorLiteral parses pgvector's "[v0,v1,...]" text form into a
+// []float32. On parse error returns nil — caller skips the row.
+func parseVectorLiteral(s string) []float32 {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+		return nil
+	}
+	parts := strings.Split(s[1:len(s)-1], ",")
+	out := make([]float32, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 32)
+		if err != nil {
+			return nil
+		}
+		out[i] = float32(f)
+	}
+	return out
+}
+
+// l2normalise in-place divides by ||v||_2 so subsequent dot products
+// with other normalised vectors yield cosine similarity directly.
+func l2normalise(v []float32) {
+	var sq float64
+	for _, x := range v {
+		sq += float64(x) * float64(x)
+	}
+	if sq <= 0 {
+		return
+	}
+	inv := float32(1.0 / math.Sqrt(sq))
+	for i := range v {
+		v[i] *= inv
+	}
+}
+
+// cosineSim assumes both inputs are L2-normalised and the same
+// length; returns the dot product.
+func cosineSim(a, b []float32) float32 {
+	n := len(a)
+	if n != len(b) {
+		return 0
+	}
+	var s float32
+	for i := 0; i < n; i++ {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+// decodeEmbeddingBase64 decodes a little-endian float32 vector from
+// the probe's base64 payload and L2-normalises for cosine-as-dot.
+// Returns nil if the blob length isn't exactly 512 floats.
+func decodeEmbeddingBase64(s string) []float32 {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	if len(b) != 512*4 {
+		return nil
+	}
+	out := make([]float32, 512)
+	for i := 0; i < 512; i++ {
+		u := uint32(b[i*4]) | uint32(b[i*4+1])<<8 |
+			uint32(b[i*4+2])<<16 | uint32(b[i*4+3])<<24
+		out[i] = math.Float32frombits(u)
+	}
+	l2normalise(out)
+	return out
+}
+
+// isRelationMissing true for Postgres 42P01 ("undefined table") —
+// used so reload() survives cleanly when migrations haven't yet
+// created a table the engine wants.
+func isRelationMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "SQLSTATE 42P01") ||
+		strings.Contains(err.Error(), "does not exist")
+}
+
+// fnv64 — tiny FNV-1a over a string. Used for short dedup hashes on
+// unmatched face embeddings so the /faces/recent grid can group
+// lookalikes without storing anything expensive.
+func fnv64(s string) uint64 {
+	const off, prime uint64 = 14695981039346656037, 1099511628211
+	h := off
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
 }
 
 // normalisePlate strips non-alphanumerics and uppercases a raw plate

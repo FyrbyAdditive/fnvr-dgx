@@ -27,6 +27,9 @@ struct Config {
     // Inserts the LPDNet + LPRNet SGIE chain after the tracker. When
     // off, the pipeline is unchanged from the object-only shape.
     bool        use_anpr;
+    // Inserts the SCRFD + ArcFace chain. Independent of ANPR — both
+    // can be on at once.
+    bool        use_face_id;
     int         reconcile_interval_sec;
 };
 

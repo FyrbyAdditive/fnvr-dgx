@@ -9,6 +9,8 @@ const tabs = [
   { to: "/rules", label: "Rules" },
   { to: "/timeline", label: "Timeline" },
   { to: "/plates", label: "Plates" },
+  { to: "/faces", label: "Faces" },
+  { to: "/storage", label: "Storage" },
   { to: "/settings", label: "Settings" },
 ];
 

@@ -25,6 +25,7 @@ pkg_check_modules(NATS libnats QUIET)
 add_executable(pipeline-supervisor
   src/main.cpp
   src/pipeline.cpp
+  src/face_crop_jpeg.cpp
   src/supervisor.cpp
   src/nats_publisher.cpp
   src/config.cpp
@@ -67,7 +68,16 @@ target_link_libraries(pipeline-supervisor PRIVATE
   $<$<NOT:$<BOOL:${NATS_FOUND}>>:nats>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvdsgst_meta>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvds_meta>
+  # Jetson NVMM buffer ops used by the in-probe face cropper:
+  # NvBufSurface*  — map/sync/destroy of the host-mappable RGBA dst
+  # NvBufSurfTransform* — VIC-accelerated NV12→RGBA + resize
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurface>
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurftransform>
+  # libjpeg-turbo for in-probe face-crop JPEG encoding. System
+  # package `libjpeg-turbo8-dev` provides both header and library.
+  jpeg
   pthread
 )
+
 
 install(TARGETS pipeline-supervisor RUNTIME DESTINATION bin)

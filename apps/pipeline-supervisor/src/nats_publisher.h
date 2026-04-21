@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -7,6 +9,12 @@
 
 namespace fnvr {
 
+// NatsPublisher wraps a long-lived connection to the broker. Survives
+// broker restarts by configuring the nats-c client with unlimited
+// reconnects and a generous buffer. Publish() additionally guards
+// against the pathological "connection CLOSED but object still alive"
+// state that used to silently swallow heartbeats for hours — on
+// CLOSED we tear down and rebuild the connection on the next call.
 class NatsPublisher {
 public:
     explicit NatsPublisher(const std::string& url);
@@ -26,7 +34,17 @@ public:
     bool Publish(std::string_view subject, std::string_view payload, bool flush = false);
 
 private:
+    // (Re)open conn_ with our reconnect-forever options. Returns true on
+    // success. url_ is captured on construction so reconnect doesn't
+    // need to be threaded through every caller.
+    bool connect();
+    void teardown();
+
+    std::string url_;
     natsConnection* conn_ = nullptr;
+    // Rate-limit noisy CLOSED-state log spam when the broker is actually
+    // down for an extended window.
+    std::chrono::steady_clock::time_point last_closed_log_{};
 };
 
 }  // namespace fnvr

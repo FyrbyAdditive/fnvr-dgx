@@ -31,6 +31,7 @@ export function Rules() {
   });
 
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<"single" | "sequence">("single");
   const [cameraID, setCameraID] = useState("");
   const [classes, setClasses] = useState("person");
   const [minConf, setMinConf] = useState(0.5);
@@ -38,6 +39,13 @@ export function Rules() {
   const [direction, setDirection] = useState<"" | "in" | "out">("");
   const [severity, setSeverity] = useState<"info" | "warning" | "critical">("warning");
   const [cooldown, setCooldown] = useState(30);
+  // Sequence-kind state: at least 2 steps, "A then B within N seconds".
+  const [steps, setSteps] = useState<Array<{ camera_id: string; classes: string }>>([
+    { camera_id: "", classes: "car" },
+    { camera_id: "", classes: "car" },
+  ]);
+  const [windowSec, setWindowSec] = useState(120);
+  const [createErr, setCreateErr] = useState<string | null>(null);
 
   // Direction only meaningful for line/tripwire zones; reset when the
   // selected zone isn't one.
@@ -46,19 +54,60 @@ export function Rules() {
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    createRule.mutate({
-      name,
-      enabled: true,
-      definition: {
-        camera_id: cameraID || undefined,
-        classes: classes.split(",").map((c) => c.trim()).filter(Boolean),
-        min_confidence: minConf,
-        zone_id: zoneID || undefined,
-        direction: isLineLike && direction ? direction : undefined,
-        cooldown_sec: cooldown,
-        severity,
-      },
-    } as any);
+    setCreateErr(null);
+    const onError = (err: unknown) =>
+      setCreateErr((err as Error)?.message ?? "create failed");
+    if (kind === "sequence") {
+      const cleanSteps = steps
+        .map((s) => ({
+          camera_id: s.camera_id.trim(),
+          classes: s.classes
+            .split(",")
+            .map((c) => c.trim())
+            .filter(Boolean),
+        }))
+        .filter((s) => s.camera_id);
+      if (cleanSteps.length < 2) {
+        setCreateErr("sequence rules need at least 2 steps with cameras");
+        return;
+      }
+      createRule.mutate(
+        {
+          name,
+          enabled: true,
+          definition: {
+            kind: "sequence",
+            classes: [],
+            min_confidence: 0,
+            cooldown_sec: cooldown,
+            severity,
+            steps: cleanSteps.map((s) => ({
+              camera_id: s.camera_id,
+              classes: s.classes.length ? s.classes : undefined,
+            })),
+            window_sec: windowSec,
+          },
+        } as any,
+        { onError }
+      );
+    } else {
+      createRule.mutate(
+        {
+          name,
+          enabled: true,
+          definition: {
+            camera_id: cameraID || undefined,
+            classes: classes.split(",").map((c) => c.trim()).filter(Boolean),
+            min_confidence: minConf,
+            zone_id: zoneID || undefined,
+            direction: isLineLike && direction ? direction : undefined,
+            cooldown_sec: cooldown,
+            severity,
+          },
+        } as any,
+        { onError }
+      );
+    }
     setName("");
   }
 
@@ -71,36 +120,84 @@ export function Rules() {
           <input className="bg-neutral-900 rounded px-3 py-2 col-span-2" placeholder="Rule name"
             value={name} onChange={(e) => setName(e.target.value)} required />
 
-          <select className="bg-neutral-900 rounded px-3 py-2" value={cameraID}
-            onChange={(e) => setCameraID(e.target.value)}>
-            <option value="">— any camera —</option>
-            {cameras.map((c) => <option key={c.id} value={c.id}>{c.name} ({c.id})</option>)}
+          <select className="bg-neutral-900 rounded px-3 py-2 col-span-2"
+            value={kind} onChange={(e) => setKind(e.target.value as "single" | "sequence")}
+            title="Rule kind">
+            <option value="single">Single camera (per-detection)</option>
+            <option value="sequence">Sequence (seen on A then B within N seconds)</option>
           </select>
 
-          <select className="bg-neutral-900 rounded px-3 py-2" value={zoneID}
-            onChange={(e) => setZoneID(e.target.value)}>
-            <option value="">— any zone —</option>
-            {zones
-              .filter((z) => !cameraID || z.camera_id === cameraID)
-              .map((z) => <option key={z.id} value={z.id}>{z.name} ({z.kind}) · {z.camera_id}</option>)}
-          </select>
+          {kind === "single" ? (
+            <>
+              <select className="bg-neutral-900 rounded px-3 py-2" value={cameraID}
+                onChange={(e) => setCameraID(e.target.value)}>
+                <option value="">— any camera —</option>
+                {cameras.map((c) => <option key={c.id} value={c.id}>{c.name} ({c.id})</option>)}
+              </select>
 
-          {isLineLike ? (
-            <select className="bg-neutral-900 rounded px-3 py-2"
-              value={direction}
-              onChange={(e) => setDirection(e.target.value as "" | "in" | "out")}
-              title="Which direction of crossing fires this rule">
-              <option value="">both directions</option>
-              <option value="in">crossing in (A → B)</option>
-              <option value="out">crossing out (B → A)</option>
-            </select>
-          ) : <div />}
+              <select className="bg-neutral-900 rounded px-3 py-2" value={zoneID}
+                onChange={(e) => setZoneID(e.target.value)}>
+                <option value="">— any zone —</option>
+                {zones
+                  .filter((z) => !cameraID || z.camera_id === cameraID)
+                  .map((z) => <option key={z.id} value={z.id}>{z.name} ({z.kind}) · {z.camera_id}</option>)}
+              </select>
 
-          <input className="bg-neutral-900 rounded px-3 py-2" placeholder="classes (comma-sep)"
-            value={classes} onChange={(e) => setClasses(e.target.value)} />
-          <input type="number" step="0.05" min="0" max="1" className="bg-neutral-900 rounded px-3 py-2"
-            placeholder="min confidence" value={minConf}
-            onChange={(e) => setMinConf(Number(e.target.value))} />
+              {isLineLike ? (
+                <select className="bg-neutral-900 rounded px-3 py-2"
+                  value={direction}
+                  onChange={(e) => setDirection(e.target.value as "" | "in" | "out")}
+                  title="Which direction of crossing fires this rule">
+                  <option value="">both directions</option>
+                  <option value="in">crossing in (A → B)</option>
+                  <option value="out">crossing out (B → A)</option>
+                </select>
+              ) : <div />}
+
+              <input className="bg-neutral-900 rounded px-3 py-2" placeholder="classes (comma-sep)"
+                value={classes} onChange={(e) => setClasses(e.target.value)} />
+              <input type="number" step="0.05" min="0" max="1" className="bg-neutral-900 rounded px-3 py-2"
+                placeholder="min confidence" value={minConf}
+                onChange={(e) => setMinConf(Number(e.target.value))} />
+            </>
+          ) : (
+            <>
+              <div className="col-span-2 space-y-2">
+                {steps.map((s, i) => (
+                  <div key={i} className="flex gap-2 items-center">
+                    <span className="text-xs text-neutral-500 w-6">#{i + 1}</span>
+                    <select className="bg-neutral-900 rounded px-2 py-1 flex-1"
+                      value={s.camera_id}
+                      onChange={(e) => setSteps((prev) => prev.map((x, j) =>
+                        j === i ? { ...x, camera_id: e.target.value } : x))}
+                      required>
+                      <option value="">— pick camera —</option>
+                      {cameras.map((c) => <option key={c.id} value={c.id}>{c.name} ({c.id})</option>)}
+                    </select>
+                    <input className="bg-neutral-900 rounded px-2 py-1 flex-1"
+                      placeholder="classes (comma-sep, blank = any)"
+                      value={s.classes}
+                      onChange={(e) => setSteps((prev) => prev.map((x, j) =>
+                        j === i ? { ...x, classes: e.target.value } : x))} />
+                    {steps.length > 2 && (
+                      <button type="button" className="text-red-400 text-xs hover:underline"
+                        onClick={() => setSteps((prev) => prev.filter((_, j) => j !== i))}>
+                        remove
+                      </button>
+                    )}
+                  </div>
+                ))}
+                <button type="button" className="text-blue-400 text-xs hover:underline"
+                  onClick={() => setSteps((prev) => [...prev, { camera_id: "", classes: "" }])}>
+                  + add step
+                </button>
+              </div>
+              <input type="number" min="1" className="bg-neutral-900 rounded px-3 py-2"
+                placeholder="window (s)" value={windowSec}
+                onChange={(e) => setWindowSec(Number(e.target.value))} />
+              <div />
+            </>
+          )}
 
           <select className="bg-neutral-900 rounded px-3 py-2" value={severity}
             onChange={(e) => setSeverity(e.target.value as any)}>
@@ -111,6 +208,10 @@ export function Rules() {
           <input type="number" min="0" className="bg-neutral-900 rounded px-3 py-2"
             placeholder="cooldown (s)" value={cooldown}
             onChange={(e) => setCooldown(Number(e.target.value))} />
+
+          {createErr && (
+            <div className="col-span-2 text-xs text-red-400">{createErr}</div>
+          )}
 
           <button type="submit" className="col-span-2 bg-blue-600 hover:bg-blue-500 rounded px-3 py-2"
             disabled={createRule.isPending}>
@@ -178,11 +279,23 @@ function RuleRow({ rule, channels, subscriptions, isAdmin, onToggle, onDelete }:
         <div className="flex-1">
           <div className="font-medium">{rule.name}</div>
           <div className="text-xs text-neutral-500">
-            {(rule.definition.classes ?? []).join(", ")}
-            {rule.definition.camera_id && ` · ${rule.definition.camera_id}`}
-            {` · ≥${Math.round((rule.definition.min_confidence ?? 0) * 100)}%`}
-            {rule.definition.direction && ` · crossing ${rule.definition.direction}`}
-            {` · ${rule.definition.severity ?? "info"}`}
+            {rule.definition.kind === "sequence" ? (
+              <>
+                {(rule.definition.steps ?? [])
+                  .map((s) => s.camera_id)
+                  .join(" → ")}
+                {` · within ${rule.definition.window_sec ?? 0}s`}
+                {` · ${rule.definition.severity ?? "info"}`}
+              </>
+            ) : (
+              <>
+                {(rule.definition.classes ?? []).join(", ")}
+                {rule.definition.camera_id && ` · ${rule.definition.camera_id}`}
+                {` · ≥${Math.round((rule.definition.min_confidence ?? 0) * 100)}%`}
+                {rule.definition.direction && ` · crossing ${rule.definition.direction}`}
+                {` · ${rule.definition.severity ?? "info"}`}
+              </>
+            )}
           </div>
         </div>
         {isAdmin && (

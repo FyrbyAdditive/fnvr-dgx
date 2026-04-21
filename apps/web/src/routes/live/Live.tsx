@@ -96,6 +96,7 @@ export function Live() {
               id={c.id}
               name={c.name}
               state={c.state}
+              lastHeartbeatAt={c.last_heartbeat_at ?? null}
               detections={boxesByCamera.get(c.id) ?? []}
               inferenceFps={fpsByCamera.get(c.id) ?? 0}
               showStats={showStats}
@@ -108,10 +109,11 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, state, detections, inferenceFps, showStats, focus }: {
+function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus }: {
   id: string;
   name: string;
   state?: "starting" | "running" | "failed" | "unknown";
+  lastHeartbeatAt?: string | null;
   detections: DetectionEvent[];
   inferenceFps: number;
   showStats: boolean;
@@ -303,7 +305,9 @@ function CameraTile({ id, name, state, detections, inferenceFps, showStats, focu
           {latest.class_name} {(latest.confidence * 100).toFixed(0)}%
         </div>
       )}
-      {state && state !== "running" && <StateBadge state={state} />}
+      {state && state !== "running" && (
+        <StateBadge state={state} lastHeartbeatAt={lastHeartbeatAt} />
+      )}
       {showStats && (
         <div className="absolute bottom-2 right-2 text-[10px] font-mono bg-black/70 text-neutral-200 px-2 py-0.5 rounded space-x-2">
           <span title="Preview refresh (JPEG img onLoad or WebRTC rVFC)">
@@ -319,11 +323,22 @@ function CameraTile({ id, name, state, detections, inferenceFps, showStats, focu
   );
 }
 
-function StateBadge({ state }: { state: "starting" | "failed" | "unknown" | string }) {
+function StateBadge({ state, lastHeartbeatAt }: {
+  state: "starting" | "failed" | "unknown" | string;
+  lastHeartbeatAt?: string | null;
+}) {
+  // "unknown" really means one of two things — never heard from this
+  // camera, or heartbeat expired. Surfacing the age lets the operator
+  // tell a never-started worker from a long-stuck one without digging
+  // in the logs.
+  const ageSuffix =
+    state === "unknown" && lastHeartbeatAt
+      ? ` · last heartbeat ${formatRelativeAge(new Date(lastHeartbeatAt))}`
+      : "";
   const label =
-    state === "starting" ? "starting (building inference engine)" :
+    state === "starting" ? "starting…" :
     state === "failed"   ? "pipeline failed" :
-                           "pipeline offline";
+                           "pipeline offline" + ageSuffix;
   const color =
     state === "starting" ? "bg-amber-600/85" :
     state === "failed"   ? "bg-red-600/85" :
@@ -338,11 +353,26 @@ function StateBadge({ state }: { state: "starting" | "failed" | "unknown" | stri
   );
 }
 
+function formatRelativeAge(d: Date): string {
+  const secs = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return `${Math.round(secs)}s ago`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+  return `${Math.round(secs / 86400)}d ago`;
+}
+
 function BBox({ d }: { d: DetectionEvent }) {
   const isPlate = d.kind === "anpr";
-  // Plates get a fixed green border + the decoded text as label so
-  // they visually stand apart from the busy COCO palette.
-  const color = isPlate ? "#22c55e" : colorForClass(d.class_name);
+  const isFace = d.kind === "face";
+  const person = isFace ? d.attributes?.person : undefined;
+  // Fixed-colour boxes for the special detectors so they stand apart
+  // from the COCO palette: green for plates, sky-blue for matched
+  // faces. Unmatched faces fall back to the class-palette "face".
+  const color = isPlate
+    ? "#22c55e"
+    : person
+    ? "#38bdf8"
+    : colorForClass(d.class_name);
   const style: React.CSSProperties = {
     position: "absolute",
     left: `${d.bbox.x * 100}%`,
@@ -353,9 +383,19 @@ function BBox({ d }: { d: DetectionEvent }) {
     boxShadow: `0 0 0 1px rgba(0,0,0,0.5)`,
     pointerEvents: "none",
   };
-  const label = isPlate
-    ? d.attributes?.plate ?? "plate"
-    : `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
+  // Label priority: plate text → matched-person name + similarity →
+  // class + detection confidence.
+  let label: string;
+  if (isPlate) {
+    label = d.attributes?.plate ?? "plate";
+  } else if (person) {
+    const sim = d.attributes?.similarity;
+    label = sim
+      ? `${person} ${Math.round(Number(sim) * 100)}%`
+      : person;
+  } else {
+    label = `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
+  }
   return (
     <div style={style}>
       <div

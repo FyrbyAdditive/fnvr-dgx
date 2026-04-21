@@ -161,11 +161,129 @@ RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
         /opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_lpr.so \
   && ldconfig
 
+# Face ID:
+# - Detector: RetinaFace MobileNet-0.25 (biubug6/Pytorch_Retinaface,
+#   MIT). Runs as an SGIE on YOLO26's person-class crops (process-mode=2,
+#   operate-on-gie-id=1, operate-on-class-ids=0), so we don't re-detect
+#   the whole frame and ArcFace only runs where a person actually is.
+#   No pre-baked ONNX is publicly hosted that matches the parser's
+#   expected tensor-output names, so we export from biubug6's .pth at
+#   build time (~1 minute) and rename outputs to bbox/conf/lmk.
+# - Parser: zhouyuchong/face-recognition-deepstream's retinaface
+#   custom nvinfer parser (MIT). Patched at build time to (a) strip
+#   landmark writes that require a forked gst-nvinfer and (b) soften
+#   NMS IoU from 0.1 to 0.45.
+# - Embedder: ArcFace R100 ONNX from insightface's buffalo_l pack,
+#   mirrored on immich-app's HuggingFace space. Apache 2.0.
+ARG RETINAFACE_REPO=https://github.com/biubug6/Pytorch_Retinaface.git
+ARG RETINAFACE_WEIGHTS_URL=https://huggingface.co/LPX55/retinaface/resolve/main/model.pth
+ARG ARCFACE_URL=https://huggingface.co/immich-app/buffalo_l/resolve/main/recognition/model.onnx
+RUN set -eux; \
+    mkdir -p /opt/fnvr/faceid; \
+    wget -q "${ARCFACE_URL}" -O /opt/fnvr/faceid/arcface.onnx; \
+    apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*; \
+    # arm64 PyPI has plain torch 2.3.0 (CPU-only on arm64 by default). \
+    # The dedicated +cpu index only hosts x86_64 arm wheels from 2.6+. \
+    pip3 install --no-cache-dir --break-system-packages \
+        'torch==2.3.0' 'torchvision==0.18.0' 'onnx==1.16.0' numpy; \
+    git clone --depth 1 "${RETINAFACE_REPO}" /tmp/rf; \
+    mkdir -p /tmp/rf/weights; \
+    wget -q "${RETINAFACE_WEIGHTS_URL}" -O /tmp/rf/weights/mobilenet0.25_Final.pth; \
+    # Patch: biubug6 loads MobileNetV1 ImageNet pretrain by default at \
+    # import time; disable because we're loading a full retrained .pth. \
+    sed -i "s/'pretrain': True/'pretrain': False/g" /tmp/rf/data/config.py; \
+    # Patch: bump opset to 13 for TensorRT 10.x compatibility, and \
+    # force --long_side to parse as int (biubug6's add_argument omits \
+    # type=int so CLI values are strings and break torch.randn). \
+    sed -i "s/opset_version=[0-9]\\+/opset_version=13/g" /tmp/rf/convert_to_onnx.py; \
+    sed -i "s/--long_side', default=640/--long_side', type=int, default=640/g" /tmp/rf/convert_to_onnx.py; \
+    cd /tmp/rf && python3 convert_to_onnx.py --trained_model weights/mobilenet0.25_Final.pth --network mobile0.25; \
+    python3 - <<'PY'
+import onnx
+m = onnx.load("/tmp/rf/FaceDetector.onnx")
+rename = {}
+# biubug6 emits: output0 (bbox), and auto-numbered conf + lmk.
+# Pick by output tensor shape: last dim 4 → bbox, 2 → conf, 10 → lmk.
+for o in m.graph.output:
+    dims = [d.dim_value for d in o.type.tensor_type.shape.dim]
+    last = dims[-1] if dims else 0
+    if last == 4:
+        rename[o.name] = "bbox"
+    elif last == 2:
+        rename[o.name] = "conf"
+    elif last == 10:
+        rename[o.name] = "lmk"
+for o in m.graph.output:
+    o.name = rename[o.name]
+for node in m.graph.node:
+    node.input[:] = [rename.get(i, i) for i in node.input]
+    node.output[:] = [rename.get(o, o) for o in node.output]
+onnx.save(m, "/opt/fnvr/faceid/face_detector.onnx")
+print("face_detector.onnx written with outputs:", [o.name for o in m.graph.output])
+PY
+RUN set -eux; \
+    rm -rf /tmp/rf /root/.cache/pip; \
+    pip3 uninstall -y --break-system-packages torch torchvision onnx numpy || true
+
+# Retinaface custom parser — clone zhouyuchong's parser, patch it to
+# compile cleanly against stock DS 7.1 (drop landmark fields that only
+# exist on the zhouyuchong gst-nvinfer fork) and soften NMS.
+ARG RF_PARSER_COMMIT=main
+RUN set -eux; \
+    git clone --depth 1 --branch ${RF_PARSER_COMMIT} \
+        https://github.com/zhouyuchong/face-recognition-deepstream.git /tmp/rf-parser; \
+    cd /tmp/rf-parser/models/retinaface/nvdsinfer_customparser; \
+    # Soften NMS IoU to 0.45 (stock value 0.1 is too aggressive and \
+    # drops half the valid faces). \
+    sed -i 's/nms_threshold = 0\.1/nms_threshold = 0.45/g' nvdsparse_retinaface.cpp; \
+    # Strip landmark writes — NvDsInferObjectDetectionInfo on stock \
+    # DS 7.1 has no numLmks / landmark members. We don't need \
+    # landmarks because ArcFace does its own implicit alignment. \
+    sed -i '/result\.numLmks/d; /result\.landmark\[/d' nvdsparse_retinaface.cpp; \
+    # Makefile's NVDS_VERSION uses `:=` so an env-var prefix won't \
+    # override it. Pass it as a make variable instead (command-line \
+    # vars win over `:=`). Also drop -lnvparsers — the library was \
+    # removed in TensorRT 10.x that ships with DS 7.1. \
+    sed -i 's/-lnvparsers//g' Makefile; \
+    make CUDA_VER=12.6 NVDS_VERSION=7.1; \
+    install -Dm755 libnvdsinfer_custom_impl_retinaface.so \
+        /usr/local/lib/fnvr/libnvdsinfer_custom_impl_retinaface.so; \
+    rm -rf /tmp/rf-parser; \
+    ldconfig
+
 WORKDIR /src
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs
 
 WORKDIR /src/apps/pipeline-supervisor
+# libnvbufsurface.so and libnvbufsurftransform.so on Jetson ship as
+# dangling symlinks at image-build time (they point into
+# /usr/lib/aarch64-linux-gnu/tegra/, bind-mounted only at container
+# start). The pipeline-supervisor link step needs these libs to
+# resolve NvBufSurface* / NvBufSurfTransform* symbols used by the
+# in-probe face cropper. Replace the dangling symlinks with tiny
+# stub .so files that export the exact symbols we call — ld is
+# satisfied at build time and the runtime ldconfig (driven by the
+# tegra ld-path written in pipeline-entrypoint.sh) resolves the
+# symbol calls into the real Tegra libs. All stub bodies return 0
+# so a mis-deployed image without tegra libs fails loud rather
+# than segfaulting.
+RUN set -eux; \
+    printf '%s\n' \
+      'int NvBufSurfaceCreate(void**a,unsigned b,void*c){(void)a;(void)b;(void)c;return -1;}' \
+      'int NvBufSurfaceDestroy(void*a){(void)a;return -1;}' \
+      'int NvBufSurfaceMap(void*a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return -1;}' \
+      'int NvBufSurfaceUnMap(void*a,int b,int c){(void)a;(void)b;(void)c;return -1;}' \
+      'int NvBufSurfaceSyncForCpu(void*a,int b,int c){(void)a;(void)b;(void)c;return -1;}' \
+      > /tmp/libnvbufsurface_stub.c; \
+    rm -f /opt/nvidia/deepstream/deepstream/lib/libnvbufsurface.so; \
+    gcc -shared -fPIC -o /opt/nvidia/deepstream/deepstream/lib/libnvbufsurface.so /tmp/libnvbufsurface_stub.c; \
+    printf '%s\n' \
+      'int NvBufSurfTransform(void*a,void*b,void*c){(void)a;(void)b;(void)c;return -1;}' \
+      > /tmp/libnvbufsurftransform_stub.c; \
+    rm -f /opt/nvidia/deepstream/deepstream/lib/libnvbufsurftransform.so; \
+    gcc -shared -fPIC -o /opt/nvidia/deepstream/deepstream/lib/libnvbufsurftransform.so /tmp/libnvbufsurftransform_stub.c; \
+    rm -f /tmp/libnvbufsurface_stub.c /tmp/libnvbufsurftransform_stub.c
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build --parallel \
   && install -Dm755 build/pipeline-supervisor /usr/local/bin/pipeline-supervisor

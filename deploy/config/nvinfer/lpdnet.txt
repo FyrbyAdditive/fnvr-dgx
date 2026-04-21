@@ -8,8 +8,11 @@
 [property]
 gpu-id=0
 net-scale-factor=0.0039215697906911373
-onnx-file=/opt/fnvr/anpr/LPDNet_usa.onnx
-model-engine-file=/var/lib/fnvr/models/anpr/LPDNet_usa.engine
+onnx-file=/var/lib/fnvr/models/anpr/LPDNet_usa.onnx
+# Match nvinfer's auto-derived name so subsequent boots reuse the
+# built engine (the configured path otherwise never matches what
+# nvinfer writes and each restart forces a rebuild).
+model-engine-file=/var/lib/fnvr/models/anpr/LPDNet_usa.onnx_b16_gpu0_fp16.engine
 labelfile-path=/etc/fnvr/nvinfer/lpdnet.labels
 batch-size=16
 # FP16. INT8 LPDNet calibration not distributed; stay FP16 for now.

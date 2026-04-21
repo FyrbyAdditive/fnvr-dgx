@@ -2,14 +2,30 @@
 
 DeepStream `nvinfer` plugin configs for the bundled model slots.
 
-| Slot | File | Classes | First-run | Notes |
-|------|------|---------|-----------|-------|
-| Default primary | `peoplenet.txt` | person, bag, face | Builds INT8 engine from TAO ETLT in DS samples | TAO 2.6, well-tuned for CCTV-height cameras |
-| Traffic primary | `trafficcamnet.txt` | car, bicycle, person, roadsign | Same | Good for driveway / street-facing cameras |
-| General primary | `yolo11.txt` | 80 (COCO) | Needs `/var/lib/fnvr/models/yolo11s.onnx` placed first | YOLO11 = latest stable Ultralytics line (2025). FP16 on GPU. |
+## Primary object detector
 
-Per-camera slot selection lives in Postgres (`cameras.primary_model` column — lands in a migration with M3). For M2, the process-wide slot is chosen via `FNVR_INFER_CONFIG`.
+| File | Used when | Notes |
+|---|---|---|
+| `yolo26.txt.template` | `detector.yolo26_variant` is set (default) | Rendered by the entrypoint into `yolo26.effective.txt` with the chosen variant (n/s/m/l/x) + precision (fp16/int8). **This is the active detector in all current deploys.** |
+| `yolo11.txt` | Legacy / fallback | Needs `/var/lib/fnvr/models/yolo11s.onnx` placed first. Kept as a drop-in for dev experiments. |
+| `peoplenet.txt` | Legacy | TAO 2.6 PeopleNet (person + bag + face). |
+| `trafficcamnet.txt` | Legacy | TAO TrafficCamNet (car + bicycle + person + roadsign). |
 
-## Newer-than-YOLO11
+## Secondary detectors (SGIEs)
 
-The `yolo11.txt` config is structurally identical to anything from v8 onwards — only `onnx-file`, `num-detected-classes`, and optionally the custom parser lib change. To drop in a newer model, copy this file, update those fields, point `model-engine-file` somewhere new, and select it via `FNVR_INFER_CONFIG`.
+| File | Used when | Notes |
+|---|---|---|
+| `lpdnet.txt` + `lpdnet.labels` | `settings.detector.anpr_enabled = true` | TAO LPDNet for US plates. |
+| `lprnet.txt` + `lprnet.labels` | Same as LPDNet | TAO LPRNet OCR. US format. |
+| `scrfd.txt` + `scrfd.labels` | `settings.detector.face_id_enabled = true` | Face detector, produces box + 5 landmarks. |
+| `arcface.txt` | Same as SCRFD | 512-d face embedder. |
+
+## Tracker
+
+`tracker_NvDCF.yml` — NvDCF with tuned minimum object dimensions. Ships with every pipeline instance.
+
+## Swapping detectors
+
+The yolo26 template renders to `yolo26.effective.txt` on container start, reading `detector.yolo26_variant` + `detector.yolo26_precision` from the `settings` table via the `/api/v1/internal/detector` endpoint. To drop in a different ONNX, copy the template, edit `onnx-file` + `num-detected-classes` + the custom parser, and set `FNVR_INFER_CONFIG` to point at it.
+
+INT8 is currently blocked on a TRT 10.3 bug — see [docs/operations/known-issues.md](../../../docs/operations/known-issues.md). The template + calibration path remain in place, waiting for JetPack 7.2.

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,7 +19,10 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
+	"github.com/fnvr/fnvr/apps/api-server/internal/metrics"
+	"github.com/fnvr/fnvr/apps/api-server/internal/mlworker"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
+	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
 	"github.com/fnvr/fnvr/apps/api-server/internal/plates"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
@@ -47,6 +51,8 @@ type Server struct {
 	natsPublish  func(subject string, data []byte) error
 	detections   *detections.Store
 	plates       *plates.Store
+	persons      *persons.Store
+	mlWorker     *mlworker.Client
 }
 
 type Deps struct {
@@ -67,6 +73,8 @@ type Deps struct {
 	NatsPublish   func(subject string, data []byte) error
 	Detections    *detections.Store
 	Plates        *plates.Store
+	Persons       *persons.Store
+	MLWorker      *mlworker.Client
 }
 
 func New(d Deps) *Server {
@@ -88,6 +96,8 @@ func New(d Deps) *Server {
 		natsPublish:  d.NatsPublish,
 		detections:   d.Detections,
 		plates:       d.Plates,
+		persons:      d.Persons,
+		mlWorker:     d.MLWorker,
 	}
 }
 
@@ -97,11 +107,18 @@ func (s *Server) Handler() http.Handler {
 	// Public routes.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/system/info", s.handleSystemInfo)
+	// Prometheus scrape endpoint — unauthenticated so scrapers don't
+	// need cookies. Scoped to the internal bridge by compose; gate on
+	// bind address for a future hosted deploy.
+	mux.Handle("GET /metrics", metrics.Handler())
 	// Internal, unauthenticated endpoints for the pipeline container's
 	// entrypoint. Read-only; safe because the docker bridge isolates
 	// them. In a multi-tenant hosted deploy these would need IP gating.
 	if s.settings != nil {
 		mux.HandleFunc("GET /api/v1/internal/detector", s.handleGetDetector)
+		// Pipeline entrypoint POSTs {ok, engine_size, table_sha256,
+		// err} here after each trtexec calibration attempt.
+		mux.HandleFunc("POST /api/v1/internal/detector/calibration_report", s.handleInternalCalibrationReport)
 	}
 	if s.cameras != nil {
 		mux.HandleFunc("GET /api/v1/internal/cameras", s.handleInternalListCameras)
@@ -118,6 +135,7 @@ func (s *Server) Handler() http.Handler {
 		protected.HandleFunc("GET /api/v1/me", s.handleMe)
 
 		protected.HandleFunc("GET /api/v1/system/local-devices", s.handleLocalDevices)
+		protected.HandleFunc("GET /api/v1/system/storage", s.handleSystemStorage)
 
 		// Reads — allowed for any authenticated user (admin or viewer).
 		// Writes — wrapped in auth.AdminFunc so viewers get 403.
@@ -127,6 +145,7 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("DELETE /api/v1/cameras/{id}", auth.AdminFunc(s.handleDeleteCamera))
 		protected.Handle("PATCH /api/v1/cameras/{id}/detectors", auth.AdminFunc(s.handleUpdateCameraDetectors))
 		protected.Handle("PATCH /api/v1/cameras/{id}/classes", auth.AdminFunc(s.handleUpdateCameraClasses))
+		protected.Handle("PATCH /api/v1/cameras/{id}/storage", auth.AdminFunc(s.handleUpdateCameraStorage))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -176,6 +195,35 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/plates/recent", s.handleRecentPlates)
 		}
 
+		if s.persons != nil {
+			// Reads viewable by any authenticated user; writes admin-only.
+			protected.HandleFunc("GET /api/v1/persons", s.handleListPersons)
+			protected.Handle("POST /api/v1/persons", auth.AdminFunc(s.handleCreatePerson))
+			protected.Handle("PATCH /api/v1/persons/{id}", auth.AdminFunc(s.handleUpdatePerson))
+			protected.Handle("DELETE /api/v1/persons/{id}", auth.AdminFunc(s.handleDeletePerson))
+			protected.HandleFunc("GET /api/v1/persons/{id}/matches", s.handlePersonMatches)
+			protected.HandleFunc("GET /api/v1/persons/{id}/embeddings", s.handleListPersonEmbeddings)
+			protected.Handle("POST /api/v1/persons/{id}/embeddings", auth.AdminFunc(s.handleAddPersonEmbedding))
+			protected.Handle("POST /api/v1/persons/{id}/embeddings_bulk", auth.AdminFunc(s.handleAddPersonEmbeddingsBulk))
+			protected.Handle("DELETE /api/v1/persons/{id}/embeddings/{embedding_id}", auth.AdminFunc(s.handleDeletePersonEmbedding))
+			protected.Handle("POST /api/v1/persons/{id}/embeddings/delete_bulk", auth.AdminFunc(s.handleBulkDeletePersonEmbeddings))
+			protected.HandleFunc("GET /api/v1/faces/recent", s.handleRecentFaces)
+			protected.HandleFunc("GET /api/v1/faces/thumbnail/{detection_id}", s.handleFaceThumbnail)
+			protected.Handle("POST /api/v1/faces/dismiss", auth.AdminFunc(s.handleDismissFaces))
+			// Photo-upload enrolment + unknown-face clustering +
+			// cluster review surface. All admin-gated except the
+			// list + status reads.
+			protected.Handle("POST /api/v1/persons/upload_enrol", auth.AdminFunc(s.handleUploadEnrol))
+			protected.HandleFunc("GET /api/v1/clusters", s.handleListClusters)
+			protected.HandleFunc("GET /api/v1/clusters/status", s.handleGetClusterStatus)
+			protected.HandleFunc("GET /api/v1/clusters/{id}/members", s.handleListClusterMembers)
+			protected.Handle("POST /api/v1/clusters/run_now", auth.AdminFunc(s.handleClusterRunNow))
+			protected.Handle("POST /api/v1/clusters/{id}/enrol", auth.AdminFunc(s.handleEnrolCluster))
+			protected.Handle("DELETE /api/v1/clusters/{id}", auth.AdminFunc(s.handleDeleteCluster))
+			protected.Handle("POST /api/v1/clusters/{id}/dismiss_not_a_face", auth.AdminFunc(s.handleDismissClusterAsNotAFace))
+			protected.HandleFunc("GET /api/v1/ml/drift/status", s.handleDriftStatus)
+		}
+
 		if s.notifs != nil {
 			protected.HandleFunc("GET /api/v1/notifications/channels", s.handleListChannels)
 			protected.Handle("POST /api/v1/notifications/channels", auth.AdminFunc(s.handleCreateChannel))
@@ -193,6 +241,10 @@ func (s *Server) Handler() http.Handler {
 		if s.settings != nil {
 			protected.HandleFunc("GET /api/v1/settings/detector", s.handleGetDetector)
 			protected.Handle("PUT /api/v1/settings/detector", auth.AdminFunc(s.handleUpdateDetector))
+			// yolo26 INT8 calibration workflow. Read is viewer-safe; the
+			// sampler trigger is admin-only.
+			protected.HandleFunc("GET /api/v1/settings/detector/calibration", s.handleGetCalibrationStatus)
+			protected.Handle("POST /api/v1/settings/detector/prepare_calibration", auth.AdminFunc(s.handlePrepareCalibration))
 			protected.HandleFunc("GET /api/v1/settings/class_mutes", s.handleGetClassMutes)
 			protected.Handle("PUT /api/v1/settings/class_mutes", auth.AdminFunc(s.handleUpdateClassMutes))
 			protected.HandleFunc("GET /api/v1/settings/ha", s.handleGetHAConfig)
@@ -218,6 +270,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/api/v1/auth/logout", guarded)
 		mux.Handle("/api/v1/me", guarded)
 		mux.Handle("/api/v1/system/local-devices", guarded)
+		mux.Handle("/api/v1/system/storage", guarded)
 		mux.Handle("/api/v1/cameras", guarded)
 		mux.Handle("/api/v1/cameras/", guarded)
 		if s.rules != nil {
@@ -241,6 +294,16 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/plate_hotlist/", guarded)
 			mux.Handle("/api/v1/plates/recent", guarded)
 		}
+		if s.persons != nil {
+			mux.Handle("/api/v1/persons", guarded)
+			mux.Handle("/api/v1/persons/", guarded)
+			mux.Handle("/api/v1/faces/recent", guarded)
+			mux.Handle("/api/v1/faces/thumbnail/", guarded)
+			mux.Handle("/api/v1/faces/dismiss", guarded)
+			mux.Handle("/api/v1/clusters", guarded)
+			mux.Handle("/api/v1/clusters/", guarded)
+			mux.Handle("/api/v1/ml/drift/status", guarded)
+		}
 		if s.notifs != nil {
 			mux.Handle("/api/v1/notifications/channels", guarded)
 			mux.Handle("/api/v1/notifications/channels/", guarded)
@@ -250,6 +313,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		if s.settings != nil {
 			mux.Handle("/api/v1/settings/detector", guarded)
+			mux.Handle("/api/v1/settings/detector/", guarded)
 			mux.Handle("/api/v1/settings/class_mutes", guarded)
 			mux.Handle("/api/v1/settings/ha", guarded)
 		}
@@ -263,7 +327,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/api/v1/users/", guarded)
 	}
 
-	return loggingMiddleware(corsMiddleware(mux))
+	return loggingMiddleware(corsMiddleware(metrics.Middleware(mux)))
 }
 
 // --- handlers ---
@@ -373,13 +437,23 @@ func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {
 // decorateCameras attaches the latest-known pipeline state to each camera
 // ("starting" | "running" | "failed" | "unknown"). This is derived from
 // NATS so it reflects current reality rather than the DB row.
+//
+// Also carries `last_heartbeat_at` (nil if the tracker has never heard
+// from the camera) so the UI can distinguish "never reported" from
+// "heartbeat went stale X minutes ago" — the latter is the diagnostic
+// we kept missing.
 func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[string]any {
 	out := make([]map[string]any, 0, len(cams))
 	for _, c := range cams {
 		state := "unknown"
+		var lastHeartbeat *time.Time
 		if states != nil {
 			if st, ok := states.State(c.ID); ok {
 				state = st
+			}
+			if _, stamped, known := states.StateDetail(c.ID); known {
+				t := stamped
+				lastHeartbeat = &t
 			}
 		}
 		out = append(out, map[string]any{
@@ -399,6 +473,7 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			"created_at":               c.CreatedAt,
 			"updated_at":               c.UpdatedAt,
 			"state":                    state,
+			"last_heartbeat_at":        lastHeartbeat,
 		})
 	}
 	return out
@@ -480,6 +555,40 @@ func (s *Server) handleUpdateCameraDetectors(w http.ResponseWriter, r *http.Requ
 	}
 	if err != nil {
 		slog.Error("update camera detectors", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateCameraStorage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RetentionDays *int `json:"retention_days,omitempty"`
+		QuotaGB       *int `json:"quota_gb,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if body.RetentionDays == nil && body.QuotaGB == nil {
+		http.Error(w, "retention_days or quota_gb required", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	err := s.cameras.UpdateStorage(r.Context(), id, body.RetentionDays, body.QuotaGB)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		// Validation errors surface as 400; anything else is internal.
+		if strings.HasPrefix(err.Error(), "retention_days") ||
+			strings.HasPrefix(err.Error(), "quota_gb") ||
+			strings.HasPrefix(err.Error(), "no fields") {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		slog.Error("update camera storage", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -648,12 +757,49 @@ func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name, definition required", http.StatusBadRequest)
 		return
 	}
+	if msg := validateRuleDefinition(rr.Definition); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
 	out, err := s.rules.CreateRule(r.Context(), rr)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusCreated, out)
+}
+
+// validateRuleDefinition rejects obviously-malformed rule JSON so the
+// UI gets immediate feedback instead of the engine silently dropping
+// the rule at reload time. Returns "" on OK, else a short message
+// suitable for a 400 body. Slice 1 only validates sequence rules
+// (new shape); existing single-camera rules pass through unchanged.
+func validateRuleDefinition(raw json.RawMessage) string {
+	var probe struct {
+		Kind      string `json:"kind"`
+		WindowSec int    `json:"window_sec"`
+		Steps     []struct {
+			CameraID string `json:"camera_id"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return "definition must be a JSON object"
+	}
+	if probe.Kind != "sequence" {
+		return ""
+	}
+	if len(probe.Steps) < 2 {
+		return "sequence rule needs at least 2 steps"
+	}
+	if probe.WindowSec <= 0 {
+		return "sequence rule needs window_sec > 0"
+	}
+	for i, s := range probe.Steps {
+		if s.CameraID == "" {
+			return fmt.Sprintf("step %d: camera_id is required", i)
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {

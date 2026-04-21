@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fnvr/fnvr/apps/event-processor/internal/metrics"
 	"github.com/fnvr/fnvr/apps/event-processor/internal/rules"
 )
 
@@ -22,6 +23,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Prometheus scrape endpoint on an internal port. No auth — the
+	// compose network is private; a hosted deploy would gate this on
+	// bind address.
+	go metrics.Serve(ctx, envOr("FNVR_METRICS_ADDR", ":9091"))
 
 	// Loop with backoff — the schema is applied by api-server on its own
 	// start, so we may race it on first boot. Retrying beats fataling.
