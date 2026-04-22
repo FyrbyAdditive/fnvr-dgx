@@ -88,6 +88,22 @@ ANPR and face-ID run as secondary `nvinfer` elements chained after the primary d
 
 Per-camera enable/disable lives in `cameras.enabled_detectors` (a text array) + `settings.detector.anpr_enabled` / `settings.detector.face_id_enabled` (process-wide kill switches). The pipeline rebuilds its graph when those settings change.
 
+## Watchdogs + hard-exit policy
+
+Three independent failure-detection paths in each worker. All converge on `std::_Exit(3)` — bypass at-exit destructors that might themselves deadlock on the same stuck resource, and let the supervisor's existing respawn + backoff + flapping-detection handle recovery.
+
+1. **Startup PLAYING watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp) `stop_watcher` thread). Faults and publishes `failed` if the pipeline hasn't reached `GST_STATE_PLAYING` within 60 s of `Start()`. Catches `rtspsrc` SETUP hangs that `tcp-timeout=15s` doesn't catch.
+2. **Bus error** ([pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `BusHandler`). On any `GST_MESSAGE_ERROR` or `GST_MESSAGE_EOS`, publishes `failed` and hard-exits. Does **not** call `gst_element_set_state(NULL)` — that path blocked the process for 37 min once when an NvMedia element was wedged. Respawn is faster than graceful shutdown anyway, and a broken pipeline has nothing worth draining.
+3. **Data-flow watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp) `flow_watchdog` thread + [pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `AttachFlowCounter`). A pad probe on the record-branch `h264parse` (`recparse`) bumps an atomic counter on every buffer; the watchdog samples every 5 s and hard-exits if the counter hasn't advanced in 20 s while the pipeline is `PLAYING`. Catches silent stalls — the case where the bus never fires ERROR because the wedge is inside an NVIDIA library syscall.
+
+Log trail (look for these in `docker logs fnvr-pipeline-1 | grep worker`):
+- `worker[X]: did not reach PLAYING within 60s — faulting` — startup watchdog
+- `worker[X]: hard-exit rc=3 (bus error)` — bus error fired
+- `worker[X]: hard-exit rc=3 (EOS)` — source stream ended
+- `worker[X]: data-flow stalled 20s — hard exit rc=3` — silent stall
+
+In all cases the supervisor respawns via the fork+exec loop in [supervisor.cpp](../../apps/pipeline-supervisor/src/supervisor.cpp), and the flapping detector (`≥3 exits in 60 s → publish "failed"`) prevents a reliably-broken source from silently respawning forever.
+
 ## Capacity
 
 With YOLO26x FP16 on an Orin AGX 64 GB at nvpmodel MAXN, 3 × 1080p cameras at 10 fps ingest use roughly half the GPU. Adding ANPR + face-ID roughly doubles the load. Real numbers come from `tegrastats` + `/metrics`; the [benchmark tool](../../tools/benchmark/) (not yet shipped) will automate this.

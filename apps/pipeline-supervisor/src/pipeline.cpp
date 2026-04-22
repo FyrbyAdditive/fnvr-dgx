@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -618,6 +619,29 @@ void AttachKeyframeGate(GstElement* pipeline, const char* element_name) {
     gst_object_unref(el);
 }
 
+// FlowCounter probe. User_data is a pointer to the
+// std::atomic<uint64_t> on the owning pipeline instance; the probe
+// runs on every buffer that flows through the src pad and bumps
+// the count. Sampled by main.cpp's flow_watchdog thread.
+GstPadProbeReturn FlowCounterProbe(GstPad*, GstPadProbeInfo*, gpointer user) {
+    auto* counter = static_cast<std::atomic<std::uint64_t>*>(user);
+    counter->fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
+}
+
+void AttachFlowCounter(GstElement* pipeline, const char* element_name,
+                       std::atomic<std::uint64_t>* counter) {
+    GstElement* el = gst_bin_get_by_name(GST_BIN(pipeline), element_name);
+    if (!el) return;
+    GstPad* src = gst_element_get_static_pad(el, "src");
+    if (src) {
+        gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
+                          &FlowCounterProbe, counter, nullptr);
+        gst_object_unref(src);
+    }
+    gst_object_unref(el);
+}
+
 }  // namespace
 
 GstElement* SingleCameraPipeline::BuildPipeline() {
@@ -943,7 +967,40 @@ p << "rtspsrc location=" << url
         AttachKeyframeGate(pipeline, "recparse");
     }
 
+    // Data-flow counter on the record-parse src pad. Bumped for every
+    // encoded frame that reaches the recording mux. main.cpp's
+    // flow_watchdog samples BuffersPassed() every 5 s and hard-exits
+    // the worker if it doesn't advance for 20 s while Playing() is
+    // true. Catches silent stalls (NvMedia wedge, thread deadlock)
+    // that don't fire a bus ERROR.
+    AttachFlowCounter(pipeline, "recparse", &buffersPassed_);
+
     return pipeline;
+}
+
+// abortWorkerAfterFault publishes {"state":"failed"} with a bounded
+// flush, then _exits the process so the parent supervisor respawns
+// with a clean slate. Used for bus ERROR/EOS and (from main.cpp) the
+// data-flow watchdog. We don't try to stop the pipeline gracefully —
+// today's incident was a 37-minute zombie worker caused by
+// gst_element_set_state(NULL) blocking forever on a wedged NvMedia
+// element, which defeats the whole point of having a supervisor.
+[[noreturn]] static void abortWorkerAfterFault(const std::string& cam_id,
+                                               NatsPublisher* nats,
+                                               const char* reason) {
+    std::cerr << "worker[" << cam_id << "]: hard-exit rc=3 ("
+              << reason << ")\n";
+    if (nats) {
+        const std::string subj = "fnvr.state.camera." + cam_id;
+        const std::string payload =
+            "{\"camera_id\":\"" + cam_id + "\",\"state\":\"failed\"}";
+        // flush=true so the message reaches the broker before we
+        // _exit. 2 s is plenty on a localhost bridge; if NATS itself
+        // is the problem the publish returns quickly with an error
+        // and we exit anyway.
+        nats->Publish(subj, payload, /*flush=*/true);
+    }
+    std::_Exit(3);
 }
 
 gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer user_data) {
@@ -951,21 +1008,23 @@ gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer use
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_EOS:
             std::cerr << "pipeline[" << self->cam_.id << "]: EOS\n";
-            self->faulted_ = true;
-            break;
+            self->faulted_.store(true);
+            abortWorkerAfterFault(self->cam_.id, self->nats_, "EOS");
         case GST_MESSAGE_ERROR: {
             GError* err = nullptr;
             gchar* dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
+            std::string msg_str = err ? err->message : "?";
             std::cerr << "pipeline[" << self->cam_.id << "] error: "
-                      << (err ? err->message : "?") << "\n";
+                      << msg_str << "\n";
             if (err) g_error_free(err);
             g_free(dbg);
-            self->faulted_ = true;
-            if (self->pipeline_) {
-                gst_element_set_state(self->pipeline_, GST_STATE_NULL);
-            }
-            break;
+            self->faulted_.store(true);
+            // Do NOT gst_element_set_state(NULL) here — that blocks
+            // indefinitely when a downstream element is wedged inside
+            // NvMedia (the failure mode we're recovering from).
+            // Hard-exit and let the supervisor respawn.
+            abortWorkerAfterFault(self->cam_.id, self->nats_, "bus error");
         }
         case GST_MESSAGE_STATE_CHANGED: {
             if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->pipeline_)) {

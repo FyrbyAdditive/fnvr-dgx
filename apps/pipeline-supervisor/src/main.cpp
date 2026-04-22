@@ -151,6 +151,45 @@ int main(int argc, char** argv) {
             g_main_loop_quit(loop);
         });
 
+        // Data-flow watchdog. Catches silent stalls where the GStreamer
+        // bus never fires ERROR — typical cause is an NvMedia element
+        // wedged inside a kernel syscall (VIC transform, decoder)
+        // where the GStreamer pipeline thinks it's still PLAYING but
+        // no buffers actually flow. We saw this in the wild: house-side
+        // sat as a zombie for 37 min until an operator SIGKILL'd it.
+        //
+        // Samples BuffersPassed() every 5 s; if the count hasn't
+        // advanced for 20 s WHILE Playing() is true, publish failed +
+        // _exit(3) directly. We bypass the bus handler here because the
+        // whole point is that the bus is silent.
+        std::thread flow_watchdog([&p, &cam, subj, &nats] {
+            // Don't start until the pipeline reaches PLAYING so
+            // startup's empty counter doesn't trip us.
+            while (!g_stop && !p.Faulted() && !p.Playing()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            std::uint64_t last_seen = p.BuffersPassed();
+            auto last_progress = std::chrono::steady_clock::now();
+            const auto stall_threshold = std::chrono::seconds(20);
+            while (!g_stop && !p.Faulted()) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                std::uint64_t now_count = p.BuffersPassed();
+                if (now_count != last_seen) {
+                    last_seen = now_count;
+                    last_progress = std::chrono::steady_clock::now();
+                    continue;
+                }
+                if (std::chrono::steady_clock::now() - last_progress > stall_threshold) {
+                    std::cerr << "worker[" << cam.id
+                              << "]: data-flow stalled 20s — hard exit rc=3\n";
+                    std::string payload = "{\"camera_id\":\"" + cam.id +
+                        "\",\"state\":\"failed\"}";
+                    nats.Publish(subj, payload, /*flush=*/true);
+                    std::_Exit(3);
+                }
+            }
+        });
+
         // Heartbeat: republish "running" every 30s so the api-server's
         // per-camera state stays fresh in the 10-minute window. The
         // initial "running" publish in pipeline.cpp on GST_STATE_PLAYING
@@ -172,8 +211,13 @@ int main(int argc, char** argv) {
         g_source_remove(watch_id);
         if (stop_watcher.joinable()) stop_watcher.join();
         if (heartbeat.joinable()) heartbeat.join();
+        if (flow_watchdog.joinable()) flow_watchdog.join();
         g_main_loop_unref(loop);
 
+        // Clean exit path (operator stopped the supervisor). For
+        // fault paths we hard-exit from the bus handler / watchdog
+        // threads directly; this is only reached on SIGTERM-to-stop
+        // or a voluntary Faulted() that we set elsewhere.
         p.Stop();
         gst_deinit();
         return p.Faulted() ? 3 : 0;
