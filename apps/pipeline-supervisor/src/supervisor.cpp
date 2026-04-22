@@ -234,6 +234,20 @@ void Supervisor::workerMain(Worker* w) {
     // publish.
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
 
+    // Carries across loop iterations: when the previous worker exited
+    // as part of an hourly segment rotation, tell the next child via
+    // an extra argv so it suppresses its "starting" state publish. The
+    // old `running` message stays live in the JetStream last-value
+    // stream throughout the ~30 s respawn, so the UI doesn't flicker.
+    bool rotation_respawn = false;
+
+    // Per-camera deterministic stagger added onto the hour boundary so
+    // three cameras don't rotate simultaneously. Up to 120 s after
+    // HH:00. Belt-and-braces behind the silent-rotation publish: even
+    // if that path regresses, a user sees one tile flash, not three.
+    const auto stagger = std::chrono::seconds(
+        std::hash<std::string>{}(w->cam.id) % 120);
+
     while (!stop_ && !w->stop) {
         // Defensive: if a prior worker died mid-engine-serialize (e.g.
         // SIGTERM from hourly rotation during a first-time TRT build),
@@ -257,17 +271,27 @@ void Supervisor::workerMain(Worker* w) {
         if (pid == 0) {
             // Child: exec the worker form. On exec failure, _exit so we
             // don't run the supervisor destructor and double-close resources.
+            // When the previous worker died of hourly rotation, pass
+            // --rotation so the child skips the "starting" publish.
             const char* argv0 = "/usr/local/bin/pipeline-supervisor";
             const char* record_mode = w->cam.recording_mode.empty()
                 ? "continuous"
                 : w->cam.recording_mode.c_str();
-            execl(argv0, argv0, "--worker",
-                  w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
-                  (char*)nullptr);
+            if (rotation_respawn) {
+                execl(argv0, argv0, "--worker",
+                      w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
+                      "--rotation", (char*)nullptr);
+            } else {
+                execl(argv0, argv0, "--worker",
+                      w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
+                      (char*)nullptr);
+            }
             std::cerr << "worker[" << w->cam.id << "]: execl failed: "
                       << strerror(errno) << "\n";
             _exit(127);
         }
+        // Rotation flag consumed by the exec above.
+        rotation_respawn = false;
 
         // Parent: track the child PID so Stop() can kill it.
         w->child_pid = pid;
@@ -277,8 +301,13 @@ void Supervisor::workerMain(Worker* w) {
         // of the next hour so the child writes into the new YYYY/MM/DD/HH
         // directory. Without this, a worker that's up for 24h writes a
         // 100+ GB rec.mp4 into its birth hour's folder.
+        //
+        // rotate_at = start_hour + 1h + stagger. The stagger (up to
+        // 120 s, deterministic by cam.id) means three cameras don't all
+        // rotate at the same wall-clock instant.
         auto start_hour = std::chrono::time_point_cast<std::chrono::hours>(
             std::chrono::system_clock::now());
+        auto rotate_at = start_hour + std::chrono::hours(1) + stagger;
         bool hourly_rotate = false;
 
         // Wait for the child to exit, polling so we can react to w->stop.
@@ -291,11 +320,10 @@ void Supervisor::workerMain(Worker* w) {
                           << strerror(errno) << "\n";
                 break;
             }
-            auto now_hour = std::chrono::time_point_cast<std::chrono::hours>(
-                std::chrono::system_clock::now());
-            if (now_hour > start_hour) {
+            if (std::chrono::system_clock::now() >= rotate_at) {
                 std::cerr << "worker[" << w->cam.id
-                          << "]: hourly rotation — restarting pid " << pid << "\n";
+                          << "]: hourly rotation — rolled (silent; prior state retained) pid "
+                          << pid << "\n";
                 hourly_rotate = true;
                 kill(pid, SIGTERM);
                 // Generous grace (15s) — if nvinfer is serializing an
@@ -338,8 +366,11 @@ void Supervisor::workerMain(Worker* w) {
         }
 
         if (hourly_rotate) {
-            // Healthy restart; don't back off.
+            // Healthy restart; don't back off. Next exec gets
+            // --rotation so the child skips the "starting" publish,
+            // so the UI doesn't flash on the hour.
             backoff_ms = 1000;
+            rotation_respawn = true;
             continue;
         }
 

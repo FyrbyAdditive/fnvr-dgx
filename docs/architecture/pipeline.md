@@ -62,6 +62,20 @@ The pipeline uses the `nats-c` library. The default reconnect behaviour gives up
 
 Without this, the detection *and* heartbeat publish paths can silently die without the process noticing — we've hit that in production and spent hours diagnosing it.
 
+## Hourly segment rotation
+
+Each worker is restarted at the top of every hour so recordings land in the new `YYYY/MM/DD/HH/<camera>/rec.mp4` directory. Without this, a worker that's up for 24 h writes a 100+ GB `rec.mp4` into its birth hour's folder and timeline scrubbing breaks.
+
+The rotation is **silent** from the UI's perspective:
+
+- The supervisor passes `--rotation` to the respawned `--worker` child. The child skips its `{"state":"starting"}` publish, so the JetStream last-value stream continues to return the pre-rotation `{"state":"running"}` message until the new worker itself reaches `GST_STATE_PLAYING` and publishes a fresh `running`.
+- The api-server's `running` freshness window is 10 minutes; the rotation gap is ~30 s, so `state=running` is honoured continuously.
+- Rotation is staggered per-camera — up to 120 s after HH:00, deterministic by `hash(camera_id)` — so even if the silent-publish path regresses, cameras flash individually rather than simultaneously.
+
+Log trail: `docker logs fnvr-pipeline-1 | grep rotation` yields lines of the form `worker[<id>]: hourly rotation — rolled (silent; prior state retained) pid N`. If you see `hourly rotation — restarting pid N` instead, that's the pre-silent-rotation log format and the build is out of date.
+
+A genuine `Start()` failure during rotation still publishes `{"state":"failed"}` — a busted rotation flips the UI red as it should.
+
 ## First-run engine compilation
 
 DeepStream `nvinfer` elements lazy-compile their TensorRT engines on first use. For yolo26x on Orin AGX this takes ~30 s per worker (cached thereafter under `/var/lib/fnvr/models/yolo26/*.engine`). The container entrypoint publishes `{"state":"starting"}` heartbeats during compile, and the UI's 15-min "starting" freshness window covers that.

@@ -51,6 +51,10 @@ int main(int argc, char** argv) {
     // Worker mode: one subprocess per camera. Isolates splitmuxsink / nvinfer
     // asserts so a single bad camera can't crash the whole supervisor.
     // Invoked as: pipeline-supervisor --worker <camera_id> <url> <record_mode>
+    //   [--rotation]
+    // The optional --rotation flag signals an hourly segment-rotation
+    // respawn: the previous worker was `running` seconds ago and the
+    // operator shouldn't see the "starting" state flash in between.
     if (argc >= 5 && std::string(argv[1]) == "--worker") {
         gst_init(nullptr, nullptr);
         std::signal(SIGINT, HandleSignal);
@@ -63,6 +67,7 @@ int main(int argc, char** argv) {
         cam.id = argv[2];
         cam.url = argv[3];
         cam.recording_mode = argv[4];
+        const bool rotation = (argc >= 6 && std::string(argv[5]) == "--rotation");
         // Resolve the effective mute set from Postgres before the
         // pipeline builds — gives the InferSrcProbe a point-in-time
         // snapshot that persists for the life of this worker. Operators
@@ -86,12 +91,22 @@ int main(int argc, char** argv) {
         // subscriber immediately sees the current state for every camera,
         // instead of being stuck at "unknown" until a worker happens to
         // (re)start.
+        //
+        // EXCEPT during an hourly segment rotation (`--rotation`). The
+        // previous worker was `running` a few seconds ago; the old
+        // message is still valid in the last-value stream. Publishing
+        // `starting` here would flip every tile to the amber
+        // "starting…" pulse every hour, which is not what the operator
+        // wants to see. The new worker's own `running` publish on
+        // reaching PLAYING wraps up the transition silently.
         const std::string subj = "fnvr.state.camera." + cam.id;
-        {
+        if (!rotation) {
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"starting\"}";
             nats.Publish(subj, payload, /*flush=*/true);
         }
         if (!p.Start()) {
+            // A failed Start() during rotation is still a real failure
+            // — publish `failed` so the UI flips red.
             std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"failed\"}";
             nats.Publish(subj, payload, /*flush=*/true);
             std::cerr << "worker[" << cam.id << "]: start failed\n";
