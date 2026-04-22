@@ -70,23 +70,44 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve event_id → PG row. Grab camera_id, ts, class_name,
-	// bbox, attributes.phash in the same query so we don't need a
-	// second round-trip. bbox is stored as JSONB. If the detection
-	// has already been pruned from the hot table this 404s — operator
-	// should catch false positives within the retention window.
+	// The path component may be either the detection's event_id (the
+	// short hex string from the pipeline, used by pre-pg_id clients)
+	// or the PG row id (numeric, from the accepted-subject payload's
+	// `pg_id` field). Try numeric first — it's unambiguous — else fall
+	// through to event_id.
 	var detID int64
 	var cameraID, className string
 	var ts time.Time
 	var bboxJSON, attrJSON []byte
-	err := s.pool.QueryRow(r.Context(),
-		`SELECT id, camera_id, ts, class_name, bbox, attributes
-		 FROM detections
-		 WHERE event_id = $1
-		 ORDER BY ts DESC LIMIT 1`, eventID).
-		Scan(&detID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+	var err error
+	if pg, convErr := strconv.ParseInt(eventID, 10, 64); convErr == nil && pg > 0 {
+		err = s.pool.QueryRow(r.Context(),
+			`SELECT id, camera_id, ts, class_name, bbox, attributes
+			 FROM detections WHERE id = $1`, pg).
+			Scan(&detID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+	} else {
+		err = s.pool.QueryRow(r.Context(),
+			`SELECT id, camera_id, ts, class_name, bbox, attributes
+			 FROM detections
+			 WHERE event_id = $1
+			 ORDER BY ts DESC LIMIT 1`, eventID).
+			Scan(&detID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+	}
 	if err != nil {
-		http.Error(w, "detection not found (may have been pruned)",
+		// Most likely: the detection is already being suppressed by an
+		// earlier flag so the current row was never persisted (the SSE
+		// bus is on the accepted subject now, so a visible bbox should
+		// imply a persisted row — a 404 here usually means the operator
+		// is trying to flag the exact detection that spawned the
+		// existing flag, or the flag's suppression window includes this
+		// frame and they're clicking a stale client-side copy).
+		// Secondary cause: the detection is older than
+		// settings.detections_hot_hours and has been pruned.
+		http.Error(w,
+			"no matching detection row. It's likely already suppressed by an "+
+				"existing flag for this camera + class — check the Flags page. "+
+				"If the detection is older than the hot-retention window "+
+				"it may have been pruned.",
 			http.StatusNotFound)
 		return
 	}

@@ -117,8 +117,10 @@ func (b *Bridge) Start(parent context.Context, cfg Config) error {
 	}
 	go b.runCameraReconcile(ctx, client)
 
-	// Subscribe to NATS streams.
-	detSub, err := b.nc.Subscribe("fnvr.events.detection.>", func(m *nats.Msg) {
+	// Subscribe to NATS streams. Use the accepted-detections subject
+	// that event-processor republishes after suppression so flagged
+	// false positives don't trigger Home Assistant entities either.
+	detSub, err := b.nc.Subscribe("fnvr.events.detection_accepted.>", func(m *nats.Msg) {
 		var d detection
 		if err := json.Unmarshal(m.Data, &d); err == nil {
 			b.onDetection(client, d)

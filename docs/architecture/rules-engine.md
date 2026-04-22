@@ -109,9 +109,11 @@ compute `bits.OnesCount64(probe ^ flag)`. Distance ≤
 Effects of suppression:
 - Detection is not INSERTed into `detections`.
 - Not added to the per-segment JSONL sidecar.
-- Not published over SSE to the UI.
 - Not evaluated against rules.
+- Not republished on `fnvr.events.detection_accepted.<camera_id>`, which is what the SSE bus + the HA bridge consume — so suppressed detections don't reach the Live view, Events tab, or Home Assistant.
 - Counted as `fnvr_detections_suppressed_total{camera_id, class}`.
+
+Split-subject detail: the pipeline publishes every frame on `fnvr.events.detection.<camera_id>`; only event-processor subscribes there. After passing suppression + mutes + face-match + INSERT, event-processor republishes on `fnvr.events.detection_accepted.<camera_id>`, and every downstream consumer (api-server SSE, HA bridge) subscribes there instead. Keeps the pipeline DB-stateless while still letting suppression be authoritative for the UI.
 
 The library is loaded in `reload()` (30 s cadence), same shape as face
 negatives. Soft-deleting a flag via the Flags page removes it from the

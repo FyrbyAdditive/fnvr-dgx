@@ -5,7 +5,8 @@ Everything fanning out from the pipeline or needing cross-service delivery goes 
 ## `fnvr.events.detection.<camera_id>`
 
 - **Producer:** pipeline probe after the primary detector + tracker.
-- **Consumers:** event-processor (rules evaluation), api-server (SSE fanout via the events bus).
+- **Consumer:** event-processor only (runs rules, suppression, face match, INSERT; then republishes on the *accepted* subject below).
+- **Not consumed by api-server or notification-dispatcher any more.** Those used to subscribe here directly, but that bypassed object-flag suppression so a user-flagged truck still appeared on the Live view. They now subscribe to `fnvr.events.detection_accepted.<camera_id>` instead.
 - **Payload** ([apps/event-processor/internal/rules/engine.go](../../apps/event-processor/internal/rules/engine.go) `Detection` struct):
 
 ```json
@@ -30,6 +31,14 @@ Everything fanning out from the pipeline or needing cross-service delivery goes 
 ```
 
 Non-face detections publish `attributes` as a small string map (plate / plate_conf / color / etc.). Face detections carry the raw embedding until the matcher resolves (or doesn't) the match, at which point `attributes.embedding` is replaced by `embedding_hash` for dedup.
+
+## `fnvr.events.detection_accepted.<camera_id>`
+
+- **Producer:** event-processor, after suppression + mutes + face-match enrichment + PG INSERT.
+- **Consumers:** api-server's SSE bus (feeds the Live page + Events tab); notification-dispatcher's Home Assistant bridge.
+- **Payload:** same fields as the raw `detection` subject plus `pg_id` (int64, the `detections.id` row that was just written) so web clients can build `POST /api/v1/detections/<pg_id>/flag` URLs without a second round-trip to resolve `event_id → id`.
+
+Why a separate subject: api-server used to consume the raw pipeline subject directly, which meant object-flag suppression (which happens in event-processor) didn't apply to the SSE stream — a user's flagged truck still appeared on Live. Republishing on an "accepted" subject keeps suppression authoritative while letting the pipeline stay DB-stateless.
 
 ## `fnvr.events.incident.<camera_id>`
 

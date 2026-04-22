@@ -16,7 +16,21 @@ import (
 
 // Detection mirrors the shape of fnvr.events.v1.Detection on the wire.
 // JSON for now — we'll switch to protobuf-over-NATS once the codegen lands.
+//
+// Source subject: `fnvr.events.detection_accepted.<camera_id>`,
+// republished by event-processor after it has passed suppression,
+// zone/class mutes, face match enrichment, and the PG INSERT. We
+// used to consume `fnvr.events.detection.*` directly from the
+// pipeline, but that bypassed suppression decisions — flagged false
+// positives still appeared on the Live view.
 type Detection struct {
+	// PgID is the row id in the `detections` table, 0 if event-
+	// processor hasn't assigned one (shouldn't happen on the
+	// accepted subject; kept 0-tolerant for defensiveness).
+	PgID int64 `json:"pg_id"`
+	// ID preserves the pipeline's event_id (short hex) as `id` on
+	// the wire for backwards compat with clients that pre-date the
+	// accepted-subject switch. New clients should prefer PgID.
 	ID         string             `json:"id"`
 	CameraID   string             `json:"camera_id"`
 	TS         time.Time          `json:"ts"`
@@ -51,7 +65,11 @@ func NewBus(url string) (*Bus, error) {
 }
 
 func (b *Bus) Start(ctx context.Context) error {
-	_, err := b.nc.Subscribe("fnvr.events.detection.>", func(msg *nats.Msg) {
+	// Consume event-processor's republished accepted detections, not
+	// the raw pipeline subject. Accepted = passed object-flag
+	// suppression + zone/class mutes + face-match enrichment + PG
+	// INSERT. Flagged false positives never reach the SSE stream.
+	_, err := b.nc.Subscribe("fnvr.events.detection_accepted.>", func(msg *nats.Msg) {
 		var d Detection
 		if err := json.Unmarshal(msg.Data, &d); err != nil {
 			slog.Warn("events: bad detection payload", "err", err)
@@ -62,7 +80,7 @@ func (b *Bus) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("events: subscribed to fnvr.events.detection.>")
+	slog.Info("events: subscribed to fnvr.events.detection_accepted.>")
 	go func() {
 		<-ctx.Done()
 		_ = b.nc.Drain()

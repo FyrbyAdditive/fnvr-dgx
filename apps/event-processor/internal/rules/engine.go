@@ -830,6 +830,49 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		return err
 	}
 
+	// Republish the accepted detection on fnvr.events.detection_accepted.<cam>.
+	// The api-server's SSE bus + the HA bridge consume THIS subject, not the
+	// raw pipeline subject — that way suppressed detections never reach the
+	// browser (before this, a user's flagged truck still appeared on the Live
+	// view because api-server's SSE handler was subscribed to the pipeline
+	// subject directly, bypassing the suppression decision). Adds the PG id
+	// to the payload so the flag endpoint works without an event_id → id
+	// lookup, closing the race where a click on a just-appeared bbox 404s
+	// because the INSERT hadn't landed yet.
+	if e.nc != nil {
+		// Field naming is hand-wired rather than reusing Detection so
+		// `id` can carry the event-id string (back-compat with old SSE
+		// consumers) while `pg_id` carries the new PG int id. A single
+		// struct couldn't do both with sane JSON tags.
+		type acceptedPayload struct {
+			PgID       int64             `json:"pg_id"`
+			ID         string            `json:"id"`
+			CameraID   string            `json:"camera_id"`
+			TS         time.Time         `json:"ts"`
+			ClassName  string            `json:"class_name"`
+			Kind       string            `json:"kind"`
+			Confidence float32           `json:"confidence"`
+			BBox       BBox              `json:"bbox"`
+			TrackID    string            `json:"track_id,omitempty"`
+			Attributes map[string]string `json:"attributes,omitempty"`
+		}
+		ap := acceptedPayload{
+			PgID:       pgID,
+			ID:         d.ID,
+			CameraID:   d.CameraID,
+			TS:         d.TS,
+			ClassName:  d.ClassName,
+			Kind:       kind,
+			Confidence: d.Confidence,
+			BBox:       d.BBox,
+			TrackID:    d.TrackID,
+			Attributes: d.Attributes,
+		}
+		if buf, err := json.Marshal(ap); err == nil {
+			_ = e.nc.Publish("fnvr.events.detection_accepted."+d.CameraID, buf)
+		}
+	}
+
 	// Face thumbnail rename — the pipeline wrote a JPEG of the face
 	// crop under {event_id}.jpg at detection time. Rename to the PG
 	// row id so the api-server's thumbnail handler (keyed by PG id)

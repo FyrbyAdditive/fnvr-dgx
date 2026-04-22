@@ -542,7 +542,11 @@ function FlagPopover({
     setSubmitting(true);
     setError(null);
     try {
-      await api.flagDetection(detection.id, classCorrected);
+      // Prefer pg_id — unambiguous and avoids the event_id→row race
+      // on freshly-published detections. Fall back to event_id for
+      // builds that haven't shipped pg_id yet on the SSE stream.
+      const key = detection.pg_id != null ? String(detection.pg_id) : detection.id;
+      await api.flagDetection(key, classCorrected);
       onClose();
     } catch (e) {
       setError((e as Error).message || "flag failed");

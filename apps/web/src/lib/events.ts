@@ -1,7 +1,15 @@
 import { useEffect, useState, useRef } from "react";
 
 export type DetectionEvent = {
+  /** Pipeline's event_id (short hex). Stable identity for client-side
+   *  de-dup; also a fallback URL key for the flag endpoint on
+   *  pre-pg_id builds. */
   id: string;
+  /** PG row id. Present when the SSE payload comes from the
+   *  accepted-detections subject (event-processor republishes after
+   *  INSERT). New clients should prefer this for flag URLs to close
+   *  the race where the row hadn't landed yet at click time. */
+  pg_id?: number;
   camera_id: string;
   ts: string;
   class_name: string;

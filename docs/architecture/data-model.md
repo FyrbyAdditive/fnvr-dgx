@@ -31,7 +31,8 @@ Detections + incidents + system state move on NATS; jobs + heartbeats live in sp
 
 | Subject | Producer | Consumer | Payload |
 |---|---|---|---|
-| `fnvr.events.detection.<camera_id>` | pipeline | event-processor, api-server SSE | per-frame detection (class/bbox/confidence/kind/attributes). |
+| `fnvr.events.detection.<camera_id>` | pipeline | event-processor | raw per-frame detection. |
+| `fnvr.events.detection_accepted.<camera_id>` | event-processor | api-server SSE, HA bridge | same payload + `pg_id` after suppression / mutes / INSERT. |
 | `fnvr.events.incident.<camera_id>` | event-processor | notification-dispatcher | incident (id, rule_id, camera_id, severity, summary, …). |
 | `fnvr.events.incident.__system` | event-processor | notification-dispatcher | system-scope incident (drift alert). |
 | `fnvr.state.camera.<camera_id>` | pipeline | api-server (JetStream last-value) | `{camera_id, state}` — `starting` / `running` / `failed`. |
