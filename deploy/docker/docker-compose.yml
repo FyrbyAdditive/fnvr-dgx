@@ -210,9 +210,13 @@ services:
       # Unset G_DEBUG so fatal-warnings are off — without this, one bad
       # camera can crash-kill all the others sharing the supervisor process.
       G_DEBUG: ""
-    devices:
-      - /dev/video0   # V4L2 M2M — NVDEC
-      - /dev/video1   # V4L2 M2M — NVENC
+    # No /dev/video* mapping here: nvv4l2{dec,enc}oder talks to the Tegra
+    # nodes /dev/v4l2-nvdec + /dev/v4l2-nvenc, which are reachable via the
+    # /usr/share/{egl,glvnd}/* host mounts below. We used to list
+    # /dev/video0 and /dev/video1 but those are USB-webcam nodes, not NVENC
+    # / NVDEC — and if a USB cam was later unplugged, docker refused to
+    # (re)create the container at all ("no such file or directory") which
+    # killed every camera in one go. Do not re-add them.
     # Docker masks /sys/firmware by default. The Tegra libv4l2 plugin reads
     # /sys/firmware/devicetree/base/{compatible,chosen/ids} to identify the
     # chip and take its fast-path (which skips the generic v4l2 capability
@@ -262,6 +266,12 @@ services:
   # DB use that URL; pipeline-supervisor then hits it via the working RTSP
   # code path — sidestepping the direct v4l2 SIGSEGV-after-NVENC-init bug.
   usb-bridge:
+    # Only started when explicitly requested (`--profile usb`): without
+    # the profile gate, a missing /dev/video0 (no USB cam plugged in)
+    # makes docker refuse to (re)create the container, which bleeds into
+    # manual restart-all operations. Most deployments use IP cameras and
+    # don't need this path.
+    profiles: ["usb"]
     image: linuxserver/ffmpeg:latest
     restart: unless-stopped
     depends_on:
