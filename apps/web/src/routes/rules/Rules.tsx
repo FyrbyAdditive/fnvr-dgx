@@ -129,6 +129,8 @@ function RuleForm({
   const [direction, setDirection] = useState<"" | "in" | "out">(initial?.definition.direction ?? "");
   const [severity, setSeverity] = useState<"info" | "warning" | "critical">(initial?.definition.severity ?? "warning");
   const [cooldown, setCooldown] = useState(initial?.definition.cooldown_sec ?? 30);
+  const initialActiveWhen = ((initial?.definition.active_when ?? "") || "any") as "any" | "home" | "away" | "disarmed";
+  const [activeWhen, setActiveWhen] = useState<"any" | "home" | "away" | "disarmed">(initialActiveWhen);
   const [steps, setSteps] = useState<Array<{ camera_id: string; classes: string }>>(
     initial?.definition.kind === "sequence"
       ? (initial.definition.steps ?? []).map((s) => ({
@@ -184,6 +186,7 @@ function RuleForm({
         min_confidence: 0,
         cooldown_sec: cooldown,
         severity,
+        active_when: activeWhen === "any" ? undefined : activeWhen,
         steps: cleanSteps.map((s) => ({
           camera_id: s.camera_id,
           classes: s.classes.length ? s.classes : undefined,
@@ -203,6 +206,7 @@ function RuleForm({
         direction: isLineLike && direction ? direction : undefined,
         cooldown_sec: cooldown,
         severity,
+        active_when: activeWhen === "any" ? undefined : activeWhen,
       };
     }
     setPending(true);
@@ -397,6 +401,20 @@ function RuleForm({
         value={cooldown}
         onChange={(e) => setCooldown(Number(e.target.value))}
       />
+      <label className="col-span-2 flex items-center gap-2 text-xs text-neutral-400">
+        Active when:
+        <select
+          className="bg-neutral-900 rounded px-2 py-1 text-sm flex-1"
+          value={activeWhen}
+          onChange={(e) => setActiveWhen(e.target.value as typeof activeWhen)}
+          title="Gate this rule on the global alarm state"
+        >
+          <option value="any">any state</option>
+          <option value="home">home</option>
+          <option value="away">away</option>
+          <option value="disarmed">disarmed</option>
+        </select>
+      </label>
 
       {err && <div className="col-span-2 text-xs text-red-400">{err}</div>}
 
@@ -488,6 +506,8 @@ function RuleRow({
                 {(rule.definition.steps ?? []).map((s) => s.camera_id).join(" → ")}
                 {` · within ${rule.definition.window_sec ?? 0}s`}
                 {` · ${rule.definition.severity ?? "info"}`}
+                {rule.definition.active_when && rule.definition.active_when !== "any" &&
+                  ` · when: ${rule.definition.active_when}`}
               </>
             ) : (
               <>
@@ -496,6 +516,8 @@ function RuleRow({
                 {` · ≥${Math.round((rule.definition.min_confidence ?? 0) * 100)}%`}
                 {rule.definition.direction && ` · crossing ${rule.definition.direction}`}
                 {` · ${rule.definition.severity ?? "info"}`}
+                {rule.definition.active_when && rule.definition.active_when !== "any" &&
+                  ` · when: ${rule.definition.active_when}`}
               </>
             )}
           </div>

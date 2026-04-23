@@ -368,3 +368,50 @@ func (s *Store) SetCalibrationImageCount(ctx context.Context, n int) error {
 	b, _ := json.Marshal(n)
 	return s.Set(ctx, "calibration.image_count", b)
 }
+
+// --- alarm state ---
+
+var validAlarmStates = map[string]struct{}{
+	"home":     {},
+	"away":     {},
+	"disarmed": {},
+}
+
+// AlarmState is the global armed/disarmed mode. Rules can opt in to a
+// specific state via their active_when field. "disarmed" is the default
+// so a fresh install doesn't silently suppress rules that depend on the
+// state being set.
+type AlarmState struct {
+	State string `json:"state"` // "home" | "away" | "disarmed"
+}
+
+func (s *Store) GetAlarm(ctx context.Context) (AlarmState, error) {
+	a := AlarmState{State: "disarmed"}
+	raw, err := s.Get(ctx, "alarm.state")
+	if errors.Is(err, ErrNotFound) {
+		return a, nil
+	}
+	if err != nil {
+		return a, err
+	}
+	// Stored shape is the full struct; tolerate a bare string too in
+	// case someone sets the key via psql.
+	if err := json.Unmarshal(raw, &a); err != nil {
+		var str string
+		if jerr := json.Unmarshal(raw, &str); jerr == nil {
+			a.State = str
+		}
+	}
+	if _, ok := validAlarmStates[a.State]; !ok {
+		a.State = "disarmed"
+	}
+	return a, nil
+}
+
+func (s *Store) SetAlarm(ctx context.Context, a AlarmState) error {
+	if _, ok := validAlarmStates[a.State]; !ok {
+		return fmt.Errorf("invalid alarm state %q", a.State)
+	}
+	b, _ := json.Marshal(a)
+	return s.Set(ctx, "alarm.state", b)
+}

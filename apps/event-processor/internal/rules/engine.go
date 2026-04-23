@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -117,6 +118,13 @@ type Engine struct {
 	// sightings kept for up to the rule's window. Pruned lazily on
 	// each evaluation for that rule/step so the map stays bounded.
 	sequenceSightings map[string][]sequenceSighting
+
+	// Global alarm state: "home" | "away" | "disarmed". Rules with an
+	// active_when field only fire when their required state matches.
+	// Seeded in reload() from settings.alarm.state, updated live via
+	// fnvr.settings.alarm.changed so flipping the state from the UI
+	// takes effect immediately rather than at the next 30 s reload.
+	alarmState atomic.Value // string
 }
 
 type trackEntry struct {
@@ -183,9 +191,39 @@ type RuleDef struct {
 	CooldownSec    int             `json:"cooldown_sec"`
 	Schedule       Schedule        `json:"schedule"`
 	Severity       string          `json:"severity"` // info | warning | critical
+	// ActiveWhen gates the rule on the global alarm state:
+	//   ""        or "any" — fires regardless of state (default)
+	//   "home"    — only when alarm is home
+	//   "away"    — only when alarm is away
+	//   "disarmed" — only when alarm is disarmed
+	ActiveWhen     string          `json:"active_when,omitempty"`
 	// Sequence-rule fields. Ignored unless Kind=="sequence".
 	Steps          []SequenceStep  `json:"steps,omitempty"`
 	WindowSec      int             `json:"window_sec,omitempty"`
+}
+
+// ruleMatchesAlarmState reports whether a rule's active_when field
+// permits firing given the current global alarm state. Empty or "any"
+// means fires regardless; otherwise the field must equal the state.
+func ruleMatchesAlarmState(def *RuleDef, state string) bool {
+	if def.ActiveWhen == "" || def.ActiveWhen == "any" {
+		return true
+	}
+	return def.ActiveWhen == state
+}
+
+// currentAlarmState returns the cached global alarm state, defaulting
+// to "disarmed" if the atomic hasn't been populated yet (pre-reload).
+func (e *Engine) currentAlarmState() string {
+	v := e.alarmState.Load()
+	if v == nil {
+		return "disarmed"
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return "disarmed"
+	}
+	return s
 }
 
 // ruleMatchesCamera reports whether a single-camera rule targets the
@@ -357,6 +395,27 @@ func (e *Engine) Run(ctx context.Context) error {
 		if err := e.onDetection(ctx, d); err != nil {
 			slog.Warn("rule eval", "err", err, "cam", d.CameraID)
 		}
+	})
+	if err != nil {
+		return err
+	}
+
+	// Live alarm-state updates from api-server. reload() also reads
+	// the same key so a missed NATS message on startup can't leave the
+	// engine stuck on a stale state.
+	_, err = e.nc.Subscribe("fnvr.settings.alarm.changed", func(msg *nats.Msg) {
+		var a struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(msg.Data, &a); err != nil {
+			slog.Warn("bad alarm state payload", "err", err)
+			return
+		}
+		if a.State == "" {
+			return
+		}
+		e.alarmState.Store(a.State)
+		slog.Info("alarm state updated", "state", a.State)
 	})
 	if err != nil {
 		return err
@@ -626,6 +685,25 @@ func (e *Engine) reload(ctx context.Context) error {
 	e.objectFlags = flagLib
 	e.phashHamming = phashHamming
 	e.mu.Unlock()
+
+	// Alarm state from settings.alarm.state. Falls back to "disarmed"
+	// if the key is absent (fresh install) or malformed. This path is
+	// the backstop: the live NATS subscriber updates the atomic on
+	// each UI-driven change, but if the api-server was down when the
+	// flip happened or the key was edited directly in psql, reload()
+	// still catches up within the 30 s poll window.
+	alarmState := "disarmed"
+	{
+		var raw []byte
+		if err := e.pool.QueryRow(ctx,
+			`SELECT value FROM settings WHERE key = 'alarm.state'`).Scan(&raw); err == nil {
+			var obj struct{ State string `json:"state"` }
+			if jerr := json.Unmarshal(raw, &obj); jerr == nil && obj.State != "" {
+				alarmState = obj.State
+			}
+		}
+	}
+	e.alarmState.Store(alarmState)
 	metrics.RulesLoaded.Set(float64(len(compiled)))
 	metrics.EnrolledEmbeddings.Set(float64(len(enrols)))
 	metrics.FaceNegatives.Set(float64(len(negs)))
@@ -642,7 +720,8 @@ func (e *Engine) reload(ctx context.Context) error {
 		"face_negatives", len(negs),
 		"neg_penalty_weight", penaltyWeight,
 		"object_flags", flagCount,
-		"phash_hamming", phashHamming)
+		"phash_hamming", phashHamming,
+		"alarm_state", e.currentAlarmState())
 	return nil
 }
 
@@ -978,6 +1057,9 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if !ruleMatchesCamera(&r.Definition, d.CameraID) {
 			continue
 		}
+		if !ruleMatchesAlarmState(&r.Definition, e.currentAlarmState()) {
+			continue
+		}
 		if d.Confidence < r.Definition.MinConfidence {
 			continue
 		}
@@ -1026,6 +1108,9 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	// are independent.
 	for _, r := range rules {
 		if r.sequence == nil {
+			continue
+		}
+		if !ruleMatchesAlarmState(&r.Definition, e.currentAlarmState()) {
 			continue
 		}
 		if !inSchedule(r.Definition.Schedule, d.TS) {

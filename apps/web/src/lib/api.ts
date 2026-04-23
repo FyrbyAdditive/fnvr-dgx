@@ -117,6 +117,8 @@ export type Rule = {
     direction?: "in" | "out" | "";
     cooldown_sec: number;
     severity: "info" | "warning" | "critical";
+    /** Global alarm-state gate. Empty/"any" = fires regardless. */
+    active_when?: AlarmStateValue | "any" | "";
     schedule?: { start_minute: number; end_minute: number; days: number[]; timezone?: string };
     /** Sequence-rule fields (kind=="sequence" only). */
     steps?: Array<{
@@ -344,6 +346,12 @@ export const api = {
   getHAConfig: () => req<HAConfig>("/settings/ha"),
   updateHAConfig: (body: HAConfig) =>
     req<void>("/settings/ha", { method: "PUT", body: JSON.stringify(body) }),
+
+  // Global alarm state. Rules with active_when fire only when the
+  // mode matches; "disarmed" is the default.
+  getAlarm: () => req<AlarmStateBody>("/settings/alarm"),
+  updateAlarm: (body: AlarmStateBody) =>
+    req<void>("/settings/alarm", { method: "PUT", body: JSON.stringify(body) }),
 
   // Face ID: persons CRUD + recent-faces view for enrolment.
   listPersons: () => req<Person[]>("/persons"),
@@ -641,6 +649,9 @@ export type RecentPlate = {
   last_seen: string;
   count: number;
 };
+
+export type AlarmStateValue = "home" | "away" | "disarmed";
+export type AlarmStateBody = { state: AlarmStateValue };
 
 export type HAConfig = {
   enabled: boolean;

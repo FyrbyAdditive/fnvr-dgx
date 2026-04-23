@@ -1,6 +1,8 @@
 import { NavLink, Outlet, Link } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { api, AlarmStateValue } from "@/lib/api";
+import { useMe, isAdmin as isAdminFn } from "@/lib/me";
 
 const tabs = [
   { to: "/live", label: "Live" },
@@ -50,8 +52,11 @@ export function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="ml-auto text-xs text-neutral-500">
-          {info ? `${info.milestone} · ${info.version}` : ""}
+        <div className="ml-auto flex items-center gap-4">
+          <AlarmPill />
+          <div className="text-xs text-neutral-500">
+            {info ? `${info.milestone} · ${info.version}` : ""}
+          </div>
         </div>
       </header>
       {showBanner && ps && (
@@ -81,6 +86,81 @@ export function Layout() {
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>
+    </div>
+  );
+}
+
+// AlarmPill shows the current global alarm state in the top bar. Admins
+// can click to change; viewers see a read-only indicator. The pill
+// reads via react-query (poll every 10s so a state flip made from
+// another session or via curl shows up) and updates optimistically.
+const ALARM_OPTIONS: Array<{ value: AlarmStateValue; label: string; emoji: string; color: string }> = [
+  { value: "disarmed", label: "disarmed", emoji: "🔓", color: "text-neutral-400" },
+  { value: "home", label: "home", emoji: "🏠", color: "text-emerald-400" },
+  { value: "away", label: "away", emoji: "🚪", color: "text-amber-400" },
+];
+
+function AlarmPill() {
+  const qc = useQueryClient();
+  const { data: me } = useMe();
+  const admin = isAdminFn(me);
+  const { data: alarm } = useQuery({
+    queryKey: ["alarm"],
+    queryFn: api.getAlarm,
+    refetchInterval: 10_000,
+    staleTime: 2_000,
+  });
+  const mut = useMutation({
+    mutationFn: (state: AlarmStateValue) => api.updateAlarm({ state }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["alarm"] }),
+  });
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const current = alarm?.state ?? "disarmed";
+  const meta = ALARM_OPTIONS.find((o) => o.value === current) ?? ALARM_OPTIONS[0];
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        disabled={!admin}
+        onClick={() => admin && setOpen((v) => !v)}
+        className={`text-xs rounded px-2 py-1 border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 disabled:cursor-default disabled:hover:bg-neutral-900 flex items-center gap-1.5 ${meta.color}`}
+        title={admin ? "change alarm state" : `alarm: ${current}`}
+      >
+        <span aria-hidden>{meta.emoji}</span>
+        <span className="font-medium">{meta.label}</span>
+      </button>
+      {open && admin && (
+        <div className="absolute right-0 mt-1 w-36 rounded border border-neutral-700 bg-neutral-900 shadow-lg z-20">
+          {ALARM_OPTIONS.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                if (o.value !== current) mut.mutate(o.value);
+              }}
+              className={`w-full text-left text-xs px-3 py-2 flex items-center gap-2 hover:bg-neutral-800 ${
+                o.value === current ? "font-semibold" : ""
+              } ${o.color}`}
+            >
+              <span aria-hidden>{o.emoji}</span>
+              <span>{o.label}</span>
+              {o.value === current && <span className="ml-auto text-neutral-500">✓</span>}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
