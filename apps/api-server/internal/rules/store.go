@@ -173,6 +173,26 @@ func (s *Store) DeleteRule(ctx context.Context, id string) error {
 	return nil
 }
 
+// UpdateRule overwrites name and/or definition on an existing rule.
+// Fields passed as nil are left alone. Returns ErrNotFound if no row
+// matches.
+func (s *Store) UpdateRule(ctx context.Context, id string, name *string, definition json.RawMessage) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE rules
+		   SET name = COALESCE($2, name),
+		       definition = COALESCE($3, definition),
+		       updated_at = NOW()
+		 WHERE id = $1`,
+		id, name, definition)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) SetRuleEnabled(ctx context.Context, id string, enabled bool) error {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE rules SET enabled = $1, updated_at = NOW() WHERE id = $2`,

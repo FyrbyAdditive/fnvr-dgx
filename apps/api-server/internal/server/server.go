@@ -172,6 +172,7 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/rules", s.handleListRules)
 			protected.Handle("POST /api/v1/rules", auth.AdminFunc(s.handleCreateRule))
 			protected.Handle("DELETE /api/v1/rules/{id}", auth.AdminFunc(s.handleDeleteRule))
+			protected.Handle("PATCH /api/v1/rules/{id}", auth.AdminFunc(s.handleUpdateRule))
 			protected.Handle("POST /api/v1/rules/{id}/enable", auth.AdminFunc(s.handleEnableRule))
 			protected.Handle("POST /api/v1/rules/{id}/disable", auth.AdminFunc(s.handleDisableRule))
 
@@ -849,6 +850,32 @@ func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	} else if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name       *string         `json:"name,omitempty"`
+		Definition json.RawMessage `json:"definition,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if body.Name == nil && len(body.Definition) == 0 {
+		http.Error(w, "name or definition required", http.StatusBadRequest)
+		return
+	}
+	err := s.rules.UpdateRule(r.Context(), r.PathValue("id"), body.Name, body.Definition)
+	if errors.Is(err, rules.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.Error("update rule", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

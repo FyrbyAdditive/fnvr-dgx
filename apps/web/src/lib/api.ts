@@ -106,7 +106,10 @@ export type Rule = {
   definition: {
     /** Omitted/"single" = original per-detection rule. "sequence" = cross-camera chain. */
     kind?: "sequence";
+    /** Legacy single-camera target. New rules set camera_ids instead. */
     camera_id?: string;
+    /** Multi-camera target subset. Empty + empty camera_id = all cameras. */
+    camera_ids?: string[];
     classes: string[];
     min_confidence: number;
     zone_id?: string;
@@ -253,6 +256,8 @@ export const api = {
     req<Rule>("/rules", { method: "POST", body: JSON.stringify(r) }),
   deleteRule: (id: string) =>
     req<void>(`/rules/${id}`, { method: "DELETE" }),
+  updateRule: (id: string, body: { name?: string; definition?: Rule["definition"] }) =>
+    req<void>(`/rules/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   enableRule: (id: string) =>
     req<void>(`/rules/${id}/enable`, { method: "POST" }),
   disableRule: (id: string) =>

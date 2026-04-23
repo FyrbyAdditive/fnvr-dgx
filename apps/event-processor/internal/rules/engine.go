@@ -170,7 +170,12 @@ type RuleDef struct {
 	// ignored. Leaving Kind absent preserves compatibility with every
 	// existing rule row.
 	Kind           string          `json:"kind,omitempty"`
-	CameraID       string          `json:"camera_id,omitempty"` // empty → all cameras
+	// CameraID is the legacy single-camera targeting field. New rules
+	// written by the UI use CameraIDs instead. Both are honoured: the
+	// rule matches a detection if the camera is in CameraIDs OR equals
+	// CameraID. Empty CameraID + empty CameraIDs = all cameras.
+	CameraID       string          `json:"camera_id,omitempty"`
+	CameraIDs      []string        `json:"camera_ids,omitempty"` // subset; empty = defer to CameraID
 	Classes        []string        `json:"classes"`             // e.g. ["person","car"]
 	MinConfidence  float32         `json:"min_confidence"`
 	ZoneID         string          `json:"zone_id,omitempty"`
@@ -181,6 +186,25 @@ type RuleDef struct {
 	// Sequence-rule fields. Ignored unless Kind=="sequence".
 	Steps          []SequenceStep  `json:"steps,omitempty"`
 	WindowSec      int             `json:"window_sec,omitempty"`
+}
+
+// ruleMatchesCamera reports whether a single-camera rule targets the
+// given camera. Empty CameraID + empty CameraIDs = all cameras.
+// Otherwise the rule matches if the camera is in CameraIDs or equals
+// CameraID (legacy scalar).
+func ruleMatchesCamera(def *RuleDef, cameraID string) bool {
+	if len(def.CameraIDs) == 0 && def.CameraID == "" {
+		return true
+	}
+	if def.CameraID != "" && def.CameraID == cameraID {
+		return true
+	}
+	for _, id := range def.CameraIDs {
+		if id == cameraID {
+			return true
+		}
+	}
+	return false
 }
 
 // SequenceStep is one hop in a cross-camera sequence rule. The
@@ -951,7 +975,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if r.sequence != nil {
 			continue
 		}
-		if r.Definition.CameraID != "" && r.Definition.CameraID != d.CameraID {
+		if !ruleMatchesCamera(&r.Definition, d.CameraID) {
 			continue
 		}
 		if d.Confidence < r.Definition.MinConfidence {
