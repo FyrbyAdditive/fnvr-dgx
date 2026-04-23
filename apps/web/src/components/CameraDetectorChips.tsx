@@ -23,13 +23,19 @@ export function CameraDetectorChips({
 }) {
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
-  // Empty array = all enabled (matches the convention in
-  // routes/cameras/Cameras.tsx:188-189). Normalise up front so the
-  // rest of the component works with a concrete set.
-  const resolved =
-    !enabledDetectors || enabledDetectors.length === 0
+  // Encoding of the stored enabled_detectors array:
+  //   []          → all detectors enabled (legacy default, survives
+  //                 adding new detector families later)
+  //   ["none"]    → no detectors enabled (explicit opt-out)
+  //   otherwise   → whitelist of kinds
+  // Normalise up front so the rest of the component works with a
+  // concrete set of real kinds only.
+  const isNone = enabledDetectors?.length === 1 && enabledDetectors[0] === "none";
+  const resolved = isNone
+    ? new Set<string>()
+    : !enabledDetectors || enabledDetectors.length === 0
       ? new Set(KINDS.map((k) => k.value))
-      : new Set(enabledDetectors);
+      : new Set(enabledDetectors.filter((k) => k !== "none"));
   const [optimistic, setOptimistic] = useState<Set<string> | null>(null);
   const effective = optimistic ?? resolved;
 
@@ -40,10 +46,12 @@ export function CameraDetectorChips({
     const next = new Set(effective);
     if (next.has(kind)) next.delete(kind);
     else next.add(kind);
-    // Re-encode as "all" if every known kind is selected, matching the
-    // convention from Settings > DetectorToggle so new detector families
-    // added later still get on-by-default.
-    const arr = next.size === KINDS.length ? [] : Array.from(next);
+    // Encode:
+    //   all real kinds selected → [] (all, forward-compatible default)
+    //   zero real kinds selected → ["none"] (explicit opt-out)
+    //   subset → the explicit list
+    const arr =
+      next.size === KINDS.length ? [] : next.size === 0 ? ["none"] : Array.from(next);
     setOptimistic(next);
     setBusy(true);
     try {

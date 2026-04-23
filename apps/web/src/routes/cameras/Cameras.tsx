@@ -185,8 +185,18 @@ const DETECTOR_KINDS: { value: string; label: string }[] = [
 
 function DetectorToggle({ camera }: { camera: Camera }) {
   const qc = useQueryClient();
-  const allEnabled = !camera.enabled_detectors || camera.enabled_detectors.length === 0;
-  const current = new Set(camera.enabled_detectors ?? DETECTOR_KINDS.map((k) => k.value));
+  // enabled_detectors encoding:
+  //   []         → all enabled (default)
+  //   ["none"]   → explicitly none enabled
+  //   ["object", ...] → whitelist
+  const stored = camera.enabled_detectors ?? [];
+  const isNone = stored.length === 1 && stored[0] === "none";
+  const allEnabled = stored.length === 0;
+  const current = isNone
+    ? new Set<string>()
+    : allEnabled
+      ? new Set(DETECTOR_KINDS.map((k) => k.value))
+      : new Set(stored.filter((k) => k !== "none"));
 
   const update = useMutation({
     mutationFn: (kinds: string[]) => api.updateCameraDetectors(camera.id, { enabled_detectors: kinds }),
@@ -197,12 +207,16 @@ function DetectorToggle({ camera }: { camera: Camera }) {
     const next = new Set(current);
     if (next.has(kind)) next.delete(kind);
     else next.add(kind);
-    // If every known kind is selected, store [] = "all" so the semantics
-    // stay sensible when we add a new detector family later.
+    // Encode:
+    //   all known kinds selected → [] (forward-compatible default)
+    //   zero kinds selected → ["none"] (explicit opt-out)
+    //   subset → the list
     const arr =
       next.size === DETECTOR_KINDS.length
         ? []
-        : Array.from(next);
+        : next.size === 0
+          ? ["none"]
+          : Array.from(next);
     update.mutate(arr);
   };
 
@@ -211,6 +225,7 @@ function DetectorToggle({ camera }: { camera: Camera }) {
       <div className="text-xs text-neutral-400 mb-1">
         Detectors enabled on this camera
         {allEnabled && <span className="text-neutral-600"> · all</span>}
+        {isNone && <span className="text-neutral-600"> · none</span>}
       </div>
       <div className="flex flex-wrap gap-3 text-xs">
         {DETECTOR_KINDS.map((k) => (
