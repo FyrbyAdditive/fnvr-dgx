@@ -136,11 +136,24 @@ func runServe() error {
 		return fmt.Errorf("whep start: %w", err)
 	}
 
+	camStore := camera.NewStore(pool)
 	camStates, err := camera.NewStateTracker(cfg.NATSURL)
 	if err != nil {
 		return fmt.Errorf("camera state tracker: %w", err)
 	}
-	if err := camStates.Start(ctx); err != nil {
+	// Prime the tracker from the JetStream last-value stream so a fresh
+	// api-server immediately has the most recent state per camera,
+	// instead of showing "unknown" until the next 30 s heartbeat.
+	var camIDs []string
+	if cams, err := camStore.List(ctx); err != nil {
+		slog.Warn("camera state: list cameras for replay failed", "err", err)
+	} else {
+		camIDs = make([]string, 0, len(cams))
+		for _, c := range cams {
+			camIDs = append(camIDs, c.ID)
+		}
+	}
+	if err := camStates.Start(ctx, camIDs); err != nil {
 		return fmt.Errorf("camera state start: %w", err)
 	}
 
@@ -157,7 +170,7 @@ func runServe() error {
 		Config:        cfg,
 		Pool:          pool,
 		Auth:          authStore,
-		Cameras:       camera.NewStore(pool),
+		Cameras:       camStore,
 		Pipeline:      pipeline.LoggingClient{}, // swap for the generated gRPC client when ready
 		Events:        bus,
 		Rules:         rules.NewStore(pool),

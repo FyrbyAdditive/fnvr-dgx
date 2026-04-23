@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -20,10 +21,11 @@ import (
 //	{"state":"ready"}
 //	{"state":"failed",          "message":"..."}
 //
-// to the subject fnvr.state.pipeline. Stream is JetStream with
-// MaxMsgsPerSubject=1 (last-value), so a fresh api-server immediately
-// sees the current state on subscribe rather than getting stuck until
-// the pipeline happens to re-announce.
+// to the subject fnvr.state.pipeline. Transport matches
+// camera.StateTracker: live messages via core-NATS subscription, with a
+// one-shot replay from the JetStream last-value stream on startup so a
+// fresh api-server sees the current state immediately rather than
+// waiting for the next publish.
 type StateTracker struct {
 	nc *nats.Conn
 	js jetstream.JetStream
@@ -75,38 +77,59 @@ func (t *StateTracker) Start(ctx context.Context) error {
 	if _, err := t.js.CreateOrUpdateStream(ctx, cfg); err != nil {
 		return fmt.Errorf("create stream: %w", err)
 	}
-	cons, err := t.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckPolicy:     jetstream.AckNonePolicy,
-		FilterSubject: subject,
+
+	sub, err := t.nc.Subscribe(subject, func(m *nats.Msg) {
+		t.ingest(m.Data, time.Now())
 	})
 	if err != nil {
-		return fmt.Errorf("create consumer: %w", err)
+		return fmt.Errorf("subscribe: %w", err)
 	}
-	_, err = cons.Consume(func(m jetstream.Msg) {
-		var s State
-		if err := json.Unmarshal(m.Data(), &s); err != nil {
-			slog.Warn("pipeline-state: bad payload", "err", err)
-			return
-		}
-		if meta, err := m.Metadata(); err == nil && !meta.Timestamp.IsZero() {
-			s.Stamped = meta.Timestamp
-		} else {
-			s.Stamped = time.Now()
-		}
-		t.mu.Lock()
-		t.cur = s
-		t.known = true
-		t.mu.Unlock()
-	})
+
+	// One-shot replay: single subject, so one GetLastMsgForSubject call.
+	stream, err := t.js.Stream(ctx, streamName)
 	if err != nil {
-		return fmt.Errorf("consume: %w", err)
+		sub.Unsubscribe()
+		return fmt.Errorf("stream handle: %w", err)
 	}
+	raw, err := stream.GetLastMsgForSubject(ctx, subject)
+	switch {
+	case err == nil:
+		stamp := raw.Time
+		if stamp.IsZero() {
+			stamp = time.Now()
+		}
+		t.ingest(raw.Data, stamp)
+	case errors.Is(err, jetstream.ErrMsgNotFound):
+		// pipeline has never published since the stream was created — fine
+	default:
+		slog.Warn("pipeline-state: replay failed", "err", err)
+	}
+
 	go func() {
 		<-ctx.Done()
+		_ = sub.Unsubscribe()
 		_ = t.nc.Drain()
 	}()
 	return nil
+}
+
+// ingest parses a pipeline state payload and stores it if newer than
+// what we already have. Shared between the live core-NATS sub and the
+// startup JetStream replay.
+func (t *StateTracker) ingest(data []byte, stamp time.Time) {
+	var s State
+	if err := json.Unmarshal(data, &s); err != nil {
+		slog.Warn("pipeline-state: bad payload", "err", err)
+		return
+	}
+	s.Stamped = stamp
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.known && stamp.Before(t.cur.Stamped) {
+		return
+	}
+	t.cur = s
+	t.known = true
 }
 
 // Current returns the last-known pipeline state. If the tracker has
