@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, HistoricDetection, Segment } from "@/lib/api";
 import { useMe, isAdmin as isAdminFn } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
+import { CameraDetectorChips } from "@/components/CameraDetectorChips";
 
 // Timeline: one day (local time) for one camera. Segments render as solid
 // bars across the 24h ruler; detections as coloured pins underneath.
@@ -191,6 +192,7 @@ export function Timeline() {
           detections={showOverlay ? detections : undefined}
           cameraId={cameraId}
           cameraEnabled={activeCamera?.enabled}
+          cameraEnabledDetectors={activeCamera?.enabled_detectors ?? []}
           isAdmin={admin}
         />
       </div>
@@ -217,6 +219,7 @@ function Player({
   detections,
   cameraId,
   cameraEnabled,
+  cameraEnabledDetectors,
   isAdmin,
 }: {
   clip: { segment: Segment; offsetSec: number } | null;
@@ -227,6 +230,7 @@ function Player({
   detections?: HistoricDetection[];
   cameraId: string;
   cameraEnabled?: boolean;
+  cameraEnabledDetectors?: string[];
   isAdmin: boolean;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
@@ -335,8 +339,14 @@ function Player({
         />
       )}
       {isAdmin && cameraId && cameraEnabled !== undefined && (
-        <div className="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="absolute top-2 right-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <CameraToggle cameraId={cameraId} enabled={cameraEnabled} variant="overlay" />
+          <CameraDetectorChips
+            cameraId={cameraId}
+            enabledDetectors={cameraEnabledDetectors ?? []}
+            disabled={!cameraEnabled}
+            variant="overlay"
+          />
         </div>
       )}
     </div>

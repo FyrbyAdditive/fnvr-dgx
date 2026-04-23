@@ -5,6 +5,7 @@ import { api, COCO_CLASSES } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
 import { useMe } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
+import { CameraDetectorChips } from "@/components/CameraDetectorChips";
 
 export function Live() {
   const { data: me } = useMe();
@@ -118,6 +119,7 @@ export function Live() {
               id={c.id}
               name={c.name}
               enabled={c.enabled}
+              enabledDetectors={c.enabled_detectors ?? []}
               state={c.state}
               lastHeartbeatAt={c.last_heartbeat_at ?? null}
               detections={boxesByCamera.get(c.id) ?? []}
@@ -133,10 +135,11 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, enabled, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
+function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
   id: string;
   name: string;
   enabled: boolean;
+  enabledDetectors: string[];
   state?: "starting" | "running" | "failed" | "unknown";
   lastHeartbeatAt?: string | null;
   detections: DetectionEvent[];
@@ -358,8 +361,14 @@ function CameraTile({ id, name, enabled, state, lastHeartbeatAt, detections, inf
         {name}
       </div>
       {isAdmin && (
-        <div className="absolute top-2 left-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="absolute top-2 left-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <CameraToggle cameraId={id} enabled={enabled} variant="overlay" />
+          <CameraDetectorChips
+            cameraId={id}
+            enabledDetectors={enabledDetectors}
+            disabled={!enabled}
+            variant="overlay"
+          />
         </div>
       )}
       {latest && (
