@@ -4,6 +4,7 @@ import { api, Camera } from "@/lib/api";
 import { loadCocoLabels } from "@/lib/classes";
 import { useMe } from "@/lib/me";
 import { ZoneEditor } from "./ZoneEditor";
+import { CameraToggle } from "@/components/CameraToggle";
 
 
 type Kind = "rtsp" | "v4l2" | "rtmp" | "http";
@@ -132,6 +133,7 @@ export function Cameras() {
 
 function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boolean; onDelete: () => void }) {
   const [expanded, setExpanded] = useState(false);
+  const qc = useQueryClient();
   return (
     <li className="text-sm">
       <div className="p-3 flex items-center gap-3">
@@ -149,12 +151,19 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
           </div>
         </div>
         {isAdmin && (
-          <button
-            className="text-xs text-red-400 hover:underline"
-            onClick={onDelete}
-          >
-            delete
-          </button>
+          <>
+            <CameraToggle
+              cameraId={camera.id}
+              enabled={camera.enabled}
+              onChange={() => qc.invalidateQueries({ queryKey: ["cameras"] })}
+            />
+            <button
+              className="text-xs text-red-400 hover:underline"
+              onClick={onDelete}
+            >
+              delete
+            </button>
+          </>
         )}
       </div>
       {expanded && isAdmin && (

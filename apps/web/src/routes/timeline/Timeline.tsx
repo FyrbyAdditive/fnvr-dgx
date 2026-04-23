@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, HistoricDetection, Segment } from "@/lib/api";
+import { useMe, isAdmin as isAdminFn } from "@/lib/me";
+import { CameraToggle } from "@/components/CameraToggle";
 
 // Timeline: one day (local time) for one camera. Segments render as solid
 // bars across the 24h ruler; detections as coloured pins underneath.
@@ -15,8 +17,11 @@ const ZOOM_DRAG_THRESHOLD_PX = 6;
 
 export function Timeline() {
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
+  const { data: me } = useMe();
+  const admin = isAdminFn(me);
   const [searchParams, setSearchParams] = useSearchParams();
   const [cameraId, setCameraId] = useState<string>("");
+  const activeCamera = useMemo(() => cameras.find((c) => c.id === cameraId), [cameras, cameraId]);
   const [dayKey, setDayKey] = useState<string>(() => todayKey());
   const [cursorMs, setCursorMs] = useState<number | null>(null);
 
@@ -184,6 +189,9 @@ export function Timeline() {
           clip={activeClip}
           onEnded={handleClipEnded}
           detections={showOverlay ? detections : undefined}
+          cameraId={cameraId}
+          cameraEnabled={activeCamera?.enabled}
+          isAdmin={admin}
         />
       </div>
 
@@ -207,6 +215,9 @@ function Player({
   clip,
   onEnded,
   detections,
+  cameraId,
+  cameraEnabled,
+  isAdmin,
 }: {
   clip: { segment: Segment; offsetSec: number } | null;
   onEnded: () => void;
@@ -214,6 +225,9 @@ function Player({
    *  using detections whose ts is near the current video frame. If
    *  undefined, overlay is disabled (default). */
   detections?: HistoricDetection[];
+  cameraId: string;
+  cameraEnabled?: boolean;
+  isAdmin: boolean;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   const url = clip ? api.segmentFileUrl(clip.segment.id) : "";
@@ -299,7 +313,7 @@ function Player({
   }
 
   return (
-    <div className="relative w-full h-full flex items-center justify-center">
+    <div className="group relative w-full h-full flex items-center justify-center">
       <video
         ref={ref}
         key={clip.segment.id}
@@ -319,6 +333,11 @@ function Player({
           videoSize={videoSize}
           detections={active}
         />
+      )}
+      {isAdmin && cameraId && cameraEnabled !== undefined && (
+        <div className="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+          <CameraToggle cameraId={cameraId} enabled={cameraEnabled} variant="overlay" />
+        </div>
       )}
     </div>
   );

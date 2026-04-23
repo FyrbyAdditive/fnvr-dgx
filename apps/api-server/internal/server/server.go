@@ -150,6 +150,8 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("PATCH /api/v1/cameras/{id}/detectors", auth.AdminFunc(s.handleUpdateCameraDetectors))
 		protected.Handle("PATCH /api/v1/cameras/{id}/classes", auth.AdminFunc(s.handleUpdateCameraClasses))
 		protected.Handle("PATCH /api/v1/cameras/{id}/storage", auth.AdminFunc(s.handleUpdateCameraStorage))
+		protected.Handle("POST /api/v1/cameras/{id}/enable", auth.AdminFunc(s.handleEnableCamera))
+		protected.Handle("POST /api/v1/cameras/{id}/disable", auth.AdminFunc(s.handleDisableCamera))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -574,6 +576,27 @@ func (s *Server) handleUpdateCameraDetectors(w http.ResponseWriter, r *http.Requ
 	}
 	if err != nil {
 		slog.Error("update camera detectors", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleEnableCamera(w http.ResponseWriter, r *http.Request) {
+	s.setCameraEnabled(w, r, true)
+}
+func (s *Server) handleDisableCamera(w http.ResponseWriter, r *http.Request) {
+	s.setCameraEnabled(w, r, false)
+}
+func (s *Server) setCameraEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	id := r.PathValue("id")
+	err := s.cameras.SetEnabled(r.Context(), id, enabled)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.Error("set camera enabled", "err", err, "camera_id", id, "enabled", enabled)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

@@ -233,6 +233,10 @@ export const api = {
     id: string,
     body: { retention_days?: number; quota_gb?: number },
   ) => req<void>(`/cameras/${id}/storage`, { method: "PATCH", body: JSON.stringify(body) }),
+  enableCamera: (id: string) =>
+    req<void>(`/cameras/${id}/enable`, { method: "POST" }),
+  disableCamera: (id: string) =>
+    req<void>(`/cameras/${id}/disable`, { method: "POST" }),
   systemStorage: () => req<SystemStorage>("/system/storage"),
 
   listZones: (cameraId?: string) =>

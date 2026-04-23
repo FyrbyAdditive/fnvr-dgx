@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom";
 import { api, COCO_CLASSES } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
 import { useMe } from "@/lib/me";
+import { CameraToggle } from "@/components/CameraToggle";
 
 export function Live() {
   const { data: me } = useMe();
@@ -116,6 +117,7 @@ export function Live() {
               key={c.id}
               id={c.id}
               name={c.name}
+              enabled={c.enabled}
               state={c.state}
               lastHeartbeatAt={c.last_heartbeat_at ?? null}
               detections={boxesByCamera.get(c.id) ?? []}
@@ -131,9 +133,10 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
+function CameraTile({ id, name, enabled, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
   id: string;
   name: string;
+  enabled: boolean;
   state?: "starting" | "running" | "failed" | "unknown";
   lastHeartbeatAt?: string | null;
   detections: DetectionEvent[];
@@ -282,7 +285,7 @@ function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps
   return (
     <div
       ref={tileRef}
-      className={`bg-neutral-900 rounded aspect-video relative overflow-hidden flex items-center justify-center transition-shadow ${
+      className={`group bg-neutral-900 rounded aspect-video relative overflow-hidden flex items-center justify-center transition-shadow ${
         highlight ? "ring-2 ring-emerald-400 shadow-[0_0_24px_rgba(52,211,153,0.55)]" : ""
       }`}
     >
@@ -354,6 +357,11 @@ function CameraTile({ id, name, state, lastHeartbeatAt, detections, inferenceFps
       <div className="absolute bottom-2 left-2 text-xs bg-black/60 px-2 py-0.5 rounded">
         {name}
       </div>
+      {isAdmin && (
+        <div className="absolute top-2 left-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+          <CameraToggle cameraId={id} enabled={enabled} variant="overlay" />
+        </div>
+      )}
       {latest && (
         <div className="absolute top-2 right-2 text-xs bg-blue-600/80 px-2 py-0.5 rounded">
           {latest.class_name} {(latest.confidence * 100).toFixed(0)}%
