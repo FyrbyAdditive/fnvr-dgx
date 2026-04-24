@@ -21,4 +21,4 @@ Prometheus client + middleware that wraps the main mux. See [docs/developer/metr
 
 ## Config
 
-`apps/api-server/internal/config/config.go`. Reads `FNVR_HTTP_ADDR`, `FNVR_DATABASE_URL`, `FNVR_NATS_URL`, `FNVR_REDIS_URL`, `FNVR_DATA_DIR` from env. Everything else lives in the `settings` key/value table — see [docs/operations/settings.md](../../docs/operations/settings.md).
+`apps/api-server/internal/config/config.go`. Reads `FNVR_HTTP_ADDR`, `FNVR_DATABASE_URL`, `FNVR_NATS_URL`, `FNVR_DATA_DIR`, `FNVR_MTX_API_URL` from env. Everything else lives in the `settings` key/value table — see [docs/operations/settings.md](../../docs/operations/settings.md).

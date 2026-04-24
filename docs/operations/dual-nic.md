@@ -90,8 +90,8 @@ What the override does:
 | `nats`     | `0.0.0.0:4222`, `0.0.0.0:8222` | `4222` withdrawn · `8222` on user NIC |
 | `mediamtx` | `0.0.0.0:8554`, `0.0.0.0:8889` | withdrawn (both) — usb-bridge + pipeline reach it via docker DNS |
 
-`postgres`, `redis`, `events`, `storage`, `notifications`, `pipeline`,
-and `usb-bridge` were never host-exposed; the override doesn't need to
+`postgres`, `events`, `storage`, `notifications`, `pipeline`, and
+`usb-bridge` were never host-exposed; the override doesn't need to
 touch them.
 
 ## 4. Verify

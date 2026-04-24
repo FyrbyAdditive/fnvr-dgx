@@ -26,11 +26,6 @@ services:
       timeout: 3s
       retries: 20
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-
   nats:
     image: nats:2-alpine
     restart: unless-stopped
@@ -63,13 +58,10 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
-      redis:
-        condition: service_started
     environment:
       FNVR_HTTP_ADDR: ":8081"
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
       FNVR_NATS_URL: "nats://nats:4222"
-      FNVR_REDIS_URL: "redis://redis:6379/0"
       FNVR_DATA_DIR: "/var/lib/fnvr"
       # MediaMTX runtime config API — api-server syncs per-camera
       # re-muxer paths here when mtx_proxy is toggled. Empty/unset

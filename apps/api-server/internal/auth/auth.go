@@ -63,8 +63,9 @@ type APIToken struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
-// Store handles user auth + (in-memory) session tokens.
-// Sessions move to Redis in M3 when we need to run >1 api-server replica.
+// Store handles user auth + (in-memory) session tokens. Single-
+// replica deploy; if we ever scale api-server horizontally, sessions
+// move to Postgres (same row lifetime as user_tokens).
 type Store struct {
 	pool *pgxpool.Pool
 	ttl  time.Duration

@@ -43,7 +43,7 @@ On first boot:
 
 - api-server runs goose migrations (22+ files) — this is fast.
 - pipeline waits for at least one enabled camera before building a TRT engine. Without a camera it idles.
-- nats + postgres + redis come up in seconds; everything else in under a minute if the images are local.
+- nats + postgres come up in seconds; everything else in under a minute if the images are local.
 
 Point your browser at `http://<orin-ip>:8080`. Default login `admin / admin` — change it immediately via **Settings → Users**.
 

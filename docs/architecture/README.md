@@ -36,7 +36,6 @@ fnvr is a split into a video pipeline (C++ / DeepStream on the Jetson), a Go con
 
   Datastores:  Postgres 16 + pgvector
                NATS (core) + JetStream (last-value state)
-               Redis (session cache, not load-bearing)
   Storage:     /var/lib/fnvr/recordings/YYYY/MM/DD/HH/<cam>/rec.mp4
                /var/lib/fnvr/models/{yolo26,anpr,faceid}/
                /var/lib/fnvr/thumbs/faces/<detection_id>.jpg

@@ -12,7 +12,7 @@ open http://localhost:8080
 
 What comes up:
 
-- `postgres`, `redis`, `nats` — stateful infra.
+- `postgres`, `nats` — stateful infra.
 - `api`, `events`, `storage`, `notifications`, `ml-worker`, `web` — the Go / Python / React services.
 - `mosquitto` — MQTT broker for Home Assistant + MQTT channel testing.
 
@@ -103,7 +103,6 @@ See [migrations.md](migrations.md) for schema evolution; [settings.md](../operat
 | Container | Image | Port |
 |---|---|---|
 | fnvr-postgres | postgres:16 + pgvector | 5432 (internal) |
-| fnvr-redis | redis:7 | 6379 (internal) |
 | fnvr-nats | nats:2 with JetStream | 4222 internal + 8222 monitor |
 | fnvr-mosquitto | eclipse-mosquitto | 1883 internal |
 | fnvr-api | fnvr-api:latest | 8081 (external) |

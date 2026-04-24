@@ -48,7 +48,7 @@ This is a large plan because the scope is large; it is structured so v1 can be b
       │                          active learning, face embedding index
       └──▶ webrtc-signaling (Go): WHEP/WHIP for live-view
 
-  Datastores:  Postgres 16 + TimescaleDB + pgvector | Redis | NATS JetStream
+  Datastores:  Postgres 16 + TimescaleDB + pgvector | NATS JetStream
   Bus:         NATS JetStream  (events, job queue, retries, DLQ)
   Storage:     /var/lib/fnvr/recordings/YYYY/MM/DD/HH/<cam>/<seg>.mp4
                /var/lib/fnvr/models /db /thumbs /datasets
