@@ -84,9 +84,27 @@ Pre-bake path: a `trtexec` invocation in [deploy/docker/calibrate-yolo26.sh](../
 
 ## Secondary inference (SGIEs)
 
-ANPR and face-ID run as secondary `nvinfer` elements chained after the primary detector + tracker. They only process objects whose class ID matches their "operate-on" list (cars for LPDNet, persons for SCRFD), so the GPU cost on a camera with no people in frame is near zero.
+ANPR and face-ID run as secondary `nvinfer` elements chained after the primary detector + tracker. They only process objects whose class ID matches their "operate-on" list (cars for LPDNet, persons for SCRFD), so the per-frame GPU cost on a camera with no candidates in frame is near zero — but the engine still sits in memory and the nvstreammux batch still binds to it, so *presence* in the graph has non-trivial cost.
 
-Per-camera enable/disable lives in `cameras.enabled_detectors` (a text array) + `settings.detector.anpr_enabled` / `settings.detector.face_id_enabled` (process-wide kill switches). The pipeline rebuilds its graph when those settings change.
+Per-camera enable/disable is effective-min of two controls:
+- **Pipeline-level kill switches** — `settings.detector.anpr_enabled` / `settings.detector.face_id_enabled`. Off = every worker's graph omits that SGIE chain. Flipping these restarts the whole pipeline container.
+- **Per-camera whitelist** — `cameras.enabled_detectors` (text array). Stored encoding:
+  - `[]` — all SGIEs permitted (friendly default for new rows)
+  - `["object","face"]` — whitelist; each listed kind enables its SGIE chain
+  - `["none"]` — explicit no-inference tier (see below)
+
+A camera only gets the ANPR chain (LPDNet + LPRNet) when the pipeline-level kill-switch is on AND `"anpr"` is in its whitelist (or the whitelist is empty). Same for face (SCRFD + ArcFace). The supervisor respawns only the affected worker when `enabled_detectors` changes, leaving the other cameras untouched.
+
+## No-AI tier
+
+When `enabled_detectors = ["none"]`, the pipeline builds a dramatically shorter graph for that camera:
+
+- **No inference branch.** No nvv4l2decoder on the record side (when rotation=0), no nvstreammux, no pgie, no nvtracker, no SGIEs, no NVENC. The source H.264 is passed straight from the pre-tee parser into qtmux → filesink. Cheapest possible path — only the RTSP demux + h264parse + muxing runs per-frame.
+- **Rotation still works.** If a no-AI camera has `rotation != 0`, the pre-tee transcode path (decode → nvvideoconvert flip-method → NVENC) still runs; the record branch then passes the re-encoded H.264 through qtmux with no inference attached.
+- **Live preview + WHEP unchanged.** Both branches tap from the same `tee` before inference ever runs, so preview JPEGs and WHEP live video work identically to a full-inference camera.
+- **No NATS publishing.** The InferSrcProbe is not attached (there's nothing to probe), so no `fnvr.events.detection.<cam>` messages come from this worker. Upstream consumers (event-processor, SSE, HA bridge) see nothing for it.
+
+Use case: cameras that exist for recording + monitoring but don't need detection (e.g. a garage camera you only look at when something happened), or sources whose H.264 is too corrupt for NVDEC to handle reliably.
 
 ## Watchdogs + hard-exit policy
 

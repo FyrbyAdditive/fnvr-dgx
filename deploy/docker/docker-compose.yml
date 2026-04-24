@@ -71,6 +71,10 @@ services:
       FNVR_NATS_URL: "nats://nats:4222"
       FNVR_REDIS_URL: "redis://redis:6379/0"
       FNVR_DATA_DIR: "/var/lib/fnvr"
+      # MediaMTX runtime config API — api-server syncs per-camera
+      # re-muxer paths here when mtx_proxy is toggled. Empty/unset
+      # disables the integration gracefully.
+      FNVR_MTX_API_URL: "http://mediamtx:9997"
     volumes:
       - fnvr-data:/var/lib/fnvr
       # 1-fps JPEG preview ring lives on tmpfs — small, constantly
@@ -257,6 +261,19 @@ services:
       MTX_PATHS_TEST_SOURCEONDEMAND: "no"
       MTX_PATHS_USB0_SOURCE: "publisher"
       MTX_PATHS_USB0_SOURCEONDEMAND: "no"
+      # Runtime config API. api-server adds/removes proxy_<camera_id>
+      # paths via this for cameras with mtx_proxy=true. Bound to the
+      # internal docker network only (no host port mapping below).
+      MTX_API: "yes"
+      MTX_APIADDRESS: ":9997"
+      # Add a second user entry that allows the config API from
+      # private docker/LAN ranges. MTX 1.17+ gates the API behind auth
+      # and the default user (_0_) only permits publish/read/playback;
+      # we keep those defaults intact and add this one for api-server.
+      # No host port binding on 9997, so this remains internal-only.
+      MTX_AUTHINTERNALUSERS_1_USER: "any"
+      MTX_AUTHINTERNALUSERS_1_IPS: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.1"
+      MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_ACTION: "api"
     ports:
       - "8554:8554" # rtsp
       - "8889:8889" # webrtc (optional)

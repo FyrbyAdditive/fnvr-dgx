@@ -40,7 +40,13 @@ type Camera struct {
 	// Rotation is the clockwise software rotation applied by the pipeline,
 	// in degrees. Valid: 0, 90, 180, 270. Used to correct cameras that
 	// can't be physically reoriented.
-	Rotation              int       `json:"rotation"`
+	Rotation int `json:"rotation"`
+	// MtxProxy routes the pipeline worker through the local MediaMTX
+	// re-muxer instead of pulling the source URL directly. Only useful
+	// for cameras with corrupt RTSP streams (qtmux chokes on broken
+	// Rockchip-style NAL framing); the UI only offers it for no-AI
+	// cameras (enabled_detectors=["none"]).
+	MtxProxy              bool      `json:"mtx_proxy"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }
@@ -56,7 +62,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       rotation, created_at, updated_at
+		       rotation, mtx_proxy, created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -68,7 +74,8 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		if err := rows.Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode,
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
 			&c.EnabledDetectors, &c.LocationKind, &c.MuteClassesOverride,
-			&c.UnmuteClassesOverride, &c.Rotation, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.UnmuteClassesOverride, &c.Rotation, &c.MtxProxy,
+			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -82,12 +89,12 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       rotation, created_at, updated_at
+		       rotation, mtx_proxy, created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
 			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
 			&c.LocationKind, &c.MuteClassesOverride, &c.UnmuteClassesOverride,
-			&c.Rotation, &c.CreatedAt, &c.UpdatedAt)
+			&c.Rotation, &c.MtxProxy, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
@@ -348,6 +355,23 @@ func (s *Store) SetRotation(ctx context.Context, id string, rotation int) error 
 		return fmt.Errorf("invalid rotation %d", rotation)
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE cameras SET rotation=$1, updated_at=NOW() WHERE id=$2`, rotation, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetMtxProxy toggles the per-camera MediaMTX re-muxer flag. The UI
+// only surfaces this for no-AI cameras, but the backend doesn't
+// enforce that — keeping the two columns independent means an
+// operator doing a CSV bulk import can set them in any order.
+func (s *Store) SetMtxProxy(ctx context.Context, id string, enabled bool) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE cameras SET mtx_proxy=$1, updated_at=NOW() WHERE id=$2`,
+		enabled, id)
 	if err != nil {
 		return err
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
 	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
 	"github.com/fnvr/fnvr/apps/api-server/internal/mlworker"
+	"github.com/fnvr/fnvr/apps/api-server/internal/mtxproxy"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
@@ -165,6 +166,18 @@ func runServe() error {
 		return fmt.Errorf("pipeline state start: %w", err)
 	}
 
+	// MediaMTX re-muxer integration: optional. If configured, we expose
+	// a callback that the camera PATCH handlers invoke after toggling
+	// mtx_proxy, and we run one reconcile at boot to prime MediaMTX's
+	// paths (they don't persist across MTX restarts).
+	var mtxReconcileCb func(context.Context)
+	if cfg.MtxAPIURL != "" {
+		mtxClient := mtxproxy.New(cfg.MtxAPIURL)
+		mtxRec := mtxproxy.NewReconciler(mtxClient, camStore)
+		mtxRec.Reconcile(ctx)
+		mtxReconcileCb = mtxRec.Reconcile
+	}
+
 	segStore := segments.NewStore(pool)
 	srv := server.New(server.Deps{
 		Config:        cfg,
@@ -182,6 +195,7 @@ func runServe() error {
 		Settings:      settings.NewStore(pool),
 		PipelineStat:  pipelineStat,
 		NatsPublish:   pipelineStat.Publish,
+		MtxReconcile:  mtxReconcileCb,
 		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),
 		Plates:        plates.NewStore(pool),
 		Persons:       persons.NewStore(pool),

@@ -102,7 +102,8 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
     }
 
     const char* q =
-        "SELECT id, url, COALESCE(substream,''), record_mode, rotation "
+        "SELECT id, url, COALESCE(substream,''), record_mode, rotation, "
+        "       enabled_detectors, mtx_proxy "
         "FROM cameras WHERE enabled = TRUE "
         "ORDER BY created_at ASC";
     PGresult* r = PQexec(conn, q);
@@ -125,6 +126,11 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
             c.rotation = std::stoi(PQgetvalue(r, i, 4));
         } catch (...) {
             c.rotation = 0;
+        }
+        c.enabled_detectors = parsePgArray(pgGetValueOrEmpty(r, i, 5));
+        {
+            std::string v = pgGetValueOrEmpty(r, i, 6);
+            c.mtx_proxy = (v == "t" || v == "true" || v == "1");
         }
         out.push_back(std::move(c));
     }
@@ -215,6 +221,47 @@ int ReadRotationForCamera(
     PQclear(r);
     PQfinish(conn);
     return rotation;
+}
+
+std::vector<std::string> ReadEnabledDetectorsForCamera(
+    const std::string& url, const std::string& camera_id) {
+    std::vector<std::string> out;
+    PGconn* conn = PQconnectdb(url.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        std::cerr << "db[det]: connect failed: " << PQerrorMessage(conn);
+        PQfinish(conn);
+        return out;
+    }
+    const char* q = "SELECT enabled_detectors FROM cameras WHERE id = $1";
+    const char* params[1] = { camera_id.c_str() };
+    PGresult* r = PQexecParams(conn, q, 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1) {
+        out = parsePgArray(pgGetValueOrEmpty(r, 0, 0));
+    }
+    PQclear(r);
+    PQfinish(conn);
+    return out;
+}
+
+bool ReadMtxProxyForCamera(
+    const std::string& url, const std::string& camera_id) {
+    PGconn* conn = PQconnectdb(url.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        std::cerr << "db[mtx]: connect failed: " << PQerrorMessage(conn);
+        PQfinish(conn);
+        return false;
+    }
+    const char* q = "SELECT mtx_proxy FROM cameras WHERE id = $1";
+    const char* params[1] = { camera_id.c_str() };
+    PGresult* r = PQexecParams(conn, q, 1, nullptr, params, nullptr, nullptr, 0);
+    bool mtx = false;
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1) {
+        std::string v = pgGetValueOrEmpty(r, 0, 0);
+        mtx = (v == "t" || v == "true" || v == "1");
+    }
+    PQclear(r);
+    PQfinish(conn);
+    return mtx;
 }
 
 }  // namespace fnvr

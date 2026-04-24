@@ -24,6 +24,18 @@ namespace fnvr {
 
 using namespace std::chrono_literals;
 
+// detectorsEqual compares two enabled_detectors lists ignoring order.
+// The UI chip-picker writes items in click order (e.g. {"face","object"})
+// while freshly-created rows default to {} or whatever psql ordering;
+// we care about set equality, not sequence.
+static bool detectorsEqual(const std::vector<std::string>& a,
+                           const std::vector<std::string>& b) {
+    if (a.size() != b.size()) return false;
+    std::set<std::string> as(a.begin(), a.end());
+    std::set<std::string> bs(b.begin(), b.end());
+    return as == bs;
+}
+
 Supervisor::Supervisor(Config cfg, NatsPublisher* nats)
     : cfg_(std::move(cfg)), nats_(nats) {}
 
@@ -94,6 +106,26 @@ void Supervisor::reconcileOnce() {
         } else if (wi->second->url != it->second->cam.url) {
             std::cerr << "supervisor: stopping [" << it->first
                       << "] (url changed)\n";
+            it->second->stop = true;
+            if (it->second->thread.joinable()) it->second->thread.join();
+            it = workers_.erase(it);
+        } else if (!detectorsEqual(wi->second->enabled_detectors,
+                                    it->second->cam.enabled_detectors)) {
+            // The per-camera detector whitelist shapes the graph (SGIE
+            // chains present/absent, skip_inference tier). A change
+            // means the worker must respawn with a rebuilt graph;
+            // event-processor alone doesn't know about the pipeline
+            // shape.
+            std::cerr << "supervisor: stopping [" << it->first
+                      << "] (enabled_detectors changed)\n";
+            it->second->stop = true;
+            if (it->second->thread.joinable()) it->second->thread.join();
+            it = workers_.erase(it);
+        } else if (wi->second->mtx_proxy != it->second->cam.mtx_proxy) {
+            std::cerr << "supervisor: stopping [" << it->first
+                      << "] (mtx_proxy changed "
+                      << it->second->cam.mtx_proxy << " -> "
+                      << wi->second->mtx_proxy << ")\n";
             it->second->stop = true;
             if (it->second->thread.joinable()) it->second->thread.join();
             it = workers_.erase(it);

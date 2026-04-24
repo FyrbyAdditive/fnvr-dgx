@@ -172,6 +172,7 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
           <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />
           <RotationSelect camera={camera} />
+          <MtxProxyToggle camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
         </div>
       )}
@@ -363,6 +364,50 @@ function RotationSelect({ camera }: { camera: Camera }) {
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// MtxProxyToggle routes the pipeline worker through the local MediaMTX
+// re-muxer instead of pulling the source URL directly. Useful for
+// broken RTSP streams (corrupt H.264 / bad NAL framing) where MediaMTX
+// re-normalises the bitstream before we record or decode it. Only
+// rendered for no-AI cameras since NVDEC is already tolerant enough for
+// detection paths.
+function MtxProxyToggle({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const stored = camera.enabled_detectors ?? [];
+  const isNoAI = stored.length === 1 && stored[0] === "none";
+  const current = !!camera.mtx_proxy;
+  const update = useMutation({
+    mutationFn: (enabled: boolean) =>
+      api.updateCameraMtxProxy(camera.id, enabled),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+  });
+  if (!isNoAI) return null;
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800">
+      <div className="text-xs text-neutral-400 mb-1">MediaMTX re-muxer</div>
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          checked={current}
+          disabled={update.isPending}
+          onChange={(e) => update.mutate(e.target.checked)}
+        />
+        <span>
+          Route source through MediaMTX
+          <span className="text-neutral-600">
+            {" "}
+            · laundering for broken RTSP streams
+          </span>
+        </span>
+      </label>
+      {current && (
+        <div className="mt-1 text-[11px] text-neutral-500 font-mono">
+          pipeline pulls: rtsp://mediamtx:8554/proxy_{camera.id}
+        </div>
+      )}
     </div>
   );
 }

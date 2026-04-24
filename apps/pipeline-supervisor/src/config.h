@@ -19,6 +19,20 @@ struct CameraConfig {
     // Clockwise software rotation applied to the decoded stream before
     // encode/record. Valid: 0, 90, 180, 270. Zero is the hot path.
     int rotation = 0;
+    // Per-camera detector whitelist from cameras.enabled_detectors.
+    // Encoding convention (matches event-processor + UI):
+    //   empty        — all SGIE chains permitted (subject to pipeline-
+    //                  level kill switches)
+    //   ["none"]     — no inference at all; pipeline builds a
+    //                  passthrough record branch
+    //   ["object"]   — PGIE only, no ANPR/face SGIEs
+    //   ["object","anpr","face"] etc — whitelist
+    std::vector<std::string> enabled_detectors;
+    // When true, the pipeline rewrites the rtspsrc URL to
+    // rtsp://mediamtx:8554/proxy_<id> — MediaMTX has already been
+    // configured by api-server to proxy the real upstream URL. Used to
+    // launder broken RTSP bitstreams through a software re-muxer.
+    bool mtx_proxy = false;
 };
 
 struct Config {

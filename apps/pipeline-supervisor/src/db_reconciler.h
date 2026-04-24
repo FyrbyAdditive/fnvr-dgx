@@ -30,4 +30,18 @@ std::set<std::string> ReadMutedClassesForCamera(
 int ReadRotationForCamera(
     const std::string& database_url, const std::string& camera_id);
 
+// ReadEnabledDetectorsForCamera fetches the `enabled_detectors` text[]
+// column. Returns an empty vector on any error — callers treat empty
+// as "all detectors enabled" (the friendly default shared with the
+// event-processor + UI). A returned ["none"] means the operator
+// explicitly opted this camera out of inference.
+std::vector<std::string> ReadEnabledDetectorsForCamera(
+    const std::string& database_url, const std::string& camera_id);
+
+// ReadMtxProxyForCamera returns the cameras.mtx_proxy flag. Defaults
+// to false on any error. When true, the worker rewrites the rtspsrc
+// URL to pull via MediaMTX instead of the source directly.
+bool ReadMtxProxyForCamera(
+    const std::string& database_url, const std::string& camera_id);
+
 }  // namespace fnvr

@@ -82,6 +82,20 @@ int main(int argc, char** argv) {
             std::cerr << "worker[" << cam.id << "]: rotation=" << cam.rotation
                       << " (forces transcode path)\n";
         }
+        cam.enabled_detectors = fnvr::ReadEnabledDetectorsForCamera(
+            cfg.database_url, cam.id);
+        if (!cam.enabled_detectors.empty()) {
+            std::string joined;
+            for (const auto& d : cam.enabled_detectors) {
+                if (!joined.empty()) joined += ",";
+                joined += d;
+            }
+            std::cerr << "worker[" << cam.id << "]: detectors=" << joined << "\n";
+        }
+        cam.mtx_proxy = fnvr::ReadMtxProxyForCamera(cfg.database_url, cam.id);
+        if (cam.mtx_proxy) {
+            std::cerr << "worker[" << cam.id << "]: mtx_proxy=on\n";
+        }
 
         fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
                                       cfg.use_deepstream, cfg.use_anpr, cfg.use_face_id,

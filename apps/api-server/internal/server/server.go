@@ -50,6 +50,11 @@ type Server struct {
 	settings     *settings.Store
 	pipelineStat *pipeline.StateTracker
 	natsPublish  func(subject string, data []byte) error
+	// mtxReconcile is called after any mutation that could change the
+	// desired MediaMTX proxy-path set (mtx_proxy toggle, url change on a
+	// proxied camera, etc.). nil on deployments where MediaMTX isn't in
+	// the stack — handlers skip the hook.
+	mtxReconcile func(ctx context.Context)
 	detections   *detections.Store
 	plates       *plates.Store
 	persons      *persons.Store
@@ -73,6 +78,7 @@ type Deps struct {
 	Settings      *settings.Store
 	PipelineStat  *pipeline.StateTracker
 	NatsPublish   func(subject string, data []byte) error
+	MtxReconcile  func(ctx context.Context)
 	Detections    *detections.Store
 	Plates        *plates.Store
 	Persons       *persons.Store
@@ -97,6 +103,7 @@ func New(d Deps) *Server {
 		settings:     d.Settings,
 		pipelineStat: d.PipelineStat,
 		natsPublish:  d.NatsPublish,
+		mtxReconcile: d.MtxReconcile,
 		detections:   d.Detections,
 		plates:       d.Plates,
 		persons:      d.Persons,
@@ -154,6 +161,7 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("POST /api/v1/cameras/{id}/enable", auth.AdminFunc(s.handleEnableCamera))
 		protected.Handle("POST /api/v1/cameras/{id}/disable", auth.AdminFunc(s.handleDisableCamera))
 		protected.Handle("PATCH /api/v1/cameras/{id}/rotation", auth.AdminFunc(s.handleUpdateCameraRotation))
+		protected.Handle("PATCH /api/v1/cameras/{id}/mtx_proxy", auth.AdminFunc(s.handleUpdateCameraMtxProxy))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -498,6 +506,7 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			"mute_classes_override":    c.MuteClassesOverride,
 			"unmute_classes_override":  c.UnmuteClassesOverride,
 			"rotation":                 c.Rotation,
+			"mtx_proxy":                c.MtxProxy,
 			"created_at":               c.CreatedAt,
 			"updated_at":               c.UpdatedAt,
 			"state":                    state,
@@ -630,6 +639,33 @@ func (s *Server) handleUpdateCameraRotation(w http.ResponseWriter, r *http.Reque
 		// Validator rejects anything outside {0,90,180,270}.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateCameraMtxProxy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MtxProxy bool `json:"mtx_proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.cameras.SetMtxProxy(r.Context(), id, body.MtxProxy); err != nil {
+		if errors.Is(err, camera.ErrNotFound) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("set mtx_proxy", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Kick the MediaMTX reconciler so the change takes effect live. Best-
+	// effort — a failure here doesn't fail the request; reconciler also
+	// runs periodically (and on next api-server start).
+	if s.mtxReconcile != nil {
+		go s.mtxReconcile(context.Background())
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

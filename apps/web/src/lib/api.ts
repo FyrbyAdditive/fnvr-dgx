@@ -42,6 +42,10 @@ export type Camera = {
   unmute_classes_override?: string[];
   /** Clockwise software rotation applied by the pipeline. */
   rotation?: 0 | 90 | 180 | 270;
+  /** If true, the pipeline pulls this camera via the local MediaMTX
+   *  re-muxer instead of the source URL directly. Only surfaced in the
+   *  UI for no-AI cameras (enabled_detectors=["none"]). */
+  mtx_proxy?: boolean;
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
   /** Last time the api-server saw a heartbeat on
@@ -251,6 +255,11 @@ export const api = {
     }),
   updateCameraBasics: (id: string, body: { name?: string; url?: string }) =>
     req<void>(`/cameras/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateCameraMtxProxy: (id: string, mtx_proxy: boolean) =>
+    req<void>(`/cameras/${id}/mtx_proxy`, {
+      method: "PATCH",
+      body: JSON.stringify({ mtx_proxy }),
+    }),
   systemStorage: () => req<SystemStorage>("/system/storage"),
 
   listZones: (cameraId?: string) =>

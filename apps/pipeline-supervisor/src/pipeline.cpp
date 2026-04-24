@@ -661,9 +661,29 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // everything else → rtspsrc (good default for RTSP, and rtspsrc also
     // tolerates SRT/RTMP when paired with protocols=). Additional schemes
     // (rtmpsrc, srtsrc) land with the upstream source-factory rework in M3.
-    const std::string url = cam_.url;
+    // Per-camera MediaMTX re-muxer: when enabled, swap the source URL
+    // for the local MediaMTX path that api-server has already wired
+    // up to proxy the real upstream. The source looks like a normal
+    // RTSP server to us — rtspsrc, h264parse, everything downstream
+    // — but MediaMTX has re-normalised the H.264 framing so qtmux
+    // and NVDEC see a clean bitstream.
+    std::string url = cam_.url;
+    if (cam_.mtx_proxy) {
+        url = "rtsp://mediamtx:8554/proxy_" + cam_.id;
+        std::cerr << "pipeline[" << cam_.id << "]: via mediamtx proxy ("
+                  << url << ")\n";
+    }
     const bool is_v4l2 = url.rfind("v4l2://", 0) == 0;
     const std::string v4l2_dev = is_v4l2 ? url.substr(7) : "";
+
+    // Detector-shape flag computed early because the transcode branch
+    // above the tee needs to know it (the pre-tee h264parse is only
+    // needed when an inference branch exists downstream). The full
+    // per-camera detector resolution (wants_anpr_ / wants_face_) is
+    // done later where the SGIE chain strings get built.
+    const bool skip_inference_early =
+        cam_.enabled_detectors.size() == 1 &&
+        cam_.enabled_detectors[0] == "none";
 
     // Live-thumbnail sidecar. A tee branch downsamples to 1 fps and writes
     // a single JPEG file that gets rewritten each second. The
@@ -768,8 +788,17 @@ p << "rtspsrc location=" << url
                  "nvvideoconvert flip-method=" << flip_method << " ! "
                  "video/x-raw(memory:NVMM),format=NV12,width=" << tw
                  << ",height=" << th << " ! "
-                 "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
-                 "h264parse config-interval=1 ! ";
+                 "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! ";
+            // The pre-tee h264parse is only needed when the
+            // inference branch does a second decode+encode (the tee
+            // output is already parsed once by then). For
+            // skip_inference+rotation the record branch is a direct
+            // passthrough to qtmux — a second parser through the tee
+            // makes qtmux fail at caps negotiation with
+            // "Could not multiplex stream". Skip it in that case.
+            if (!skip_inference_early) {
+                p << "h264parse config-interval=1 ! ";
+            }
             rec_width_ = tw;
             rec_height_ = th;
         } else {
@@ -795,13 +824,35 @@ p << "rtspsrc location=" << url
 
     p << "tee name=t ";
 
-    // --- Recording + inference branch ---
-    // For v4l2 sources we keep inference (live detection works) but drop
-    // the recording portion. splitmuxsink asserts on first-buffer-not-
-    // keyframe for NVENC H.265 on USB, and mp4mux+filesink EOSes after
-    // nvinfer's model load. Both failure modes are upstream-quirks
-    // specific to the USB pipeline shape; recording comes back when
-    // we solve them properly (probably by app-level mp4 rotation).
+    // Per-camera detector resolution.
+    //   enabled_detectors == []         → all SGIEs permitted
+    //     (subject to pipeline-level kill switches below)
+    //   enabled_detectors == ["none"]   → no inference at all; build a
+    //     passthrough record branch and skip attaching the probe
+    //   otherwise                       → whitelist membership check
+    // Pipeline-level use_anpr_ / use_face_id_ remain the upper bound
+    // (a global kill switch). The per-camera flags only *narrow*.
+    const auto& det = cam_.enabled_detectors;
+    const bool skip_inference_ = det.size() == 1 && det[0] == "none";
+    auto detectorListed = [&](const char* kind) {
+        if (det.empty()) return true;  // "all" convention
+        for (const auto& v : det) if (v == kind) return true;
+        return false;
+    };
+    const bool wants_anpr_ = use_anpr_    && !skip_inference_ && detectorListed("anpr");
+    const bool wants_face_ = use_face_id_ && !skip_inference_ && detectorListed("face");
+
+    // --- Recording branch ---
+    // Three shapes depending on per-camera detector config:
+    //   1. skip_inference_ + rotation==0 → pure H.264 passthrough.
+    //      No decode, no NVENC, no inference — cheapest possible, and
+    //      the only viable shape for sources we don't want to spend
+    //      GPU on (e.g. corrupt-stream cameras recorded for evidence).
+    //   2. skip_inference_ + rotation!=0 → decode → rotate → encode,
+    //      but no PGIE/tracker/SGIEs on this branch. Happens when an
+    //      operator explicitly disabled detection on a rotated cam.
+    //   3. full inference branch (default) — pgie + tracker + any
+    //      enabled SGIE chains, then nvvideoconvert + NVENC + qtmux.
     p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
 
     // Use the probed recording dims if we have them, falling back to 1080p.
@@ -817,7 +868,7 @@ p << "rtspsrc location=" << url
     // pgie obj_meta via unique_component_id. Empty string when ANPR
     // is off — the primary chain is unchanged.
     std::string anpr_chain;
-    if (use_anpr_) {
+    if (wants_anpr_) {
         anpr_chain =
             "nvinfer name=lpdnet config-file-path=/etc/fnvr/nvinfer/lpdnet.txt ! "
             "nvinfer name=lprnet config-file-path=/etc/fnvr/nvinfer/lprnet.txt ! ";
@@ -828,13 +879,29 @@ p << "rtspsrc location=" << url
     // ArcFace surfaces its 512-d output via tensor-meta; the probe
     // base64-encodes it into attributes.embedding.
     std::string face_chain;
-    if (use_face_id_) {
+    if (wants_face_) {
         face_chain =
             "nvinfer name=scrfd  config-file-path=/etc/fnvr/nvinfer/scrfd.txt ! "
             "nvinfer name=arcface config-file-path=/etc/fnvr/nvinfer/arcface.txt ! ";
     }
 
-    if (use_deepstream_ && is_v4l2) {
+    if (skip_inference_) {
+        // No-AI tier: the stream into the tee is already parsed H.264
+        // (either source-passthrough or post-rotation transcode above).
+        // Route it straight into qtmux — no decode/re-encode here. The
+        // post-tee h264parse converts byte-stream → avc (length-
+        // prefixed) for qtmux; the pre-tee parser in the transcode
+        // path is explicitly pinned to byte-stream output so the two
+        // parsers don't conflict through the tee.
+        p << "h264parse name=recparse config-interval=-1 ! "
+             "video/x-h264,stream-format=avc,alignment=au ! "
+             "queue max-size-buffers=300 max-size-time=2000000000 "
+             "  max-size-bytes=0 ! "
+             "qtmux reserved-max-duration=4500000000000 "
+             "      reserved-moov-update-period=1000000000 ! "
+             "filesink location=" << dir.string() << "/rec.mp4 "
+             "         append=false ";
+    } else if (use_deepstream_ && is_v4l2) {
         p << "nvv4l2decoder ! "
              "mux.sink_0 nvstreammux name=mux batch-size=1 "
              "  width=" << mux_w << " height=" << mux_h
@@ -948,7 +1015,12 @@ p << "rtspsrc location=" << url
     }
 
 #if FNVR_HAS_DEEPSTREAM
-    if (use_deepstream_ && nats_) {
+    // Per-camera skip_inference tier has no nvinfer elements at all —
+    // nothing to probe, nothing to publish. The recording + WHEP +
+    // thumbnail branches still work without the probe.
+    const bool skip_inference_probe = cam_.enabled_detectors.size() == 1 &&
+                                       cam_.enabled_detectors[0] == "none";
+    if (use_deepstream_ && nats_ && !skip_inference_probe) {
         // Attach the detection probe to the LAST nvinfer in the
         // active chain. SGIE-produced obj_meta + user_meta only
         // appears on buffers downstream of the SGIE, so a probe on
