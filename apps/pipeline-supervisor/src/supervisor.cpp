@@ -129,6 +129,14 @@ void Supervisor::reconcileOnce() {
             it->second->stop = true;
             if (it->second->thread.joinable()) it->second->thread.join();
             it = workers_.erase(it);
+        } else if (wi->second->detector_backend != it->second->cam.detector_backend) {
+            std::cerr << "supervisor: stopping [" << it->first
+                      << "] (detector_backend changed "
+                      << it->second->cam.detector_backend << " -> "
+                      << wi->second->detector_backend << ")\n";
+            it->second->stop = true;
+            if (it->second->thread.joinable()) it->second->thread.join();
+            it = workers_.erase(it);
         } else {
             ++it;
         }

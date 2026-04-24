@@ -96,6 +96,12 @@ int main(int argc, char** argv) {
         if (cam.mtx_proxy) {
             std::cerr << "worker[" << cam.id << "]: mtx_proxy=on\n";
         }
+        cam.detector_backend = fnvr::ReadDetectorBackendForCamera(
+            cfg.database_url, cam.id);
+        if (cam.detector_backend != "trt") {
+            std::cerr << "worker[" << cam.id << "]: detector_backend="
+                      << cam.detector_backend << "\n";
+        }
         // Inform pipeline's bus-error path of the startup grace window
         // so transient faults during warmup don't publish `failed` to
         // the UI. Reads from the same settings key the supervisor uses.

@@ -33,6 +33,11 @@ struct CameraConfig {
     // configured by api-server to proxy the real upstream URL. Used to
     // launder broken RTSP bitstreams through a software re-muxer.
     bool mtx_proxy = false;
+    // Primary-detector backend: "trt" (default, DeepStream nvinfer on
+    // the Orin GPU) or "hailo" (hailonet via Hailo-8 PCIe
+    // accelerator). Per-camera so operators migrate one camera at a
+    // time and choose which cameras get the scarce Hailo compute.
+    std::string detector_backend = "trt";
 };
 
 struct Config {

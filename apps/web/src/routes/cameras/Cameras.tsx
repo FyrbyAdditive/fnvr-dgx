@@ -171,6 +171,7 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
           <BasicsEditor camera={camera} />
           <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />
+          <DetectorBackendSelect camera={camera} />
           <RotationSelect camera={camera} />
           <MtxProxyToggle camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
@@ -328,6 +329,56 @@ function BasicsEditor({ camera }: { camera: Camera }) {
           {err && <span className="text-red-400">{err}</span>}
           <span className="text-neutral-600 ml-auto">id: {camera.id}</span>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// DetectorBackendSelect picks which inference engine runs this
+// camera's primary object detector (PGIE). "TensorRT (GPU)" is the
+// existing DeepStream nvinfer path; "Hailo-8 (PCIe)" offloads to the
+// Hailo accelerator, freeing GPU for SGIEs + encode. The Hailo option
+// is only enabled when /dev/hailo0 is reachable from the api-server
+// container (host driver + HailoRT installed + bind-mounted in).
+function DetectorBackendSelect({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const { data: hailo } = useQuery({
+    queryKey: ["system-hailo"],
+    queryFn: api.getHailoStatus,
+    // This rarely changes — polling every 30s is plenty, and it's
+    // cheap (single syscall inside the container).
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+  const current = camera.detector_backend ?? "trt";
+  const update = useMutation({
+    mutationFn: (backend: "trt" | "hailo") =>
+      api.updateCameraDetectorBackend(camera.id, backend),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+  });
+  const hailoPresent = hailo?.present ?? false;
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800">
+      <div className="text-xs text-neutral-400 mb-1">Detector backend</div>
+      <div className="flex items-center gap-2 text-xs">
+        <select
+          className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+          value={current}
+          disabled={update.isPending}
+          onChange={(e) =>
+            update.mutate(e.target.value as "trt" | "hailo")
+          }
+        >
+          <option value="trt">TensorRT (GPU)</option>
+          <option value="hailo" disabled={!hailoPresent}>
+            Hailo-8 (PCIe){hailoPresent ? "" : " — not detected"}
+          </option>
+        </select>
+        {current === "hailo" && (
+          <span className="text-neutral-500">
+            primary detector offloaded to Hailo-8
+          </span>
+        )}
       </div>
     </div>
   );

@@ -1,0 +1,38 @@
+# Overlay to enable the Hailo-8 PCIe accelerator for the pipeline container.
+# Only compose this on a host where deploy/hailo/install-hailo-host.sh has
+# been run (driver loaded, /dev/hailo0 present, HailoRT userspace installed
+# to /usr/local on the host).
+#
+# The pipeline container has its own libhailort.so built into the image
+# (see deploy/docker/Dockerfile.pipeline). We still bind-mount the host
+# copy over the in-image one so host driver ABI and container userspace
+# stay in lockstep — the Hailo PCIe driver's ioctl interface is strictly
+# versioned against libhailort; a mismatch produces silent VDevice::create
+# failures with status codes in the 500 range.
+#
+# We deliberately do NOT mount the hailonet GStreamer plugin or TAPPAS.
+# The fnvr pipeline uses libhailort's C++ API directly from a pad probe
+# (see apps/pipeline-supervisor/src/hailo_probe.cpp) so those components
+# are never loaded.
+#
+# Usage:
+#   sudo docker compose \
+#     -f deploy/docker/docker-compose.yml \
+#     -f deploy/docker/docker-compose.hailo.yml \
+#     up -d pipeline
+#
+# If /dev/hailo0 doesn't exist on the host, the pipeline container won't
+# start. That's by design: attempting to run the Hailo backend without the
+# device would confuse the operator silently. Omit this overlay on hosts
+# without Hailo hardware.
+services:
+  pipeline:
+    devices:
+      - /dev/hailo0
+    volumes:
+      # HailoRT C++ runtime — host build takes precedence over the in-image
+      # fallback so driver ABI and userspace stay aligned.
+      - /usr/local/lib/libhailort.so:/usr/local/lib/libhailort.so:ro
+      - /usr/local/lib/libhailort.so.4:/usr/local/lib/libhailort.so.4:ro
+      # hailortcli for in-container debug (`hailortcli scan`, `fw-control identify`).
+      - /usr/local/bin/hailortcli:/usr/local/bin/hailortcli:ro

@@ -164,6 +164,8 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("PATCH /api/v1/cameras/{id}/rotation", auth.AdminFunc(s.handleUpdateCameraRotation))
 		protected.Handle("PATCH /api/v1/cameras/{id}/mtx_proxy", auth.AdminFunc(s.handleUpdateCameraMtxProxy))
 		protected.Handle("PATCH /api/v1/cameras/{id}/mtx_tls_ignore", auth.AdminFunc(s.handleUpdateCameraMtxTLSIgnore))
+		protected.Handle("PATCH /api/v1/cameras/{id}/detector_backend", auth.AdminFunc(s.handleUpdateCameraDetectorBackend))
+		protected.HandleFunc("GET /api/v1/system/hailo", s.handleHailoStatus)
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -303,6 +305,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/api/v1/me", guarded)
 		mux.Handle("/api/v1/system/local-devices", guarded)
 		mux.Handle("/api/v1/system/storage", guarded)
+		mux.Handle("/api/v1/system/hailo", guarded)
 		mux.Handle("/api/v1/cameras", guarded)
 		mux.Handle("/api/v1/cameras/", guarded)
 		if s.rules != nil {
@@ -513,6 +516,7 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			"rotation":                 c.Rotation,
 			"mtx_proxy":                c.MtxProxy,
 			"mtx_tls_fingerprint":      c.MtxTLSFingerprint,
+			"detector_backend":         c.DetectorBackend,
 			"created_at":               c.CreatedAt,
 			"updated_at":               c.UpdatedAt,
 			"state":                    state,

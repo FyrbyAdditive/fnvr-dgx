@@ -44,6 +44,13 @@ std::vector<std::string> ReadEnabledDetectorsForCamera(
 bool ReadMtxProxyForCamera(
     const std::string& database_url, const std::string& camera_id);
 
+// ReadDetectorBackendForCamera returns the cameras.detector_backend
+// value ("trt" or "hailo"). Defaults to "trt" on any error — preserves
+// backward-compat and the existing GPU path if the lookup fails for
+// any reason.
+std::string ReadDetectorBackendForCamera(
+    const std::string& database_url, const std::string& camera_id);
+
 // ReadPipelineStartupGraceSec returns the settings.pipeline.startup_grace_sec
 // value: seconds after a worker (re)spawn during which the supervisor
 // suppresses `failed` state publishes on transient exits. Default 60

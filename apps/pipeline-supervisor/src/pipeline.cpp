@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "face_crop_jpeg.h"
+#include "hailo_probe.h"
 #include "object_phash.h"
 #include "rtsp_probe.h"
 #include "whep_server.h"
@@ -904,6 +905,30 @@ p << "rtspsrc location=" << url
             "nvinfer name=arcface config-file-path=/etc/fnvr/nvinfer/arcface.txt ! ";
     }
 
+    // Primary-detector element. "trt" = DeepStream nvinfer running on
+    // the Orin GPU; "hailo" = in-process libhailort inference attached
+    // as a src-pad probe on a no-op `queue name=pgie` (see
+    // hailo_probe.cpp). The probe walks the batch, downscales each
+    // frame's NVMM surface to 640x640 RGB via NvBufSurfTransform, runs
+    // yolov11l on the Hailo-8, decodes the NMS output, and attaches
+    // NvDsObjectMeta directly to the frame meta. Downstream nvtracker
+    // + SGIEs + InferSrcProbe see the same shape regardless of backend
+    // — they all bind to the element named "pgie" and read
+    // NvDsObjectMeta from the buffer.
+    //
+    // We deliberately avoid the `hailonet` + `hailofilter` GStreamer
+    // plugins: hailonet re-emits a fresh GstBuffer rather than
+    // forwarding the input, which drops NvDsBatchMeta and breaks
+    // DeepStream's metadata flow. Going direct to libhailort keeps
+    // the DeepStream graph single-pipeline.
+    std::string pgie_element;
+    if (cam_.detector_backend == "hailo") {
+        pgie_element = "queue name=pgie max-size-buffers=4 leaky=no ! ";
+    } else {
+        pgie_element = std::string(
+            "nvinfer name=pgie config-file-path=") + infer_config_ + " ! ";
+    }
+
     if (skip_inference_) {
         // No-AI tier: the stream into the tee is already parsed H.264
         // (either source-passthrough or post-rotation transcode above).
@@ -925,8 +950,8 @@ p << "rtspsrc location=" << url
              "mux.sink_0 nvstreammux name=mux batch-size=1 "
              "  width=" << mux_w << " height=" << mux_h
              << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
-             "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
-             // NvDCF tracker gives us stable per-object track_ids.
+          << pgie_element
+          << // NvDCF tracker gives us stable per-object track_ids.
              // Required for tripwire line-crossing evaluation (which
              // needs to see an object on both sides of the line across
              // consecutive frames) and for future cross-camera ReID.
@@ -945,8 +970,8 @@ p << "rtspsrc location=" << url
              "mux.sink_0 nvstreammux name=mux batch-size=1 "
              "  width=" << mux_w << " height=" << mux_h
              << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
-             "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
-             // NvDCF tracker gives us stable per-object track_ids.
+          << pgie_element
+          << // NvDCF tracker gives us stable per-object track_ids.
              // Required for tripwire line-crossing evaluation (which
              // needs to see an object on both sides of the line across
              // consecutive frames) and for future cross-camera ReID.
@@ -1039,15 +1064,65 @@ p << "rtspsrc location=" << url
     // thumbnail branches still work without the probe.
     const bool skip_inference_probe = cam_.enabled_detectors.size() == 1 &&
                                        cam_.enabled_detectors[0] == "none";
+
+    // For the hailo backend the `pgie` element is a no-op queue. Install
+    // the Hailo inference probe on its src pad so libhailort runs between
+    // nvstreammux and nvtracker, injecting NvDsObjectMeta into the frame
+    // meta exactly as nvinfer would have. This keeps the rest of the
+    // DeepStream chain (tracker + SGIEs + InferSrcProbe) unchanged.
+    if (use_deepstream_ && !skip_inference_probe &&
+        cam_.detector_backend == "hailo") {
+        GstElement* pgie_elem = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        if (pgie_elem) {
+            GstPad* src = gst_element_get_static_pad(pgie_elem, "src");
+            if (src) {
+                // Source dimensions come from the probed recording dims —
+                // same values we set on nvstreammux width/height.
+                int hsrc_w = rec_width_  > 0 ? rec_width_  : 1920;
+                int hsrc_h = rec_height_ > 0 ? rec_height_ : 1080;
+                auto* hctx = fnvr::hailo_probe_ctx_new(
+                    "/var/lib/fnvr/models/hailo/yolov11l.hef",
+                    hsrc_w, hsrc_h);
+                if (hctx) {
+                    gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
+                                      &fnvr::HailoInferProbe, hctx, nullptr);
+                    std::cerr << "pipeline[" << cam_.id
+                              << "]: hailo-8 inference probe attached on pgie.src\n";
+                } else {
+                    std::cerr << "pipeline[" << cam_.id
+                              << "]: hailo-8 inference setup failed; "
+                              << "pipeline runs without detections on this cam\n";
+                }
+                gst_object_unref(src);
+            }
+            gst_object_unref(pgie_elem);
+        }
+    }
+
     if (use_deepstream_ && nats_ && !skip_inference_probe) {
         // Attach the detection probe to the LAST nvinfer in the
         // active chain. SGIE-produced obj_meta + user_meta only
         // appears on buffers downstream of the SGIE, so a probe on
         // e.g. tracker.src never sees face or plate objects.
-        GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
-        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
-        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
-        if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        //
+        // For the Hailo backend (detector_backend == "hailo") the detector
+        // probe injects NvDsObjectMeta on the pgie (queue) src pad, BEFORE
+        // nvtracker. nvtracker apparently drops NvDsObjectMeta it didn't
+        // produce (even with detector_bbox_info populated), so for hailo
+        // cameras we prefer attaching the InferSrcProbe on the same pad as
+        // the hailo injector (pgie.src) — objects observed there survive
+        // the tee that feeds them both. Tradeoff: no track_ids on hailo
+        // cameras until we figure out how to make nvtracker accept our
+        // injected objects.
+        GstElement* attach = nullptr;
+        if (cam_.detector_backend == "hailo") {
+            attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        } else {
+            attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
+            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
+            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
+            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        }
         if (attach) {
             GstPad* src = gst_element_get_static_pad(attach, "src");
             if (src) {

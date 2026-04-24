@@ -51,6 +51,10 @@ export type Camera = {
    *  doing CA validation. Populated automatically when operator ticks
    *  "Ignore certificate" on an RTSPS source. */
   mtx_tls_fingerprint?: string;
+  /** Which inference path this camera's primary detector runs on.
+   *  "trt" (default) = DeepStream nvinfer on the Orin GPU.
+   *  "hailo" = hailonet on the Hailo-8 PCIe accelerator. */
+  detector_backend?: "trt" | "hailo";
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
   /** Last time the api-server saw a heartbeat on
@@ -265,6 +269,12 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ mtx_proxy }),
     }),
+  updateCameraDetectorBackend: (id: string, backend: "trt" | "hailo") =>
+    req<void>(`/cameras/${id}/detector_backend`, {
+      method: "PATCH",
+      body: JSON.stringify({ backend }),
+    }),
+  getHailoStatus: () => req<{ present: boolean }>("/system/hailo"),
   updateCameraMtxTLSIgnore: (id: string, ignore: boolean) =>
     req<{ mtx_tls_fingerprint: string }>(
       `/cameras/${id}/mtx_tls_ignore`,
