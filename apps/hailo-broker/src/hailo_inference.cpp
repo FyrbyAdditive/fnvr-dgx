@@ -2,10 +2,18 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
+#include <thread>
+#include <vector>
+
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -25,11 +33,24 @@ namespace fnvr {
 
 using namespace hailort;
 
-// mmap-backed page-aligned scratch buffer. libhailort's docs require
-// PAGE_SIZE alignment for output buffers (otherwise memory corruption at
-// the tail); for inputs it's a performance thing but also affects whether
-// libhailort can DMA-map the buffer directly vs. bounce-copy. Using
-// std::vector is not enough — the data pointer alignment isn't guaranteed.
+// Hailo-side batch size. Libhailort submits up to this many frames in one
+// `run_async(vector<Bindings>)` call; the inference thread drains
+// concurrent client requests into a batch of up to this size without
+// blocking for more frames to arrive.
+//
+// 4 matches a common sweet spot on Hailo-8L for yolov11l — hits pipeline
+// parallelism without starving any slot. Bump if you find >=4 hailo
+// cameras reliably saturating the device.
+static constexpr size_t kMaxBatch = 4;
+
+// Backpressure: max outstanding requests waiting on the inference thread.
+// Beyond this, Infer() returns false immediately rather than pile up 1.2MB
+// RGB frames while the accelerator stalls.
+static constexpr size_t kMaxQueued = 16;
+
+// mmap-backed page-aligned scratch buffer. libhailort requires PAGE_SIZE
+// alignment for output buffers (otherwise tail corruption) and strongly
+// prefers it for inputs (DMA-mappable vs. bounce-copy).
 struct PageAlignedBuffer {
     uint8_t* ptr = nullptr;
     size_t   size = 0;
@@ -61,13 +82,28 @@ struct PageAlignedBuffer {
     ~PageAlignedBuffer() { free(); }
     PageAlignedBuffer(const PageAlignedBuffer&) = delete;
     PageAlignedBuffer& operator=(const PageAlignedBuffer&) = delete;
+
+    // Moveable so we can hold a PageAlignedBuffer inside a Slot that
+    // itself lives in a std::vector. Move-from zeroes the source so its
+    // destructor is a no-op.
+    PageAlignedBuffer(PageAlignedBuffer&& other) noexcept
+        : ptr(other.ptr), size(other.size), capacity(other.capacity) {
+        other.ptr = nullptr;
+        other.size = 0;
+        other.capacity = 0;
+    }
+    PageAlignedBuffer& operator=(PageAlignedBuffer&& other) noexcept {
+        if (this != &other) {
+            free();
+            ptr = other.ptr; size = other.size; capacity = other.capacity;
+            other.ptr = nullptr; other.size = 0; other.capacity = 0;
+        }
+        return *this;
+    }
 };
 
-// hailo_bbox_float32_t layout, packed, per the hailort public header:
-//   float32 y_min, x_min, y_max, x_max, score
-// Keep this local so we don't leak the hailort typedef up into headers;
-// hailo_inference.h stays hailort-free so pipeline.cpp doesn't need the
-// hailort include path at its compile site.
+// hailo_bbox_float32_t layout, packed. Kept local so hailo_inference.h
+// stays hailort-free for downstream consumers.
 struct HailoBboxF32 {
     float y_min;
     float x_min;
@@ -78,30 +114,197 @@ struct HailoBboxF32 {
 static_assert(sizeof(HailoBboxF32) == 5 * sizeof(float),
               "HailoBboxF32 must be packed");
 
+// One batch position: private input + output scratch + a persistent
+// Bindings pointing at them. Bindings are created once during Impl ctor
+// via configured_.create_bindings(); each inference cycle re-set_buffer's
+// them so libhailort sees the same pointers but we keep the known-good
+// "single-call" contract.
+struct Slot {
+    PageAlignedBuffer                   input;
+    PageAlignedBuffer                   output;
+    ConfiguredInferModel::Bindings      bindings;
+};
+
+// A single enqueued inference request. Owned by the client thread via
+// the future; the inference thread fulfils the promise after batching.
+struct Request {
+    const uint8_t*                     rgb;
+    std::vector<HailoDetection>*       out;   // caller-owned
+    float                              score_threshold;
+    std::promise<bool>                 done;
+};
+
 struct HailoInference::Impl {
     std::unique_ptr<VDevice>            vdevice;
     std::shared_ptr<InferModel>         infer_model;
     ConfiguredInferModel                configured;
-    ConfiguredInferModel::Bindings      bindings;
+    std::vector<Slot>                   slots;  // kMaxBatch entries
 
-    // Scratch buffers reused across calls. Page-aligned via mmap — required
-    // by libhailort for DMA safety. Sized once at construction from the
-    // model's reported frame sizes so we pay the allocation cost once.
-    PageAlignedBuffer                   input_buffer;   // 640*640*3 RGB
-    PageAlignedBuffer                   output_buffer;  // NMS output, model-sized
-
-    std::string                         output_name;
-
-    // Decoded NMS shape — used by the parser to bound class iteration.
+    // Decoded NMS shape — same for every slot.
     uint32_t                            num_classes      = 0;
     uint32_t                            max_bboxes_class = 0;
+
+    // Request queue + signalling.
+    std::queue<std::unique_ptr<Request>> queue;
+    std::mutex                          q_mu;
+    std::condition_variable             q_cv;
+    std::atomic<bool>                   stop{false};
+    std::thread                         inference_thread;
+
+    // Parses one slot's output buffer into `out`. Uses the compact
+    // variable-stride NMS_BY_CLASS layout libhailort actually writes (per
+    // libhailort's nms_post_process.cpp::write_bboxes_to_buffer): class c's
+    // count lives at offset `4*c + 20 * sum(prior_counts)`; bboxes follow.
+    void parse_nms(const uint8_t* p, size_t out_size,
+                   std::vector<HailoDetection>& out, float score_threshold) const
+    {
+        out.clear();
+        out.reserve(64);
+        uint32_t dets_accumulated = 0;
+        for (uint32_t c = 0; c < num_classes; ++c) {
+            size_t count_offset = 4 * static_cast<size_t>(c) +
+                                  sizeof(HailoBboxF32) * dets_accumulated;
+            if (count_offset + sizeof(float) > out_size) break;
+
+            float count_f;
+            std::memcpy(&count_f, p + count_offset, sizeof(float));
+            uint32_t count = static_cast<uint32_t>(count_f);
+            if (count == 0) continue;
+            if (count > max_bboxes_class) break;
+
+            size_t bboxes_offset = count_offset + sizeof(float);
+            if (bboxes_offset + count * sizeof(HailoBboxF32) > out_size) break;
+
+            const HailoBboxF32* bboxes =
+                reinterpret_cast<const HailoBboxF32*>(p + bboxes_offset);
+            for (uint32_t i = 0; i < count; ++i) {
+                const HailoBboxF32& b = bboxes[i];
+                if (b.score < score_threshold) continue;
+                HailoDetection det;
+                det.class_id    = static_cast<int>(c);
+                det.confidence  = b.score;
+                det.x_min       = b.x_min;
+                det.y_min       = b.y_min;
+                det.x_max       = b.x_max;
+                det.y_max       = b.y_max;
+                out.push_back(det);
+            }
+            dets_accumulated += count;
+        }
+    }
+
+    // Runs on the dedicated inference thread. Drains up to kMaxBatch
+    // requests per pass (blocking only for the first; subsequent drains
+    // are opportunistic) and ships them through libhailort in one
+    // `run_async(vector<Bindings>)` call.
+    void RunLoop() {
+        std::vector<std::unique_ptr<Request>> batch;
+        batch.reserve(kMaxBatch);
+
+        while (!stop.load()) {
+            batch.clear();
+            {
+                std::unique_lock<std::mutex> lk(q_mu);
+                q_cv.wait(lk, [&]{ return stop.load() || !queue.empty(); });
+                if (stop.load() && queue.empty()) break;
+
+                // Drain up to kMaxBatch without blocking.
+                while (batch.size() < kMaxBatch && !queue.empty()) {
+                    batch.emplace_back(std::move(queue.front()));
+                    queue.pop();
+                }
+            }
+            if (batch.empty()) continue;
+
+            ProcessBatch(batch);
+        }
+
+        // Drain any remaining requests with false on shutdown.
+        std::lock_guard<std::mutex> lk(q_mu);
+        while (!queue.empty()) {
+            queue.front()->done.set_value(false);
+            queue.pop();
+        }
+    }
+
+    void ProcessBatch(std::vector<std::unique_ptr<Request>>& batch) {
+        const size_t n = batch.size();
+        assert(n > 0 && n <= kMaxBatch);
+
+        // Copy each request's RGB into its slot and point Bindings there.
+        // set_buffer() each call — same pattern as the single-frame path,
+        // which is what works against libhailort's internal state.
+        for (size_t i = 0; i < n; ++i) {
+            std::memcpy(slots[i].input.ptr, batch[i]->rgb, slots[i].input.size);
+            {
+                auto in_exp = slots[i].bindings.input();
+                if (!in_exp) { FailBatch(batch); return; }
+                auto in = in_exp.release();
+                if (in.set_buffer(MemoryView(slots[i].input.ptr,
+                                             slots[i].input.size)) != HAILO_SUCCESS) {
+                    FailBatch(batch); return;
+                }
+            }
+            {
+                auto out_exp = slots[i].bindings.output();
+                if (!out_exp) { FailBatch(batch); return; }
+                auto out = out_exp.release();
+                if (out.set_buffer(MemoryView(slots[i].output.ptr,
+                                              slots[i].output.size)) != HAILO_SUCCESS) {
+                    FailBatch(batch); return;
+                }
+            }
+        }
+
+        // Wait for pipeline capacity for `n` frames, then submit them all
+        // in one run_async call. libhailort internally pipelines the N
+        // frames through the HEF's 4 contexts.
+        auto wait_ready = configured.wait_for_async_ready(
+            std::chrono::milliseconds(1000), static_cast<uint32_t>(n));
+        if (HAILO_SUCCESS != wait_ready) {
+            std::cerr << "hailo: wait_for_async_ready(n=" << n << ") failed: "
+                      << static_cast<int>(wait_ready) << "\n";
+            FailBatch(batch); return;
+        }
+
+        std::vector<ConfiguredInferModel::Bindings> vb;
+        vb.reserve(n);
+        for (size_t i = 0; i < n; ++i) vb.push_back(slots[i].bindings);
+
+        auto job_exp = configured.run_async(vb);
+        if (!job_exp) {
+            std::cerr << "hailo: run_async(batch=" << n << ") failed: "
+                      << static_cast<int>(job_exp.status()) << "\n";
+            FailBatch(batch); return;
+        }
+        auto& job = job_exp.value();
+        auto wait_status = job.wait(std::chrono::milliseconds(1000));
+        if (HAILO_SUCCESS != wait_status) {
+            std::cerr << "hailo: batch job wait failed: "
+                      << static_cast<int>(wait_status) << "\n";
+            FailBatch(batch); return;
+        }
+
+        // Success — parse each slot's output into its owner's vector and
+        // fulfil the promise.
+        for (size_t i = 0; i < n; ++i) {
+            parse_nms(slots[i].output.ptr, slots[i].output.size,
+                      *batch[i]->out, batch[i]->score_threshold);
+            batch[i]->done.set_value(true);
+        }
+    }
+
+    void FailBatch(std::vector<std::unique_ptr<Request>>& batch) {
+        for (auto& r : batch) {
+            if (r) {
+                r->out->clear();
+                r->done.set_value(false);
+            }
+        }
+    }
 };
 
 HailoInference& HailoInference::Instance(const std::string& hef_path) {
-    // Narrow singleton semantics: first caller wins the HEF path; subsequent
-    // callers reuse the same instance regardless of what they passed. The
-    // supervisor uses a single HEF for iteration 1, so this is fine; if we
-    // ever multi-HEF, this changes to a keyed map.
     static HailoInference* instance = nullptr;
     static std::once_flag init_flag;
     static std::exception_ptr init_err;
@@ -120,11 +323,6 @@ HailoInference& HailoInference::Instance(const std::string& hef_path) {
 HailoInference::HailoInference(const std::string& hef_path)
     : impl_(std::make_unique<Impl>())
 {
-    // One VDevice per process with direct /dev/hailo0 access.
-    // Multi-process sharing is handled by our hailo-broker daemon which
-    // owns this code path exclusively; the supervisor's pipeline workers
-    // talk to the broker over a unix socket (see hailo_client.cpp), so
-    // only the broker process ever runs this path.
     auto vdev_exp = VDevice::create();
     if (!vdev_exp) {
         throw std::runtime_error(
@@ -141,35 +339,23 @@ HailoInference::HailoInference(const std::string& hef_path)
     }
     impl_->infer_model = model_exp.release();
 
-    // The yolov11l HEF from Hailo Model Zoo ships with on-chip NMS already
-    // configured as HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS + FLOAT32 — exactly
-    // what our parser wants. Overriding via set_format_order / set_format_type
-    // here fails configure() with HAILO_HEF_NOT_COMPATIBLE_WITH_DEVICE (93)
-    // on HailoRT 4.23.0 even when the requested format matches the HEF's
-    // native output. Leaving the defaults is both simpler and correct —
-    // confirmed against `hailortcli parse-hef yolov11l.hef` which reports
-    // the same layout we decode in Infer().
+    // CRITICAL: set batch size BEFORE configure(). Without this the
+    // configured model is batch-1 and the vector<Bindings> run_async
+    // overload either errors or silently serialises.
+    impl_->infer_model->set_batch_size(static_cast<uint16_t>(kMaxBatch));
 
-    // Configure (compiles the model onto the device). Blocking.
     auto conf_exp = impl_->infer_model->configure();
     if (!conf_exp) {
         throw std::runtime_error(
-            "HailoInference: configure() failed: " +
+            "HailoInference: configure(batch=" + std::to_string(kMaxBatch) +
+            ") failed: " +
             std::to_string(static_cast<int>(conf_exp.status())));
     }
     impl_->configured = conf_exp.release();
 
-    auto bind_exp = impl_->configured.create_bindings();
-    if (!bind_exp) {
-        throw std::runtime_error(
-            "HailoInference: create_bindings failed: " +
-            std::to_string(static_cast<int>(bind_exp.status())));
-    }
-    impl_->bindings = bind_exp.release();
-
-    // Size and wire input buffer — contract with caller: RGB 640*640*3 bytes.
+    // Discover input/output sizes + NMS shape from the just-configured
+    // model. These are the same for every slot.
     size_t expected_in = static_cast<size_t>(kInputWidth) * kInputHeight * 3;
-    size_t in_frame_size = 0;
     {
         auto input_exp = impl_->infer_model->input();
         if (!input_exp) {
@@ -178,48 +364,25 @@ HailoInference::HailoInference(const std::string& hef_path)
                 std::to_string(static_cast<int>(input_exp.status())));
         }
         auto input = input_exp.release();
-        in_frame_size = input.get_frame_size();
-    }
-    if (in_frame_size != expected_in) {
-        throw std::runtime_error(
-            "HailoInference: model input frame size " +
-            std::to_string(in_frame_size) + " != expected " +
-            std::to_string(expected_in) +
-            " — HEF isn't the 640x640 RGB yolov11l we built against.");
-    }
-    impl_->input_buffer.allocate(expected_in);
-
-    {
-        auto in_bind_exp = impl_->bindings.input();
-        if (!in_bind_exp) {
-            throw std::runtime_error("HailoInference: bindings.input() failed");
-        }
-        auto in_bind = in_bind_exp.release();
-        auto set_in = in_bind.set_buffer(MemoryView(
-            impl_->input_buffer.ptr, impl_->input_buffer.size));
-        if (HAILO_SUCCESS != set_in) {
+        size_t in_frame_size = input.get_frame_size();
+        if (in_frame_size != expected_in) {
             throw std::runtime_error(
-                "HailoInference: bindings input set_buffer failed: " +
-                std::to_string(static_cast<int>(set_in)));
+                "HailoInference: model input frame size " +
+                std::to_string(in_frame_size) + " != expected " +
+                std::to_string(expected_in) +
+                " — HEF isn't the 640x640 RGB yolov11l we built against.");
         }
     }
 
-    // Size and wire output buffer. For NMS_BY_CLASS / FLOAT32, libhailort
-    // returns a per-class packed layout:
-    //   for each of `num_classes`: float32 count; hailo_bbox_float32_t[count]
-    // The per-class block is padded to max_bboxes_per_class. We let
-    // libhailort report the total size via get_frame_size and derive the
-    // shape from get_nms_shape().
     size_t out_frame_size = 0;
     {
         auto output_exp = impl_->infer_model->output();
         if (!output_exp) {
             throw std::runtime_error(
-                "HailoInference: infer_model.output() (2) failed: " +
+                "HailoInference: infer_model.output() failed: " +
                 std::to_string(static_cast<int>(output_exp.status())));
         }
         auto output = output_exp.release();
-        impl_->output_name = output.name();
         out_frame_size = output.get_frame_size();
 
         auto nms_shape_exp = output.get_nms_shape();
@@ -232,33 +395,62 @@ HailoInference::HailoInference(const std::string& hef_path)
         impl_->num_classes      = nms_shape.number_of_classes;
         impl_->max_bboxes_class = nms_shape.max_bboxes_per_class;
     }
-    impl_->output_buffer.allocate(out_frame_size);
 
-    {
-        auto out_bind_exp = impl_->bindings.output();
-        if (!out_bind_exp) {
-            throw std::runtime_error("HailoInference: bindings.output() failed");
-        }
-        auto out_bind = out_bind_exp.release();
-        // MemoryView sized at the real frame size (libhailort writes only
-        // that many bytes); the mmap backing is page-padded so any tail-page
-        // scribble lands in safe padding.
-        auto set_out = out_bind.set_buffer(MemoryView(
-            impl_->output_buffer.ptr, impl_->output_buffer.size));
-        if (HAILO_SUCCESS != set_out) {
+    // Allocate slots: each gets its own input/output scratch + a fresh
+    // Bindings pre-pointed at them. These persist for the lifetime of the
+    // singleton.
+    impl_->slots.resize(kMaxBatch);
+    for (size_t i = 0; i < kMaxBatch; ++i) {
+        impl_->slots[i].input.allocate(expected_in);
+        impl_->slots[i].output.allocate(out_frame_size);
+
+        auto bind_exp = impl_->configured.create_bindings();
+        if (!bind_exp) {
             throw std::runtime_error(
-                "HailoInference: bindings output set_buffer failed: " +
-                std::to_string(static_cast<int>(set_out)));
+                "HailoInference: create_bindings[" + std::to_string(i) +
+                "] failed: " +
+                std::to_string(static_cast<int>(bind_exp.status())));
+        }
+        impl_->slots[i].bindings = bind_exp.release();
+
+        // Initial set_buffer so the bindings reference something real even
+        // before the first Infer() memcpy. RunLoop will re-set before each
+        // batch anyway, but this is cheap insurance.
+        auto ib = impl_->slots[i].bindings.input().release();
+        if (ib.set_buffer(MemoryView(impl_->slots[i].input.ptr,
+                                     impl_->slots[i].input.size))
+            != HAILO_SUCCESS) {
+            throw std::runtime_error("HailoInference: initial input set_buffer failed");
+        }
+        auto ob = impl_->slots[i].bindings.output().release();
+        if (ob.set_buffer(MemoryView(impl_->slots[i].output.ptr,
+                                     impl_->slots[i].output.size))
+            != HAILO_SUCCESS) {
+            throw std::runtime_error("HailoInference: initial output set_buffer failed");
         }
     }
 
     std::cerr << "hailo: configured yolov11l — "
               << impl_->num_classes << " classes, up to "
               << impl_->max_bboxes_class << " bboxes/class, "
+              << "batch_size=" << kMaxBatch << ", "
               << "input=" << expected_in << "B, output=" << out_frame_size << "B\n";
+
+    // Spawn the inference thread last so Impl is fully constructed before
+    // it could possibly see a request. (Impl::RunLoop is a member so it
+    // captures `this` implicitly via the thread ctor.)
+    impl_->inference_thread = std::thread(&Impl::RunLoop, impl_.get());
 }
 
-HailoInference::~HailoInference() = default;
+HailoInference::~HailoInference() {
+    if (impl_) {
+        impl_->stop.store(true);
+        impl_->q_cv.notify_all();
+        if (impl_->inference_thread.joinable()) {
+            impl_->inference_thread.join();
+        }
+    }
+}
 
 bool HailoInference::Infer(const uint8_t* rgb,
                            std::vector<HailoDetection>& out,
@@ -266,132 +458,40 @@ bool HailoInference::Infer(const uint8_t* rgb,
 {
     out.clear();
 
-    std::lock_guard<std::mutex> lock(mu_);
+    auto req = std::make_unique<Request>();
+    req->rgb = rgb;
+    req->out = &out;
+    req->score_threshold = score_threshold;
+    auto fut = req->done.get_future();
 
-    // Copy the caller's RGB into our pinned input buffer. The bindings
-    // captured the pointer at init time — we overwrite the bytes in
-    // place. For the multi_process_service path, calling create_bindings()
-    // per frame leaks server-side handles and triggers HAILO_INTERNAL_FAILURE
-    // (status 8) after a few frames, which cascades into HAILO_STREAM_ABORT
-    // (status 63) for every subsequent request.
-    std::memcpy(impl_->input_buffer.ptr, rgb, impl_->input_buffer.size);
-
-    // Re-set the buffer views on the existing Bindings each call. This is
-    // cheap (just updates the MemoryView inside the existing InferStream
-    // handle — no server-side allocation) and fixes the "all-zero output"
-    // issue the direct VDevice path had when we only set the buffer once
-    // at init.
     {
-        auto in_bind_exp = impl_->bindings.input();
-        if (!in_bind_exp) return false;
-        auto in_bind = in_bind_exp.release();
-        auto s = in_bind.set_buffer(MemoryView(impl_->input_buffer.ptr,
-                                               impl_->input_buffer.size));
-        if (s != HAILO_SUCCESS) return false;
-    }
-    {
-        auto out_bind_exp = impl_->bindings.output();
-        if (!out_bind_exp) return false;
-        auto out_bind = out_bind_exp.release();
-        auto s = out_bind.set_buffer(MemoryView(impl_->output_buffer.ptr,
-                                                impl_->output_buffer.size));
-        if (s != HAILO_SUCCESS) return false;
-    }
-
-    // Fire the async job and wait for it — same pattern as the hailort
-    // basic example. An earlier attempt used the sync `run()` API which
-    // returned HAILO_SUCCESS but produced an all-zero output buffer every
-    // frame; async with explicit wait actually fills the output.
-    auto wait_ready = impl_->configured.wait_for_async_ready(
-        std::chrono::milliseconds(1000));
-    if (HAILO_SUCCESS != wait_ready) {
-        std::cerr << "hailo: wait_for_async_ready failed: "
-                  << static_cast<int>(wait_ready) << "\n";
-        return false;
-    }
-    auto job_exp = impl_->configured.run_async(impl_->bindings);
-    if (!job_exp) {
-        std::cerr << "hailo: run_async failed: "
-                  << static_cast<int>(job_exp.status()) << "\n";
-        return false;
-    }
-    auto& job = job_exp.value();
-    auto wait_status = job.wait(std::chrono::milliseconds(1000));
-    if (HAILO_SUCCESS != wait_status) {
-        std::cerr << "hailo: infer job wait failed: "
-                  << static_cast<int>(wait_status) << "\n";
-        return false;
-    }
-
-    // Parse NMS_BY_CLASS output. Layout per libhailort's nms_post_process.cpp
-    // (write_bboxes_to_buffer): the buffer is COMPACT (variable-stride), NOT
-    // the fixed-max-bboxes-per-class stride I originally assumed.
-    //
-    //   Class c's count lives at offset:
-    //       4*c + 20 * (sum of detection counts in classes [0, c))
-    //   Class c's bboxes live immediately after that count:
-    //       4*(c+1) + 20 * (sum of detection counts in classes [0, c))
-    //
-    // Walking in class order, we can accumulate the running bbox-offset as
-    // we go.
-    const uint8_t* p = impl_->output_buffer.ptr;
-    uint32_t dets_accumulated = 0;
-
-    out.reserve(64);  // typical frame has <64 detections total
-    for (uint32_t c = 0; c < impl_->num_classes; ++c) {
-        size_t count_offset = 4 * static_cast<size_t>(c) +
-                              sizeof(HailoBboxF32) * dets_accumulated;
-        if (count_offset + sizeof(float) > impl_->output_buffer.size) break;
-
-        float count_f;
-        std::memcpy(&count_f, p + count_offset, sizeof(float));
-        uint32_t count = static_cast<uint32_t>(count_f);
-        if (count == 0) continue;
-        if (count > impl_->max_bboxes_class) {
-            // Defensive: malformed output shouldn't happen but skip rather
-            // than overrun.
-            break;
+        std::lock_guard<std::mutex> lk(impl_->q_mu);
+        if (impl_->stop.load()) return false;
+        if (impl_->queue.size() >= kMaxQueued) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) % 100 == 0) {
+                std::cerr << "broker: queue full (" << kMaxQueued
+                          << ") — dropping request\n";
+            }
+            return false;
         }
-
-        size_t bboxes_offset = count_offset + sizeof(float);
-        if (bboxes_offset + count * sizeof(HailoBboxF32) > impl_->output_buffer.size) break;
-
-        const HailoBboxF32* bboxes =
-            reinterpret_cast<const HailoBboxF32*>(p + bboxes_offset);
-        for (uint32_t i = 0; i < count; ++i) {
-            const HailoBboxF32& b = bboxes[i];
-            if (b.score < score_threshold) continue;
-
-            HailoDetection det;
-            det.class_id    = static_cast<int>(c);
-            det.confidence  = b.score;
-            det.x_min       = b.x_min;
-            det.y_min       = b.y_min;
-            det.x_max       = b.x_max;
-            det.y_max       = b.y_max;
-            out.push_back(det);
-        }
-        dets_accumulated += count;
+        impl_->queue.push(std::move(req));
     }
+    impl_->q_cv.notify_one();
 
-    return true;
+    return fut.get();
 }
 
 #else // FNVR_HAS_HAILO
 
-// Stubs for dev builds without libhailort installed. The pipeline code
-// checks cam_.detector_backend at runtime and only takes the hailo path
-// when explicitly requested — on a stub build, any camera with
-// detector_backend="hailo" will hit the Instance() call below and get a
-// loud failure, which the caller (hailo_probe_ctx_new) converts into a
-// "run without detections" fallback for that camera.
+// Stubs for dev builds without libhailort installed.
 
 struct HailoInference::Impl {};
 
 HailoInference& HailoInference::Instance(const std::string&) {
     throw std::runtime_error(
-        "HailoInference: this build of pipeline-supervisor has no libhailort. "
-        "Install HailoRT via deploy/hailo/install-hailo-host.sh and rebuild.");
+        "HailoInference: this build has no libhailort. Install HailoRT "
+        "and rebuild.");
 }
 
 HailoInference::HailoInference(const std::string&) : impl_() {}

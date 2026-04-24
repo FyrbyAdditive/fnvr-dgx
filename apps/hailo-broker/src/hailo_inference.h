@@ -1,37 +1,29 @@
-// In-process Hailo-8 inference for fnvr. Replaces `nvinfer` PGIE on cameras
-// whose `detector_backend == "hailo"` without introducing the hailonet
-// GStreamer plugin (which breaks GstBuffer identity and so drops
-// NvDsBatchMeta on the output side — fatal for DeepStream integration).
+// In-process Hailo-8 inference used by the fnvr-hailo-broker. Public API is
+// simple blocking Infer(rgb, out). Internally a dedicated inference thread
+// pulls requests from a queue and submits them as a batch of up to
+// kMaxBatch frames in one `run_async(vector<Bindings>)` call — concurrent
+// callers naturally coalesce when the device is the bottleneck.
 //
 // Design:
 // - One process-wide HailoInference singleton owns the VDevice and the
-//   ConfiguredInferModel for the one HEF we ship (`yolov11l.hef`). Multiple
-//   worker threads (one per camera) call `Infer()` concurrently; libhailort's
-//   internal scheduler serialises accesses to the single Hailo-8 PCIe device.
+//   ConfiguredInferModel for the one HEF we ship (`yolov11l.hef`).
+// - Multiple broker threads (one per client/camera) call Infer()
+//   concurrently; each enqueues a request and blocks on a per-request
+//   promise. The single inference thread drains up to kMaxBatch requests
+//   per pass and issues one batched libhailort call.
 // - Infer() takes an RGB 640x640 buffer (row-major uint8), blocks on the
-//   async-infer completion, and returns decoded detections in network-space
-//   (coordinates normalised to [0, 1] via bbox/640). The caller is responsible
-//   for scaling into source pixel space.
-// - The HEF is expected to have on-device NMS (yolov11l from Hailo Model Zoo
-//   v2.13.0 does — single output tensor of shape [num_classes][max_bboxes][5]
-//   with rows (y_min, x_min, y_max, x_max, confidence), all float32 in [0,1]).
-//   Rows with confidence == 0 are padding and are skipped.
-// - No dependency on the hailonet / hailofilter GStreamer plugins or on
-//   TAPPAS. Links only against /usr/local/lib/libhailort.so (source-built by
-//   deploy/hailo/install-hailo-host.sh).
-//
-// Non-goals:
-// - Async batching across frames. DeepStream per-camera batch-size=1, and the
-//   Hailo-8 serves ~60fps yolov11l at batch-1 — good enough for 4-6 cameras
-//   on the accelerator before saturation. Move to batched if we ever need it.
-// - Hailo-side tracking or multi-model scheduling. Tracking stays in
-//   nvtracker downstream, which is where our tripwire / ReID logic already
-//   lives.
+//   inference completion, and returns decoded detections in network-space
+//   (coordinates normalised to [0, 1] via bbox/640). The caller is
+//   responsible for scaling into source pixel space.
+// - The HEF is expected to have on-device NMS (yolov11l from Hailo Model
+//   Zoo — single output tensor: per-class float bbox_count followed by
+//   hailo_bbox_float32_t[count]).
+// - No dependency on hailonet / hailofilter / TAPPAS. Links only against
+//   /usr/local/lib/libhailort.so.
 #pragma once
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -77,13 +69,6 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
-
-    // infer() serialises against itself — not because libhailort requires
-    // it (the scheduler handles device contention) but because we reuse a
-    // single Bindings object and output buffer. One ConfiguredInferModel
-    // per device, one Bindings per call would be the next step if contention
-    // ever matters.
-    std::mutex mu_;
 };
 
 } // namespace fnvr
