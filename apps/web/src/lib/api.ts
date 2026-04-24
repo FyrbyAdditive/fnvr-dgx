@@ -40,6 +40,8 @@ export type Camera = {
   location_kind?: "indoor" | "outdoor" | null;
   mute_classes_override?: string[];
   unmute_classes_override?: string[];
+  /** Clockwise software rotation applied by the pipeline. */
+  rotation?: 0 | 90 | 180 | 270;
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
   /** Last time the api-server saw a heartbeat on
@@ -242,6 +244,13 @@ export const api = {
     req<void>(`/cameras/${id}/enable`, { method: "POST" }),
   disableCamera: (id: string) =>
     req<void>(`/cameras/${id}/disable`, { method: "POST" }),
+  updateCameraRotation: (id: string, rotation: 0 | 90 | 180 | 270) =>
+    req<void>(`/cameras/${id}/rotation`, {
+      method: "PATCH",
+      body: JSON.stringify({ rotation }),
+    }),
+  updateCameraBasics: (id: string, body: { name?: string; url?: string }) =>
+    req<void>(`/cameras/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   systemStorage: () => req<SystemStorage>("/system/storage"),
 
   listZones: (cameraId?: string) =>

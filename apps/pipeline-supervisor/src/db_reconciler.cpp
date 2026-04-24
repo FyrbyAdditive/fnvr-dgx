@@ -102,7 +102,7 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
     }
 
     const char* q =
-        "SELECT id, url, COALESCE(substream,''), record_mode "
+        "SELECT id, url, COALESCE(substream,''), record_mode, rotation "
         "FROM cameras WHERE enabled = TRUE "
         "ORDER BY created_at ASC";
     PGresult* r = PQexec(conn, q);
@@ -121,6 +121,11 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
         c.url            = PQgetvalue(r, i, 1);
         c.substream_url  = PQgetvalue(r, i, 2);
         c.recording_mode = PQgetvalue(r, i, 3);
+        try {
+            c.rotation = std::stoi(PQgetvalue(r, i, 4));
+        } catch (...) {
+            c.rotation = 0;
+        }
         out.push_back(std::move(c));
     }
     PQclear(r);
@@ -186,6 +191,30 @@ std::set<std::string> ReadMutedClassesForCamera(
     for (const auto& c : unmuteOv) out.erase(c);
     for (const auto& c : muteOv)   out.insert(c);
     return out;
+}
+
+int ReadRotationForCamera(
+    const std::string& url, const std::string& camera_id) {
+    PGconn* conn = PQconnectdb(url.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        std::cerr << "db[rot]: connect failed: " << PQerrorMessage(conn);
+        PQfinish(conn);
+        return 0;
+    }
+    const char* q = "SELECT rotation FROM cameras WHERE id = $1";
+    const char* params[1] = { camera_id.c_str() };
+    PGresult* r = PQexecParams(conn, q, 1, nullptr, params, nullptr, nullptr, 0);
+    int rotation = 0;
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1) {
+        try {
+            rotation = std::stoi(PQgetvalue(r, 0, 0));
+        } catch (...) {
+            rotation = 0;
+        }
+    }
+    PQclear(r);
+    PQfinish(conn);
+    return rotation;
 }
 
 }  // namespace fnvr

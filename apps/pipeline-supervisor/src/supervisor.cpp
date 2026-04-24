@@ -66,10 +66,34 @@ void Supervisor::reconcileOnce() {
 
     std::lock_guard<std::mutex> lk(workers_mu_);
 
-    // Stop removed or disabled cameras.
+    // Index the desired configs so we can compare per-worker config
+    // deltas in the stop loop below.
+    std::map<std::string, const CameraConfig*> want_by_id;
+    for (auto& c : want) want_by_id[c.id] = &c;
+
+    // Stop removed, disabled, or reconfigured cameras. We only restart
+    // workers on config changes that actually require rebuilding the
+    // GStreamer graph — today just `rotation`, since changing it
+    // toggles the transcode path. URL changes are left alone because
+    // rtspsrc already reconnects on transport issues and some users
+    // rewrite URLs temporarily for testing.
     for (auto it = workers_.begin(); it != workers_.end();) {
-        if (want_ids.find(it->first) == want_ids.end()) {
+        auto wi = want_by_id.find(it->first);
+        if (wi == want_by_id.end()) {
             std::cerr << "supervisor: stopping [" << it->first << "] (no longer enabled)\n";
+            it->second->stop = true;
+            if (it->second->thread.joinable()) it->second->thread.join();
+            it = workers_.erase(it);
+        } else if (wi->second->rotation != it->second->cam.rotation) {
+            std::cerr << "supervisor: stopping [" << it->first
+                      << "] (rotation changed " << it->second->cam.rotation
+                      << " -> " << wi->second->rotation << ")\n";
+            it->second->stop = true;
+            if (it->second->thread.joinable()) it->second->thread.join();
+            it = workers_.erase(it);
+        } else if (wi->second->url != it->second->cam.url) {
+            std::cerr << "supervisor: stopping [" << it->first
+                      << "] (url changed)\n";
             it->second->stop = true;
             if (it->second->thread.joinable()) it->second->thread.join();
             it = workers_.erase(it);

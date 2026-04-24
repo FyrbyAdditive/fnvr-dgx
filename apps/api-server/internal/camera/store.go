@@ -3,6 +3,7 @@ package camera
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -35,7 +36,11 @@ type Camera struct {
 	MuteClassesOverride []string `json:"mute_classes_override"`
 	// UnmuteClassesOverride removes classes from the resolved mute set
 	// for this camera only (re-enables an inherited mute).
-	UnmuteClassesOverride []string  `json:"unmute_classes_override"`
+	UnmuteClassesOverride []string `json:"unmute_classes_override"`
+	// Rotation is the clockwise software rotation applied by the pipeline,
+	// in degrees. Valid: 0, 90, 180, 270. Used to correct cameras that
+	// can't be physically reoriented.
+	Rotation              int       `json:"rotation"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }
@@ -51,7 +56,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       created_at, updated_at
+		       rotation, created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -63,7 +68,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		if err := rows.Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode,
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
 			&c.EnabledDetectors, &c.LocationKind, &c.MuteClassesOverride,
-			&c.UnmuteClassesOverride, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.UnmuteClassesOverride, &c.Rotation, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -77,12 +82,12 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       created_at, updated_at
+		       rotation, created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
 			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
 			&c.LocationKind, &c.MuteClassesOverride, &c.UnmuteClassesOverride,
-			&c.CreatedAt, &c.UpdatedAt)
+			&c.Rotation, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
@@ -286,6 +291,63 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 
 func (s *Store) SetEnabled(ctx context.Context, id string, enabled bool) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE cameras SET enabled=$1, updated_at=NOW() WHERE id=$2`, enabled, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateBasics updates name and/or url on an existing camera row.
+// Fields passed as nil are left alone. Trims whitespace and rejects
+// empty strings on either field to avoid blanking a row by accident.
+// Returns ErrNotFound if no row matches.
+func (s *Store) UpdateBasics(ctx context.Context, id string, name *string, url *string) error {
+	if name != nil {
+		trimmed := strings.TrimSpace(*name)
+		if trimmed == "" {
+			return fmt.Errorf("name cannot be empty")
+		}
+		name = &trimmed
+	}
+	if url != nil {
+		trimmed := strings.TrimSpace(*url)
+		if trimmed == "" {
+			return fmt.Errorf("url cannot be empty")
+		}
+		url = &trimmed
+	}
+	if name == nil && url == nil {
+		return fmt.Errorf("name or url required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE cameras
+		   SET name = COALESCE($2, name),
+		       url  = COALESCE($3, url),
+		       updated_at = NOW()
+		 WHERE id = $1`, id, name, url)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetRotation updates the per-camera software rotation. Valid values are
+// 0, 90, 180, 270 (enforced by a DB CHECK constraint). The pipeline's
+// supervisor picks up the change on its next reconcile tick and respawns
+// the worker so the new rotation takes effect.
+func (s *Store) SetRotation(ctx context.Context, id string, rotation int) error {
+	switch rotation {
+	case 0, 90, 180, 270:
+	default:
+		return fmt.Errorf("invalid rotation %d", rotation)
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE cameras SET rotation=$1, updated_at=NOW() WHERE id=$2`, rotation, id)
 	if err != nil {
 		return err
 	}

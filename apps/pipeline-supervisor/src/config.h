@@ -16,6 +16,9 @@ struct CameraConfig {
     //   ((global ∪ bucket(location_kind)) \ unmute_override) ∪ mute_override
     // Empty = no mutes; probe short-circuits cheaply.
     std::set<std::string> muted_classes;
+    // Clockwise software rotation applied to the decoded stream before
+    // encode/record. Valid: 0, 90, 180, 270. Zero is the hot path.
+    int rotation = 0;
 };
 
 struct Config {

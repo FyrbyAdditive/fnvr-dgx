@@ -77,6 +77,11 @@ int main(int argc, char** argv) {
             std::cerr << "worker[" << cam.id << "]: muting "
                       << cam.muted_classes.size() << " class(es) at pipeline\n";
         }
+        cam.rotation = fnvr::ReadRotationForCamera(cfg.database_url, cam.id);
+        if (cam.rotation != 0) {
+            std::cerr << "worker[" << cam.id << "]: rotation=" << cam.rotation
+                      << " (forces transcode path)\n";
+        }
 
         fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
                                       cfg.use_deepstream, cfg.use_anpr, cfg.use_face_id,

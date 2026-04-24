@@ -168,8 +168,10 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
       </div>
       {expanded && isAdmin && (
         <div className="px-3 pb-3 space-y-3">
+          <BasicsEditor camera={camera} />
           <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />
+          <RotationSelect camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
         </div>
       )}
@@ -239,6 +241,127 @@ function DetectorToggle({ camera }: { camera: Camera }) {
             {k.label}
           </label>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// RotationSelect picks a clockwise software rotation (0/90/180/270) for
+// cameras that can't be physically reoriented. Any non-zero value forces
+// the pipeline onto the transcode path (decode + nvvideoconvert flip +
+// re-encode), so leave at 0 unless needed.
+// BasicsEditor lets an admin rename a camera and/or change its RTSP URL
+// in place — preserving the camera id (and therefore its rules, zones,
+// and historical detections). Save is disabled until something's
+// actually changed so a hover over the expand panel doesn't fire a
+// pointless round-trip.
+function BasicsEditor({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(camera.name);
+  const [url, setUrl] = useState(camera.url);
+  const [err, setErr] = useState<string | null>(null);
+  // Reset local state when the upstream camera row changes (e.g. another
+  // client edits it, or an unrelated invalidate refetches).
+  useEffect(() => {
+    setName(camera.name);
+    setUrl(camera.url);
+  }, [camera.name, camera.url]);
+  const save = useMutation({
+    mutationFn: () => {
+      const body: { name?: string; url?: string } = {};
+      if (name !== camera.name) body.name = name;
+      if (url !== camera.url) body.url = url;
+      return api.updateCameraBasics(camera.id, body);
+    },
+    onSuccess: () => {
+      setErr(null);
+      qc.invalidateQueries({ queryKey: ["cameras"] });
+    },
+    onError: (e) => setErr((e as Error)?.message ?? "save failed"),
+  });
+  const dirty = name !== camera.name || url !== camera.url;
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800 space-y-1">
+      <div className="text-xs text-neutral-400 mb-1">Basics</div>
+      <div className="flex flex-col gap-1 text-xs">
+        <label className="flex items-center gap-2">
+          <span className="w-10 text-neutral-500">name</span>
+          <input
+            className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={save.isPending}
+          />
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="w-10 text-neutral-500">url</span>
+          <input
+            className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 font-mono"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            disabled={save.isPending}
+          />
+        </label>
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            type="button"
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed rounded px-3 py-1"
+            disabled={!dirty || save.isPending}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? "saving…" : "save"}
+          </button>
+          {dirty && !save.isPending && (
+            <button
+              type="button"
+              className="text-neutral-400 hover:text-white"
+              onClick={() => {
+                setName(camera.name);
+                setUrl(camera.url);
+                setErr(null);
+              }}
+            >
+              reset
+            </button>
+          )}
+          {err && <span className="text-red-400">{err}</span>}
+          <span className="text-neutral-600 ml-auto">id: {camera.id}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RotationSelect({ camera }: { camera: Camera }) {
+  const qc = useQueryClient();
+  const current = camera.rotation ?? 0;
+  const update = useMutation({
+    mutationFn: (rotation: 0 | 90 | 180 | 270) =>
+      api.updateCameraRotation(camera.id, rotation),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+  });
+  return (
+    <div className="pl-3 border-l-2 border-neutral-800">
+      <div className="text-xs text-neutral-400 mb-1">Rotation</div>
+      <div className="flex items-center gap-2 text-xs">
+        <select
+          className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+          value={current}
+          disabled={update.isPending}
+          onChange={(e) =>
+            update.mutate(Number(e.target.value) as 0 | 90 | 180 | 270)
+          }
+        >
+          <option value={0}>0°</option>
+          <option value={90}>90° (clockwise)</option>
+          <option value={180}>180°</option>
+          <option value={270}>270° (counterclockwise)</option>
+        </select>
+        {current !== 0 && (
+          <span className="text-neutral-500">
+            transcode path (decode + NVENC)
+          </span>
+        )}
       </div>
     </div>
   );

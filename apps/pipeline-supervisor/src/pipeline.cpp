@@ -698,15 +698,38 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         std::cerr << "pipeline[" << cam_.id << "]: probed codec=" << probe.codec
                   << " size=" << probe.width << "x" << probe.height << "\n";
 
-        if (probe.codec == "h265") {
+        // Take the transcode path whenever we need to rotate the stream
+        // or the source codec isn't H.264 — both require decode + NVENC.
+        // Rotation via nvvideoconvert flip-method operates on decoded
+        // NVMM surfaces, so H.264 passthrough is incompatible with any
+        // non-zero rotation.
+        const bool needs_transcode = (probe.codec == "h265") || (cam_.rotation != 0);
+        // GStreamer nvvideoconvert flip-method mapping:
+        //   0 = none, 1 = CCW 90°, 2 = 180°, 3 = CW 90°, 4/5 = flips
+        // Our camera rotation is clockwise degrees; translate.
+        int flip_method = 0;
+        switch (cam_.rotation) {
+            case 90:  flip_method = 3; break;
+            case 180: flip_method = 2; break;
+            case 270: flip_method = 1; break;
+            default:  flip_method = 0; break;
+        }
+        const bool rotate_swaps_axes = (cam_.rotation == 90 || cam_.rotation == 270);
+
+        if (needs_transcode) {
             // Compute aspect-preserving target. If we know source size,
             // fit to max(1080) height; otherwise fall back to 1920x1080.
+            int src_w = probe.width;
+            int src_h = probe.height;
+            // After rotation the visible dims swap, so the encoder caps
+            // must describe the post-rotation frame.
+            if (rotate_swaps_axes) std::swap(src_w, src_h);
             int tw = 1920, th = 1080;
-            if (probe.width > 0 && probe.height > 0) {
-                th = std::min(1080, probe.height);
+            if (src_w > 0 && src_h > 0) {
+                th = std::min(1080, src_h);
                 // width scaled, rounded to even (H.264 4:2:0 needs even).
                 tw = static_cast<int>(
-                    static_cast<double>(th) * probe.width / probe.height + 0.5);
+                    static_cast<double>(th) * src_w / src_h + 0.5);
                 if (tw & 1) tw += 1;
             }
             // Clamp width to something sane (avoid ultra-wide 4K → 3520x1080
@@ -719,7 +742,8 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
                 tw = 2880;
             }
             std::cerr << "pipeline[" << cam_.id
-                      << "]: recording target=" << tw << "x" << th << "\n";
+                      << "]: recording target=" << tw << "x" << th
+                      << " rotation=" << cam_.rotation << "\n";
 
             // tcp-timeout=15s + retry=3 so a hung RTSP SETUP bails instead of
 // blocking a worker forever (observed: Reolink firmware hang where
@@ -729,14 +753,19 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
 // supervisor respawn with its backoff.
 p << "rtspsrc location=" << url
   << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3"
-  << " name=src ! "
-                 "rtph265depay ! h265parse config-interval=1 ! "
-                 "video/x-h265,stream-format=byte-stream,alignment=au ! "
-                 // Re-mux H.265 → H.264 via NVDEC+NVENC so the rest of
-                 // the pipeline only has to handle one codec path. Target
-                 // dims preserve source aspect ratio.
-                 "nvv4l2decoder ! "
-                 "nvvideoconvert ! "
+  << " name=src ! ";
+            if (probe.codec == "h265") {
+                p << "rtph265depay ! h265parse config-interval=1 ! "
+                     "video/x-h265,stream-format=byte-stream,alignment=au ! ";
+            } else {
+                p << "rtph264depay ! h264parse config-interval=1 ! ";
+            }
+            // Re-mux source → H.264 via NVDEC+NVENC so the rest of the
+            // pipeline only has to handle one codec path. Rotation (if
+            // any) is applied on the decoded NVMM surface before caps
+            // negotiation so the encoder sees the post-rotation dims.
+            p << "nvv4l2decoder ! "
+                 "nvvideoconvert flip-method=" << flip_method << " ! "
                  "video/x-raw(memory:NVMM),format=NV12,width=" << tw
                  << ",height=" << th << " ! "
                  "nvv4l2h264enc insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
@@ -744,9 +773,9 @@ p << "rtspsrc location=" << url
             rec_width_ = tw;
             rec_height_ = th;
         } else {
-            // Source is already H.264 — pass through the parsed elementary
-            // stream; downstream infers dims from the caps. Record at
-            // source resolution.
+            // Source is already H.264 and no rotation requested — pass
+            // through the parsed elementary stream; downstream infers
+            // dims from the caps. Record at source resolution.
             // tcp-timeout=15s + retry=3 so a hung RTSP SETUP bails instead of
 // blocking a worker forever (observed: Reolink firmware hang where
 // TCP/554 accepts connects but SETUP never completes, starving the

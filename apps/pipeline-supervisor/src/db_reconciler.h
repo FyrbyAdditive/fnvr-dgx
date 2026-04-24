@@ -23,4 +23,11 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& database_url);
 std::set<std::string> ReadMutedClassesForCamera(
     const std::string& database_url, const std::string& camera_id);
 
+// ReadRotationForCamera fetches the `rotation` column for one camera,
+// returning 0 on any error (missing row, DB unreachable, unparseable
+// value). Workers call this at startup so the per-camera config loaded
+// via argv doesn't need a separate plumbing hop through the supervisor.
+int ReadRotationForCamera(
+    const std::string& database_url, const std::string& camera_id);
+
 }  // namespace fnvr

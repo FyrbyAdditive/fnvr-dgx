@@ -147,11 +147,13 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("POST /api/v1/cameras", auth.AdminFunc(s.handleCreateCamera))
 		protected.HandleFunc("GET /api/v1/cameras/{id}", s.handleGetCamera)
 		protected.Handle("DELETE /api/v1/cameras/{id}", auth.AdminFunc(s.handleDeleteCamera))
+		protected.Handle("PATCH /api/v1/cameras/{id}", auth.AdminFunc(s.handleUpdateCameraBasics))
 		protected.Handle("PATCH /api/v1/cameras/{id}/detectors", auth.AdminFunc(s.handleUpdateCameraDetectors))
 		protected.Handle("PATCH /api/v1/cameras/{id}/classes", auth.AdminFunc(s.handleUpdateCameraClasses))
 		protected.Handle("PATCH /api/v1/cameras/{id}/storage", auth.AdminFunc(s.handleUpdateCameraStorage))
 		protected.Handle("POST /api/v1/cameras/{id}/enable", auth.AdminFunc(s.handleEnableCamera))
 		protected.Handle("POST /api/v1/cameras/{id}/disable", auth.AdminFunc(s.handleDisableCamera))
+		protected.Handle("PATCH /api/v1/cameras/{id}/rotation", auth.AdminFunc(s.handleUpdateCameraRotation))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -495,6 +497,7 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			"location_kind":            c.LocationKind,
 			"mute_classes_override":    c.MuteClassesOverride,
 			"unmute_classes_override":  c.UnmuteClassesOverride,
+			"rotation":                 c.Rotation,
 			"created_at":               c.CreatedAt,
 			"updated_at":               c.UpdatedAt,
 			"state":                    state,
@@ -564,6 +567,29 @@ func (s *Server) handleDeleteCamera(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleUpdateCameraBasics(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name *string `json:"name,omitempty"`
+		URL  *string `json:"url,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	err := s.cameras.UpdateBasics(r.Context(), id, body.Name, body.URL)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		// Validation errors are user-actionable, so surface the message.
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleUpdateCameraDetectors(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		EnabledDetectors []string `json:"enabled_detectors"`
@@ -581,6 +607,28 @@ func (s *Server) handleUpdateCameraDetectors(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		slog.Error("update camera detectors", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateCameraRotation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Rotation int `json:"rotation"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	err := s.cameras.SetRotation(r.Context(), id, body.Rotation)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		// Validator rejects anything outside {0,90,180,270}.
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
