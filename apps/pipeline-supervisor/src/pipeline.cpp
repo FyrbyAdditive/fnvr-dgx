@@ -723,7 +723,17 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         // Rotation via nvvideoconvert flip-method operates on decoded
         // NVMM surfaces, so H.264 passthrough is incompatible with any
         // non-zero rotation.
-        const bool needs_transcode = (probe.codec == "h265") || (cam_.rotation != 0);
+        // Also force transcode when mtx_proxy is set. The cameras we
+        // route through MediaMTX are by definition "broken at the
+        // source" (Bambu H2D, cheap Rockchip RTSP servers, etc.) and
+        // their H.264 bitstreams tend to include mid-stream SPS/PPS
+        // changes that qtmux rejects with "Could not multiplex
+        // stream" 10-20s into a recording. Decoding via NVDEC and
+        // re-encoding via NVENC normalises the bitstream so qtmux
+        // sees a clean, monotonic stream. Costs a few percent GPU
+        // per proxied camera; worth it for record stability.
+        const bool needs_transcode =
+            (probe.codec == "h265") || (cam_.rotation != 0) || cam_.mtx_proxy;
         // GStreamer nvvideoconvert flip-method mapping:
         //   0 = none, 1 = CCW 90°, 2 = 180°, 3 = CW 90°, 4/5 = flips
         // Our camera rotation is clockwise degrees; translate.
