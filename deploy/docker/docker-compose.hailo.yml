@@ -36,3 +36,13 @@ services:
       - /usr/local/lib/libhailort.so.4:/usr/local/lib/libhailort.so.4:ro
       # hailortcli for in-container debug (`hailortcli scan`, `fw-control identify`).
       - /usr/local/bin/hailortcli:/usr/local/bin/hailortcli:ro
+
+  # api-server uses /dev/hailo0 only to detect whether the Hailo backend
+  # is available on this host (stat-only, GET /api/v1/system/hailo). The
+  # UI uses that flag to enable/disable the "Hailo-8 (PCIe)" option in the
+  # per-camera Backend dropdown. Without this mount, the api container
+  # can't see the device and the UI always reports the Hailo option as
+  # unavailable even when /dev/hailo0 exists on the host.
+  api:
+    devices:
+      - /dev/hailo0
