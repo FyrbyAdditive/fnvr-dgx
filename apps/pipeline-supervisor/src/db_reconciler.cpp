@@ -243,6 +243,30 @@ std::vector<std::string> ReadEnabledDetectorsForCamera(
     return out;
 }
 
+int ReadPipelineStartupGraceSec(const std::string& url) {
+    PGconn* conn = PQconnectdb(url.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        PQfinish(conn);
+        return 60;
+    }
+    const char* q = "SELECT value::text FROM settings WHERE key='pipeline.startup_grace_sec'";
+    PGresult* r = PQexec(conn, q);
+    int sec = 60;
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1) {
+        // Stored as a JSON number, which is just its string form.
+        try {
+            sec = std::stoi(PQgetvalue(r, 0, 0));
+        } catch (...) {
+            sec = 60;
+        }
+        if (sec < 0) sec = 0;
+        if (sec > 600) sec = 600;
+    }
+    PQclear(r);
+    PQfinish(conn);
+    return sec;
+}
+
 bool ReadMtxProxyForCamera(
     const std::string& url, const std::string& camera_id) {
     PGconn* conn = PQconnectdb(url.c_str());

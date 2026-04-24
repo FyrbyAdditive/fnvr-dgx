@@ -415,3 +415,41 @@ func (s *Store) SetAlarm(ctx context.Context, a AlarmState) error {
 	b, _ := json.Marshal(a)
 	return s.Set(ctx, "alarm.state", b)
 }
+
+// --- pipeline tunables ---
+
+// GetPipelineStartupGrace returns the seconds-of-grace window during
+// which the supervisor tolerates a flapping worker without publishing
+// `failed`. Used to silence "pipeline failed" flashes for sources that
+// need a few seconds (or a few respawns) to establish their upstream —
+// MediaMTX-proxied cameras, slow RTSPS handshakes, cold-boot devices.
+// Clamped to [0, 600]. Default 60.
+func (s *Store) GetPipelineStartupGrace(ctx context.Context) (int, error) {
+	const def = 60
+	raw, err := s.Get(ctx, "pipeline.startup_grace_sec")
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return def, nil
+		}
+		return def, err
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return def, nil
+	}
+	if n < 0 {
+		n = 0
+	}
+	if n > 600 {
+		n = 600
+	}
+	return n, nil
+}
+
+func (s *Store) SetPipelineStartupGrace(ctx context.Context, n int) error {
+	if n < 0 || n > 600 {
+		return fmt.Errorf("startup_grace_sec must be in [0, 600]")
+	}
+	b, _ := json.Marshal(n)
+	return s.Set(ctx, "pipeline.startup_grace_sec", b)
+}

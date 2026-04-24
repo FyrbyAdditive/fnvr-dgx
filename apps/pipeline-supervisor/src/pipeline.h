@@ -12,6 +12,14 @@
 
 namespace fnvr {
 
+// Set the grace window (seconds) used by the bus-error hard-exit path
+// to suppress its "failed" NATS publish. Called by the worker child
+// process at startup with the value from settings.pipeline.startup_grace_sec.
+// Without this, a slow-to-connect source (MediaMTX-proxied, cold-boot
+// TLS, etc.) fires `failed` in the UI on its first warmup exit even
+// though the supervisor is about to respawn and succeed.
+void SetWorkerStartupGraceSec(int sec);
+
 class WhepServer;
 
 // SingleCameraPipeline is the M2 shape: one camera in, record + (if DeepStream

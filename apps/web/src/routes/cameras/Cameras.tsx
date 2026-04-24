@@ -379,10 +379,21 @@ function MtxProxyToggle({ camera }: { camera: Camera }) {
   const stored = camera.enabled_detectors ?? [];
   const isNoAI = stored.length === 1 && stored[0] === "none";
   const current = !!camera.mtx_proxy;
+  const pinned = !!camera.mtx_tls_fingerprint;
+  const isRtsps = camera.url.startsWith("rtsps://");
   const update = useMutation({
     mutationFn: (enabled: boolean) =>
       api.updateCameraMtxProxy(camera.id, enabled),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+  });
+  const tlsIgnore = useMutation({
+    mutationFn: (ignore: boolean) =>
+      api.updateCameraMtxTLSIgnore(camera.id, ignore),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
+    onError: (e) =>
+      alert(
+        `couldn't probe TLS cert: ${e instanceof Error ? e.message : String(e)}`,
+      ),
   });
   if (!isNoAI) return null;
   return (
@@ -404,9 +415,33 @@ function MtxProxyToggle({ camera }: { camera: Camera }) {
         </span>
       </label>
       {current && (
-        <div className="mt-1 text-[11px] text-neutral-500 font-mono">
-          pipeline pulls: rtsp://mediamtx:8554/proxy_{camera.id}
-        </div>
+        <>
+          <div className="mt-1 text-[11px] text-neutral-500 font-mono">
+            pipeline pulls: rtsp://mediamtx:8554/proxy_{camera.id}
+          </div>
+          {isRtsps && (
+            <label className="mt-2 flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={pinned}
+                disabled={tlsIgnore.isPending}
+                onChange={(e) => tlsIgnore.mutate(e.target.checked)}
+              />
+              <span>
+                Ignore certificate
+                <span className="text-neutral-600">
+                  {" "}
+                  · pin to the current cert (self-signed / no-SAN devices)
+                </span>
+              </span>
+            </label>
+          )}
+          {pinned && camera.mtx_tls_fingerprint && (
+            <div className="mt-1 text-[10px] text-neutral-600 font-mono break-all">
+              pinned: {camera.mtx_tls_fingerprint}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

@@ -46,6 +46,11 @@ export type Camera = {
    *  re-muxer instead of the source URL directly. Only surfaced in the
    *  UI for no-AI cameras (enabled_detectors=["none"]). */
   mtx_proxy?: boolean;
+  /** SHA256 fingerprint of the upstream's TLS cert (uppercase, colon-
+   *  separated). Non-empty = MediaMTX pins to this cert instead of
+   *  doing CA validation. Populated automatically when operator ticks
+   *  "Ignore certificate" on an RTSPS source. */
+  mtx_tls_fingerprint?: string;
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
   /** Last time the api-server saw a heartbeat on
@@ -260,6 +265,11 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ mtx_proxy }),
     }),
+  updateCameraMtxTLSIgnore: (id: string, ignore: boolean) =>
+    req<{ mtx_tls_fingerprint: string }>(
+      `/cameras/${id}/mtx_tls_ignore`,
+      { method: "PATCH", body: JSON.stringify({ ignore }) },
+    ),
   systemStorage: () => req<SystemStorage>("/system/storage"),
 
   listZones: (cameraId?: string) =>
@@ -370,6 +380,16 @@ export const api = {
   getAlarm: () => req<AlarmStateBody>("/settings/alarm"),
   updateAlarm: (body: AlarmStateBody) =>
     req<void>("/settings/alarm", { method: "PUT", body: JSON.stringify(body) }),
+
+  // Pipeline-supervisor startup grace: seconds after a worker (re)spawn
+  // during which transient exits don't publish "failed" to the UI.
+  getPipelineStartupGrace: () =>
+    req<{ startup_grace_sec: number }>("/settings/pipeline_startup_grace"),
+  updatePipelineStartupGrace: (sec: number) =>
+    req<void>("/settings/pipeline_startup_grace", {
+      method: "PUT",
+      body: JSON.stringify({ startup_grace_sec: sec }),
+    }),
 
   // Face ID: persons CRUD + recent-faces view for enrolment.
   listPersons: () => req<Person[]>("/persons"),

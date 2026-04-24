@@ -11,6 +11,7 @@ export function Settings() {
   return (
     <div className="p-4 space-y-6 max-w-3xl">
       <Detector />
+      {me?.is_admin && <PipelineTunables />}
       <ClassMutes />
 
       {me?.is_admin && <Users />}
@@ -25,6 +26,60 @@ export function Settings() {
 
       <NotificationChannels />
     </div>
+  );
+}
+
+// PipelineTunables are the small knobs that shape supervisor behaviour —
+// no pipeline restart needed for a change to take effect (the supervisor
+// re-reads them per worker respawn cycle).
+function PipelineTunables() {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["pipeline-startup-grace"],
+    queryFn: api.getPipelineStartupGrace,
+  });
+  const [value, setValue] = useState<number | null>(null);
+  useEffect(() => {
+    if (data) setValue(data.startup_grace_sec);
+  }, [data]);
+  const save = useMutation({
+    mutationFn: (n: number) => api.updatePipelineStartupGrace(n),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["pipeline-startup-grace"] }),
+  });
+  const dirty =
+    value !== null && data !== undefined && value !== data.startup_grace_sec;
+  return (
+    <section>
+      <h2 className="text-lg font-semibold mb-2">Pipeline tunables</h2>
+      <div className="bg-neutral-900 rounded p-3 space-y-2 text-sm">
+        <label className="flex items-center gap-3">
+          <span className="w-56 text-neutral-400">Startup grace (seconds)</span>
+          <input
+            type="number"
+            min={0}
+            max={600}
+            className="bg-neutral-800 border border-neutral-700 rounded px-2 py-1 w-24"
+            value={value ?? 0}
+            onChange={(e) => setValue(Math.max(0, Math.min(600, Number(e.target.value))))}
+          />
+          <button
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed rounded px-3 py-1 text-xs"
+            disabled={!dirty || save.isPending}
+            onClick={() => value !== null && save.mutate(value)}
+          >
+            {save.isPending ? "saving…" : "save"}
+          </button>
+        </label>
+        <p className="text-xs text-neutral-500 pl-56">
+          During this window after a worker (re)spawn, transient exits
+          don't flip the UI banner to "pipeline failed" — gives
+          slow-to-dial sources (MediaMTX-proxied, self-signed TLS,
+          cold-boot cameras) time to settle. Default 60s. Set to 0 to
+          fail fast.
+        </p>
+      </div>
+    </section>
   );
 }
 

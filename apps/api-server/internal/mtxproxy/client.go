@@ -37,9 +37,14 @@ func New(baseURL string) *Client {
 // proxied sources. Many other fields exist (record, authentication,
 // publishUser, etc.); we leave them at defaults.
 type PathConfig struct {
-	Source           string `json:"source"`
-	SourceProtocol   string `json:"sourceProtocol,omitempty"`
-	SourceOnDemand   bool   `json:"sourceOnDemand"`
+	Source         string `json:"source"`
+	SourceProtocol string `json:"sourceProtocol,omitempty"`
+	SourceOnDemand bool   `json:"sourceOnDemand"`
+	// SourceFingerprint pins the SHA256 of the upstream's TLS cert so
+	// MediaMTX skips CA validation. Needed for devices with self-signed
+	// certs missing IP SAN entries (Bambu H2D, some Reolinks).
+	// Uppercase hex with ":" separators: "AA:BB:..."
+	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
 }
 
 // Add creates or replaces a path in MediaMTX's live config. Uses

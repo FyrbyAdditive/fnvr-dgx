@@ -46,7 +46,14 @@ type Camera struct {
 	// for cameras with corrupt RTSP streams (qtmux chokes on broken
 	// Rockchip-style NAL framing); the UI only offers it for no-AI
 	// cameras (enabled_detectors=["none"]).
-	MtxProxy              bool      `json:"mtx_proxy"`
+	MtxProxy bool `json:"mtx_proxy"`
+	// MtxTLSFingerprint is the SHA256 cert fingerprint of the upstream
+	// RTSPS source, uppercase + colon-separated. When non-empty,
+	// MediaMTX's source pins trust to this cert and skips the usual
+	// CA-validation path. Needed for devices with self-signed certs that
+	// lack IP SAN entries (e.g. Bambu H2D). Populated automatically by
+	// the API when the operator toggles "Ignore certificate" in the UI.
+	MtxTLSFingerprint     string    `json:"mtx_tls_fingerprint,omitempty"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }
@@ -62,7 +69,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       rotation, mtx_proxy, created_at, updated_at
+		       rotation, mtx_proxy, mtx_tls_fingerprint, created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -75,7 +82,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
 			&c.EnabledDetectors, &c.LocationKind, &c.MuteClassesOverride,
 			&c.UnmuteClassesOverride, &c.Rotation, &c.MtxProxy,
-			&c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.MtxTLSFingerprint, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -89,12 +96,13 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 		SELECT id, name, url, coalesce(substream,''), record_mode, enabled,
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
-		       rotation, mtx_proxy, created_at, updated_at
+		       rotation, mtx_proxy, mtx_tls_fingerprint, created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
 			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
 			&c.LocationKind, &c.MuteClassesOverride, &c.UnmuteClassesOverride,
-			&c.Rotation, &c.MtxProxy, &c.CreatedAt, &c.UpdatedAt)
+			&c.Rotation, &c.MtxProxy, &c.MtxTLSFingerprint,
+			&c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
@@ -372,6 +380,27 @@ func (s *Store) SetMtxProxy(ctx context.Context, id string, enabled bool) error 
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE cameras SET mtx_proxy=$1, updated_at=NOW() WHERE id=$2`,
 		enabled, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetMtxTLSFingerprint stores the SHA256 cert fingerprint to pin for
+// this camera's MediaMTX-proxied upstream. Empty string clears it (use
+// standard TLS verification again). Normalised to lowercase hex with
+// no separators — the format MediaMTX's RTSP client expects for its
+// sourceFingerprint equality check.
+func (s *Store) SetMtxTLSFingerprint(ctx context.Context, id, fingerprint string) error {
+	fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+	// Strip colon separators if caller pasted the openssl-style format.
+	fingerprint = strings.ReplaceAll(fingerprint, ":", "")
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE cameras SET mtx_tls_fingerprint=$1, updated_at=NOW() WHERE id=$2`,
+		fingerprint, id)
 	if err != nil {
 		return err
 	}

@@ -44,4 +44,12 @@ std::vector<std::string> ReadEnabledDetectorsForCamera(
 bool ReadMtxProxyForCamera(
     const std::string& database_url, const std::string& camera_id);
 
+// ReadPipelineStartupGraceSec returns the settings.pipeline.startup_grace_sec
+// value: seconds after a worker (re)spawn during which the supervisor
+// suppresses `failed` state publishes on transient exits. Default 60
+// on missing/invalid. Lets cameras with slow-to-warm sources (e.g. a
+// MediaMTX-proxied RTSPS device) come up without flashing "failed" in
+// the UI during their first successful connect.
+int ReadPipelineStartupGraceSec(const std::string& database_url);
+
 }  // namespace fnvr

@@ -96,6 +96,11 @@ int main(int argc, char** argv) {
         if (cam.mtx_proxy) {
             std::cerr << "worker[" << cam.id << "]: mtx_proxy=on\n";
         }
+        // Inform pipeline's bus-error path of the startup grace window
+        // so transient faults during warmup don't publish `failed` to
+        // the UI. Reads from the same settings key the supervisor uses.
+        fnvr::SetWorkerStartupGraceSec(
+            fnvr::ReadPipelineStartupGraceSec(cfg.database_url));
 
         fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
                                       cfg.use_deepstream, cfg.use_anpr, cfg.use_face_id,

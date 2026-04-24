@@ -22,6 +22,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
 	"github.com/fnvr/fnvr/apps/api-server/internal/metrics"
 	"github.com/fnvr/fnvr/apps/api-server/internal/mlworker"
+	"github.com/fnvr/fnvr/apps/api-server/internal/mtxproxy"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
@@ -162,6 +163,7 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("POST /api/v1/cameras/{id}/disable", auth.AdminFunc(s.handleDisableCamera))
 		protected.Handle("PATCH /api/v1/cameras/{id}/rotation", auth.AdminFunc(s.handleUpdateCameraRotation))
 		protected.Handle("PATCH /api/v1/cameras/{id}/mtx_proxy", auth.AdminFunc(s.handleUpdateCameraMtxProxy))
+		protected.Handle("PATCH /api/v1/cameras/{id}/mtx_tls_ignore", auth.AdminFunc(s.handleUpdateCameraMtxTLSIgnore))
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
@@ -277,6 +279,8 @@ func (s *Server) Handler() http.Handler {
 			protected.Handle("PUT /api/v1/settings/ha", auth.AdminFunc(s.handleUpdateHAConfig))
 			protected.HandleFunc("GET /api/v1/settings/alarm", s.handleGetAlarm)
 			protected.Handle("PUT /api/v1/settings/alarm", auth.AdminFunc(s.handleUpdateAlarm))
+			protected.HandleFunc("GET /api/v1/settings/pipeline_startup_grace", s.handleGetPipelineStartupGrace)
+			protected.Handle("PUT /api/v1/settings/pipeline_startup_grace", auth.AdminFunc(s.handleUpdatePipelineStartupGrace))
 		}
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
@@ -351,6 +355,7 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/settings/class_mutes", guarded)
 			mux.Handle("/api/v1/settings/ha", guarded)
 			mux.Handle("/api/v1/settings/alarm", guarded)
+			mux.Handle("/api/v1/settings/pipeline_startup_grace", guarded)
 		}
 		if s.pipelineStat != nil {
 			mux.Handle("/api/v1/system/pipeline/state", guarded)
@@ -507,6 +512,7 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 			"unmute_classes_override":  c.UnmuteClassesOverride,
 			"rotation":                 c.Rotation,
 			"mtx_proxy":                c.MtxProxy,
+			"mtx_tls_fingerprint":      c.MtxTLSFingerprint,
 			"created_at":               c.CreatedAt,
 			"updated_at":               c.UpdatedAt,
 			"state":                    state,
@@ -668,6 +674,52 @@ func (s *Server) handleUpdateCameraMtxProxy(w http.ResponseWriter, r *http.Reque
 		go s.mtxReconcile(context.Background())
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleUpdateCameraMtxTLSIgnore flips the "ignore TLS certificate"
+// affordance for a MediaMTX-proxied camera. When ignore=true we probe
+// the upstream URL over TLS, grab the cert's SHA256 fingerprint, and
+// store it so MediaMTX pins trust to that specific cert (which is
+// equivalent to "don't CA-validate" but safer — a MITM would have to
+// present the exact same cert). When ignore=false we clear the
+// fingerprint and fall back to standard TLS verification.
+func (s *Server) handleUpdateCameraMtxTLSIgnore(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Ignore bool `json:"ignore"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	cam, err := s.cameras.Get(r.Context(), id)
+	if errors.Is(err, camera.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.Error("get camera for tls ignore", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	fingerprint := ""
+	if body.Ignore {
+		fp, err := mtxproxy.ProbeFingerprint(r.Context(), cam.URL)
+		if err != nil {
+			http.Error(w, "probe cert: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		fingerprint = fp
+	}
+	if err := s.cameras.SetMtxTLSFingerprint(r.Context(), id, fingerprint); err != nil {
+		slog.Error("set mtx_tls_fingerprint", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if s.mtxReconcile != nil {
+		go s.mtxReconcile(context.Background())
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"mtx_tls_fingerprint": fingerprint})
 }
 
 func (s *Server) handleEnableCamera(w http.ResponseWriter, r *http.Request) {

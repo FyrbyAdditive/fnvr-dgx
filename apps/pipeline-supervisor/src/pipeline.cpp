@@ -814,7 +814,16 @@ p << "rtspsrc location=" << url
 p << "rtspsrc location=" << url
   << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3"
   << " name=src ! "
-                 "rtph264depay ! h264parse config-interval=1 ! ";
+                 "rtph264depay ! ";
+            // Pre-tee h264parse: needed on the inference path (our
+            // nvstreammux branch consumes parsed AU-aligned frames).
+            // Skipped for skip_inference because each tee branch has
+            // its own h264parse and two parsers around a tee trip
+            // qtmux with "Could not multiplex stream" — same fix we
+            // applied earlier for the transcode+skip_inference case.
+            if (!skip_inference_early) {
+                p << "h264parse config-interval=1 ! ";
+            }
             if (probe.width > 0 && probe.height > 0) {
                 rec_width_ = probe.width;
                 rec_height_ = probe.height;
@@ -1079,6 +1088,19 @@ p << "rtspsrc location=" << url
     return pipeline;
 }
 
+// Time this child-worker process started. Used by abortWorkerAfterFault
+// to decide whether an early fault should publish `failed` to the UI
+// (it shouldn't — the supervisor will respawn and the new child may
+// reach PLAYING). Only useful in worker child processes; the parent
+// supervisor has its own grace logic.
+static const auto g_worker_process_start = std::chrono::steady_clock::now();
+// The grace window within which abortWorkerAfterFault suppresses its
+// `failed` publish. Zero = publish immediately like before. Set by
+// main.cpp at worker startup from settings.pipeline.startup_grace_sec.
+static int g_worker_startup_grace_sec = 0;
+
+void SetWorkerStartupGraceSec(int sec) { g_worker_startup_grace_sec = sec; }
+
 // abortWorkerAfterFault publishes {"state":"failed"} with a bounded
 // flush, then _exits the process so the parent supervisor respawns
 // with a clean slate. Used for bus ERROR/EOS and (from main.cpp) the
@@ -1091,7 +1113,18 @@ p << "rtspsrc location=" << url
                                                const char* reason) {
     std::cerr << "worker[" << cam_id << "]: hard-exit rc=3 ("
               << reason << ")\n";
-    if (nats) {
+    // Startup grace: if this child has been up for less than the grace
+    // window, don't publish `failed` — the parent supervisor will
+    // respawn shortly and the next child may reach PLAYING. Without
+    // this, a slow-source camera (MediaMTX-proxied, cold-boot RTSPS,
+    // etc.) flashes `failed` in the UI on its first warmup exit even
+    // though the supervisor is about to retry successfully.
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - g_worker_process_start).count();
+    const bool within_grace =
+        g_worker_startup_grace_sec > 0 &&
+        age < g_worker_startup_grace_sec;
+    if (nats && !within_grace) {
         const std::string subj = "fnvr.state.camera." + cam_id;
         const std::string payload =
             "{\"camera_id\":\"" + cam_id + "\",\"state\":\"failed\"}";
@@ -1100,6 +1133,11 @@ p << "rtspsrc location=" << url
         // is the problem the publish returns quickly with an error
         // and we exit anyway.
         nats->Publish(subj, payload, /*flush=*/true);
+    } else if (within_grace) {
+        std::cerr << "worker[" << cam_id << "]: within "
+                  << g_worker_startup_grace_sec
+                  << "s startup grace (age=" << age
+                  << "s), not publishing failed\n";
     }
     std::_Exit(3);
 }

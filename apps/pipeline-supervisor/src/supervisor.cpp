@@ -290,6 +290,18 @@ void Supervisor::workerMain(Worker* w) {
     // publish.
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
 
+    // Startup grace: suppress the `failed` publish for a worker that
+    // has *never* run long enough to reach PLAYING. A child process
+    // that survived past grace_sec is presumed healthy — if it
+    // subsequently flaps, that's a real fault and we publish failed
+    // as normal. This handles slow-cadence flapping (e.g. rtspsrc
+    // hanging for tcp-timeout=15s between retries) where 3 exits
+    // take longer than a wall-clock grace window. Configurable via
+    // settings.pipeline.startup_grace_sec (default 60); re-read on
+    // each worker cycle so UI changes apply on next respawn.
+    const int grace_sec = ReadPipelineStartupGraceSec(cfg_.database_url);
+    bool has_been_healthy = false;
+
     // Carries across loop iterations: when the previous worker exited
     // as part of an hourly segment rotation, tell the next child via
     // an extra argv so it suppresses its "starting" state publish. The
@@ -366,6 +378,13 @@ void Supervisor::workerMain(Worker* w) {
         auto rotate_at = start_hour + std::chrono::hours(1) + stagger;
         bool hourly_rotate = false;
 
+        // Time the child was spawned so we can distinguish "died
+        // quickly during warmup" from "ran fine then something
+        // broke". The grace window below uses this to mark the
+        // worker as "has been healthy" once the child survives past
+        // grace_sec — after that, flaps publish `failed` normally.
+        auto child_spawn_at = std::chrono::steady_clock::now();
+
         // Wait for the child to exit, polling so we can react to w->stop.
         int status = 0;
         while (!stop_ && !w->stop) {
@@ -437,13 +456,28 @@ void Supervisor::workerMain(Worker* w) {
                now - recent_exits.front() > std::chrono::seconds(60)) {
             recent_exits.pop_front();
         }
+        // If this child lived past grace_sec, mark the worker healthy
+        // so future flaps get published normally. Slow-cadence flaps
+        // that never reach this threshold stay in grace.
+        auto child_uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - child_spawn_at).count();
+        if (grace_sec > 0 && child_uptime >= grace_sec) {
+            has_been_healthy = true;
+        }
         if (recent_exits.size() >= 3 && nats_) {
-            std::cerr << "worker[" << w->cam.id << "]: flapping ("
-                      << recent_exits.size() << " exits in 60s) — publishing failed\n";
-            std::string subj = "fnvr.state.camera." + w->cam.id;
-            std::string payload = "{\"camera_id\":\"" + w->cam.id +
-                "\",\"state\":\"failed\"}";
-            nats_->Publish(subj, payload, /*flush=*/true);
+            if (grace_sec > 0 && !has_been_healthy) {
+                std::cerr << "worker[" << w->cam.id << "]: flapping ("
+                          << recent_exits.size() << " exits in 60s) — in "
+                          << grace_sec << "s startup grace (no healthy run yet), "
+                          << "not publishing failed\n";
+            } else {
+                std::cerr << "worker[" << w->cam.id << "]: flapping ("
+                          << recent_exits.size() << " exits in 60s) — publishing failed\n";
+                std::string subj = "fnvr.state.camera." + w->cam.id;
+                std::string payload = "{\"camera_id\":\"" + w->cam.id +
+                    "\",\"state\":\"failed\"}";
+                nats_->Publish(subj, payload, /*flush=*/true);
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));

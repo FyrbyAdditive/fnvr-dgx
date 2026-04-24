@@ -42,14 +42,18 @@ func (r *Reconciler) Reconcile(ctx context.Context) {
 		slog.Warn("mtxproxy: list cameras", "err", err)
 		return
 	}
-	// Desired set: camera_id → upstream_url for rows with mtx_proxy=true
-	// and a non-empty url.
-	want := map[string]string{}
+	// Desired set: camera_id → (url, cert_fingerprint) for rows with
+	// mtx_proxy=true and a non-empty url. Fingerprint optional; set
+	// only when the operator ticked "Ignore certificate" in the UI.
+	type desired struct {
+		url, fingerprint string
+	}
+	want := map[string]desired{}
 	for _, c := range cams {
 		if !c.MtxProxy || c.URL == "" {
 			continue
 		}
-		want[pathName(c.ID)] = c.URL
+		want[pathName(c.ID)] = desired{url: c.URL, fingerprint: c.MtxTLSFingerprint}
 	}
 
 	existing, err := r.client.List(ctx)
@@ -75,17 +79,19 @@ func (r *Reconciler) Reconcile(ctx context.Context) {
 		}
 	}
 	// Add-or-patch desired paths.
-	for name, url := range want {
+	for name, d := range want {
 		cfg := PathConfig{
-			Source:         url,
-			SourceProtocol: "tcp",
-			SourceOnDemand: false,
+			Source:            d.url,
+			SourceProtocol:    "tcp",
+			SourceOnDemand:    false,
+			SourceFingerprint: d.fingerprint,
 		}
 		if err := r.client.Add(ctx, name, cfg); err != nil {
 			slog.Warn("mtxproxy: add", "path", name, "err", err)
 			continue
 		}
-		slog.Info("mtxproxy: up", "path", name, "source", url)
+		slog.Info("mtxproxy: up", "path", name, "source", d.url,
+			"pinned_cert", d.fingerprint != "")
 	}
 }
 

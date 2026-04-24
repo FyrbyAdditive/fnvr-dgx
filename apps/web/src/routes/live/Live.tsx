@@ -171,6 +171,12 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   // blocks insecure getUserMedia, etc.).
   const videoRef = useRef<HTMLVideoElement>(null);
   const [rtcLive, setRtcLive] = useState(false);
+  // retryTick bumps every 10s while the tile has no working stream
+  // (neither WHEP nor JPEG). Each bump re-runs the WHEP negotiation
+  // and — via imgOk — re-attempts the JPEG path. Without this, a tile
+  // whose pipeline wasn't ready at mount time shows "No recording yet"
+  // forever until the user refreshes the page.
+  const [retryTick, setRetryTick] = useState(0);
 
   useEffect(() => {
     let pc: RTCPeerConnection | null = null;
@@ -224,7 +230,7 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
       cancelled = true;
       if (pc) pc.close();
     };
-  }, [id]);
+  }, [id, retryTick]);
 
   // Snapshot fallback refresh.
   const [t, setT] = useState(() => Date.now());
@@ -236,6 +242,22 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
 
   const [imgOk, setImgOk] = useState(true);
   useEffect(() => { setImgOk(true); }, [id]);
+
+  // Every 10s while this tile has no working stream, bump retryTick
+  // to re-attempt both WHEP and the JPEG snapshot. Covers the common
+  // "pipeline not ready when page loaded" case — the worker comes up
+  // later and the tile picks it up automatically, no refresh needed.
+  useEffect(() => {
+    if (rtcLive && imgOk) return;
+    const h = setInterval(() => {
+      // Reset the JPEG-failed flag so the <img> re-renders and tries
+      // the latest snapshot; if it errors again, setImgOk(false) just
+      // flips us back and we wait another 10s.
+      setImgOk(true);
+      setRetryTick((v) => v + 1);
+    }, 10_000);
+    return () => clearInterval(h);
+  }, [rtcLive, imgOk]);
 
   // Preview FPS — tracked by counting successful image loads in the last
   // 5s. For WebRTC we register a requestVideoFrameCallback. Both feed
