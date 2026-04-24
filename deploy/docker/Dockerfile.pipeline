@@ -251,31 +251,11 @@ RUN set -eux; \
     rm -rf /tmp/rf-parser; \
     ldconfig
 
-# HailoRT (v4.23.0, hailo8 branch) userspace library + headers. Built from
-# public source — no developer-zone login. We only need libhailort.so +
-# headers for compiling and linking pipeline-supervisor; we skip the
-# gstreamer plugin (HAILO_BUILD_GSTREAMER=OFF) because our integration goes
-# direct via the C++ API from a pad probe. See apps/pipeline-supervisor/
-# src/hailo_inference.cpp for the runtime wiring.
-#
-# At runtime the container expects /dev/hailo0 + /usr/local/lib/libhailort.so
-# bind-mounted from the host (see deploy/docker/docker-compose.hailo.yml).
-# The in-image libhailort.so built here is overridden by the bind-mount on
-# Hailo-enabled hosts and is the fallback link for the supervisor binary on
-# Hailo-absent hosts.
-ARG HAILORT_VERSION=4.23.0
-RUN git clone --depth 1 --branch v${HAILORT_VERSION} \
-        https://github.com/hailo-ai/hailort.git /tmp/hailort \
-  && cmake -S /tmp/hailort -B /tmp/hailort/build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/usr/local \
-        -DHAILO_BUILD_GSTREAMER=OFF \
-        -DHAILO_BUILD_EXAMPLES=OFF \
-        -DHAILO_BUILD_UT=OFF \
-  && cmake --build /tmp/hailort/build --config Release --parallel $(nproc) \
-  && cmake --install /tmp/hailort/build --config Release \
-  && ldconfig \
-  && rm -rf /tmp/hailort
+# No libhailort in this image. The pipeline-supervisor talks to the Hailo
+# via a unix socket to fnvr-hailo-broker (apps/hailo-broker/), which is a
+# separate container that owns libhailort and /dev/hailo0. Supervisor-side
+# code is at apps/pipeline-supervisor/src/hailo_inference.cpp — pure
+# socket client, no hailort linkage.
 
 WORKDIR /src
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor

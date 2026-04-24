@@ -1,36 +1,51 @@
 #!/usr/bin/env bash
-# Install the Hailo-8 PCIe driver + HailoRT userspace on the Jetson host —
-# all from public GitHub sources, no developer-zone login required.
+# Install the Hailo-8 PCIe driver + firmware on the Jetson host.
 #
-# We do NOT build the hailonet GStreamer plugin. The fnvr pipeline uses
-# libhailort directly from a pad probe (apps/pipeline-supervisor/src/
-# hailo_probe.cpp), so the gstreamer plugin isn't needed. Skipping it cuts
-# build time and avoids the LGPL gstreamer-bindings code path.
+# The fnvr pipeline uses a dedicated broker container (fnvr-hailo-broker)
+# that owns the VDevice exclusively and serves pipeline-supervisor workers
+# over a unix socket. The broker has libhailort baked into its image, so
+# the host only strictly needs:
+#   - the hailo_pci kernel module (DKMS-managed)
+#   - the hailo8_fw.bin firmware blob at /lib/firmware/hailo/
+#   - the yolov11l HEF staged into the fnvr-data docker volume
+#
+# We ALSO build + install libhailort userspace on the host for
+# convenience — `hailortcli scan` / `hailortcli fw-control identify` etc.
+# Not required for fnvr to run, but very useful for diagnostics.
 #
 # One-time operation. Run as root (or with sudo) on the Orin itself, not inside
 # a container. Re-run safely — every step is idempotent.
 #
-# Pins both hailort-drivers and hailort to v4.23.0 (head of the hailo8 branch
-# at time of writing). Host userspace version must match the version baked
-# into the pipeline container image — if you bump HAILORT_VERSION here, bump
-# the ARG in deploy/docker/Dockerfile.pipeline to match.
+# Pins both hailort-drivers and hailort to v4.23.0 (head of the hailo8 branch).
+# The broker container's Dockerfile pins to the same version — keep them
+# in sync if you bump.
 #
 # What this script does:
 #   1. Clones hailort-drivers @ v4.23.0, builds the kernel module via DKMS so
 #      kernel upgrades auto-rebuild it.
-#   2. modprobes hailo_pci, waits for /dev/hailo0.
-#   3. Clones hailort @ v4.23.0, CMake-builds libhailort + hailortcli.
-#   4. Installs to /usr/local (so apt's userspace stays untouched).
+#   2. Downloads + installs the Hailo-8 firmware blob to /lib/firmware/hailo/.
+#   3. modprobes hailo_pci, waits for /dev/hailo0.
+#   4. Clones hailort @ v4.23.0, CMake-builds libhailort + hailortcli
+#      (HOST ONLY — the broker container has its own libhailort baked in).
 #   5. Stages the YOLOv11l HEF from Hailo's public Model Zoo S3 bucket into
-#      the fnvr-data docker volume where the pipeline container expects it.
+#      the fnvr-data docker volume where the broker container expects it.
 #
-# First-time build is ~10-20 minutes on the Orin (CMake pulls in protobuf,
-# spdlog, readerwriterqueue, etc. via FetchContent). Re-runs skip everything
+# Does NOT install/start the hailort_service systemd unit. An earlier
+# iteration used that for multi-process VDevice sharing, but the service
+# path is broken in libhailort v4.23.0 for our NMS-on-chip yolov11l
+# workload (returns HAILO_INTERNAL_FAILURE on first run_async). We replaced
+# it with our own broker — see apps/hailo-broker/ and
+# deploy/docker/docker-compose.hailo.yml.
+#
+# First-time build is ~10-20 minutes on the Orin (CMake pulls in spdlog,
+# readerwriterqueue, etc. via FetchContent). Re-runs skip everything
 # already present.
 #
 # Usage: sudo ./install-hailo-host.sh [--force-rebuild]
 
 set -euo pipefail
+
+log() { echo "hailo: $*"; }
 
 FORCE_REBUILD="${1:-}"
 
@@ -43,28 +58,11 @@ DRIVERS_DIR="${WORK_DIR}/hailort-drivers"
 HAILORT_DIR="${WORK_DIR}/hailort"
 INSTALL_PREFIX="/usr/local"
 HEF_NAME="yolov11l.hef"
-# HEF is architecture-specific — hailo8 vs hailo8l (entry tier, half the
-# compute). Detect at runtime using hailortcli to pick the matching HEF.
-DEVICE_ARCH="$(/usr/local/bin/hailortcli fw-control identify 2>/dev/null \
-    | awk -F': *' '/Device Architecture/ {print tolower($2); exit}')"
-if [ -z "$DEVICE_ARCH" ]; then
-    # Fallback: probe the module param / device fingerprint. Hailo-8L PCIe
-    # device IDs are documented as 0x2864 just like Hailo-8 so we can't
-    # discriminate there; default to hailo8l which is strictly smaller so
-    # the 8l HEF also runs on an 8 (validated by hailort docs), whereas
-    # the hailo8 HEF refuses to run on 8l.
-    log "hailortcli didn't report arch — defaulting to hailo8l"
-    DEVICE_ARCH="hailo8l"
-fi
-log "hailo device arch: $DEVICE_ARCH"
-HEF_URL="https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/${DEVICE_ARCH}/${HEF_NAME}"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "hailo: must run as root (use sudo)." >&2
     exit 1
 fi
-
-log() { echo "hailo: $*"; }
 
 log "build prerequisites"
 apt-get update
@@ -168,14 +166,20 @@ else
     log "cmake-configuring hailort (this pulls ~200MB of deps on first run)"
     BUILD_DIR="${HAILORT_DIR}/build"
     rm -rf "$BUILD_DIR"
+    # HAILO_BUILD_SERVICE=OFF — we had this ON in a prior iteration to try
+    # libhailort's own multi-process service, but the service's RPC pipeline
+    # is buggy for our NMS-on-chip yolov11l HEF (hits HAILO_INTERNAL_FAILURE
+    # on first run_async). We replaced it with fnvr-hailo-broker; see
+    # apps/hailo-broker/. Turning OFF here saves ~10min of grpc compile.
     cmake -S "$HAILORT_DIR" -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
         -DHAILO_BUILD_GSTREAMER=OFF \
+        -DHAILO_BUILD_SERVICE=OFF \
         -DHAILO_BUILD_EXAMPLES=OFF \
         -DHAILO_BUILD_UT=OFF
 
-    log "building hailort (this is the slow part — ~15-25min on Orin)"
+    log "building hailort (~10-15min on Orin)"
     cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 
     log "installing hailort to ${INSTALL_PREFIX}"
@@ -191,6 +195,31 @@ else
 fi
 
 ###############################################################################
+# 2b. (removed) hailort_service systemd unit
+###############################################################################
+# A prior iteration of this script installed hailort_service as a systemd
+# unit for multi-process VDevice sharing. That path is broken in v4.23.0
+# for our HEF (see note at the top). If a stale unit was previously
+# installed, stop + disable + remove it so it's not holding /dev/hailo0
+# when the broker container tries to claim it.
+if systemctl is-enabled hailort.service >/dev/null 2>&1 \
+   || [ -f /etc/systemd/system/hailort.service ]; then
+    log "removing legacy hailort.service unit (not needed anymore)"
+    systemctl disable --now hailort.service 2>/dev/null || true
+    rm -f /etc/systemd/system/hailort.service
+    rm -f /etc/default/hailort_service
+    systemctl daemon-reload
+fi
+# If a rogue hailort_service process is still running, kill it so
+# /dev/hailo0 becomes available to the broker container.
+if pgrep -x hailort_service >/dev/null 2>&1; then
+    log "killing leftover hailort_service process"
+    pkill -TERM -x hailort_service 2>/dev/null || true
+    sleep 1
+    pkill -KILL -x hailort_service 2>/dev/null || true
+fi
+
+###############################################################################
 # 3. Sanity checks
 ###############################################################################
 log "probing device with hailortcli"
@@ -202,6 +231,21 @@ log "probing device with hailortcli"
 ###############################################################################
 # 4. Stage HEF into the fnvr-data volume
 ###############################################################################
+# HEF is architecture-specific — hailo8 (full part) vs hailo8l (entry tier,
+# half the compute). Detect via hailortcli against the running chip. If the
+# hailort_service daemon is already running, hailortcli can reach it;
+# otherwise it talks to /dev/hailo0 directly. Falls back to hailo8l as a
+# safe default (the 8l HEF also runs on an 8 per hailort docs, but an 8 HEF
+# refuses to run on an 8l with status 93).
+DEVICE_ARCH="$(/usr/local/bin/hailortcli fw-control identify 2>/dev/null \
+    | awk -F': *' '/Device Architecture/ {print tolower($2); exit}')"
+if [ -z "$DEVICE_ARCH" ]; then
+    log "hailortcli didn't report arch — defaulting to hailo8l"
+    DEVICE_ARCH="hailo8l"
+fi
+log "hailo device arch: $DEVICE_ARCH"
+HEF_URL="https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/${DEVICE_ARCH}/${HEF_NAME}"
+
 log "staging ${HEF_NAME} into fnvr-data volume"
 docker run --rm -v fnvr_fnvr-data:/d alpine sh -c "
     set -e

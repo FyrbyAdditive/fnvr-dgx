@@ -48,20 +48,12 @@ else()
   message(STATUS "DeepStream: NOT found — building fallback pipeline only")
 endif()
 
-# HailoRT — only needed when the Hailo-8 backend is built into the
-# container image. We look for the installed header at /usr/local/include
-# (what deploy/hailo/install-hailo-host.sh produces on the build host,
-# and what Dockerfile.pipeline copies into the image). If absent we
-# compile hailo_inference.cpp + hailo_probe.cpp as stubs (the FNVR_HAS_HAILO
-# guard skips the libhailort-touching code paths) so dev machines without
-# Hailo still build the supervisor.
-if (EXISTS "/usr/local/include/hailo/hailort.hpp")
-  set(HAILO_FOUND TRUE)
-  message(STATUS "HailoRT: found at /usr/local/include/hailo")
-else()
-  set(HAILO_FOUND FALSE)
-  message(STATUS "HailoRT: NOT found — Hailo backend compiled as stub")
-endif()
+# HailoRT used to be linked directly here for the direct-VDevice path, but
+# the pipeline-supervisor now talks to apps/hailo-broker over a unix socket
+# (see src/hailo_inference.cpp). The broker owns libhailort exclusively; the
+# supervisor has zero hailort dependency. Keeping the variable for the
+# ${HAILO_FOUND} generator-expression below, but it's always FALSE now.
+set(HAILO_FOUND FALSE)
 
 target_include_directories(pipeline-supervisor PRIVATE
   ${GST_INCLUDE_DIRS}
@@ -69,7 +61,6 @@ target_include_directories(pipeline-supervisor PRIVATE
   ${PQ_INCLUDE_DIRS}
   src
   $<$<BOOL:${DEEPSTREAM_FOUND}>:${DEEPSTREAM_ROOT}/sources/includes>
-  $<$<BOOL:${HAILO_FOUND}>:/usr/local/include>
 )
 
 target_link_directories(pipeline-supervisor PRIVATE
@@ -77,14 +68,7 @@ target_link_directories(pipeline-supervisor PRIVATE
   ${NATS_LIBRARY_DIRS}
   ${PQ_LIBRARY_DIRS}
   $<$<BOOL:${DEEPSTREAM_FOUND}>:${DEEPSTREAM_ROOT}/lib>
-  $<$<BOOL:${HAILO_FOUND}>:/usr/local/lib>
 )
-
-if (HAILO_FOUND)
-  target_compile_definitions(pipeline-supervisor PRIVATE FNVR_HAS_HAILO=1)
-else()
-  target_compile_definitions(pipeline-supervisor PRIVATE FNVR_HAS_HAILO=0)
-endif()
 
 target_link_libraries(pipeline-supervisor PRIVATE
   ${GST_LIBRARIES}
@@ -103,10 +87,6 @@ target_link_libraries(pipeline-supervisor PRIVATE
   # package `libjpeg-turbo8-dev` provides both header and library.
   jpeg
   pthread
-  # libhailort — sync inference + VDevice + InferModel C++ API. Linked
-  # only when the header is detected on the build host (dev machines
-  # without Hailo build the stub path in hailo_*.cpp).
-  $<$<BOOL:${HAILO_FOUND}>:hailort>
 )
 
 
