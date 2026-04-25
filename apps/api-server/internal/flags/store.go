@@ -30,13 +30,13 @@ type BBox struct {
 
 type Flag struct {
 	ID             int64     `json:"id"`
-	DetectionID    int64     `json:"detection_id"`
+	DetectionID    *int64    `json:"detection_id"`
 	CameraID       string    `json:"camera_id"`
 	TS             time.Time `json:"ts"`
 	ClassOriginal  string    `json:"class_original"`
 	ClassCorrected *string   `json:"class_corrected"`
 	BBox           BBox      `json:"bbox"`
-	PHash          uint64    `json:"phash"`
+	PHash          *uint64   `json:"phash"`
 	FramePath      string    `json:"frame_path"`
 	LabelPath      string    `json:"label_path"`
 	CreatedBy      *string   `json:"created_by"`
@@ -44,18 +44,25 @@ type Flag struct {
 	DismissedAt    *time.Time `json:"dismissed_at"`
 }
 
-// CreateArgs bundles what the handler needs to write a flag. The
-// handler reads detection.id/ts/camera_id/bbox/attributes from PG and
-// populates the fields here; phash comes from the detection's
-// `attributes.phash` string (16-hex-char lowercase).
+// CreateArgs bundles what the handler needs to write a flag.
+//
+// For *detection-derived* flags (the original flow) the handler reads
+// detection.id/ts/camera_id/bbox/attributes from PG and populates the
+// fields here; phash comes from the detection's `attributes.phash`
+// string (16-hex-char lowercase).
+//
+// For *manual* flags (drawn straight onto a frozen Live tile) there's
+// no underlying detection — DetectionID and PHash are nil. The flag
+// still contributes a YOLO dataset row but doesn't enter the
+// pHash-based suppression library.
 type CreateArgs struct {
-	DetectionID    int64
+	DetectionID    *int64
 	CameraID       string
 	TS             time.Time
 	ClassOriginal  string
 	ClassCorrected *string
 	BBox           BBox
-	PHash          uint64
+	PHash          *uint64
 	FramePath      string // relative to DataDir
 	LabelPath      string // relative to DataDir
 	CreatedBy      *string
@@ -85,16 +92,16 @@ func (s *Store) Create(ctx context.Context, a CreateArgs) (Flag, error) {
 		RETURNING id, detection_id, camera_id, ts, class_original,
 		          class_corrected, bbox, phash, frame_path, label_path,
 		          created_by, created_at, dismissed_at`,
-		a.DetectionID, a.CameraID, a.TS, a.ClassOriginal,
+		nullableInt64(a.DetectionID), a.CameraID, a.TS, a.ClassOriginal,
 		derefOrNil(a.ClassCorrected), string(bboxJSON),
 		// pgx's pgtype for bigint is int64; pHash is a full 64-bit
 		// value which we store as a *signed* int64. The bit pattern
 		// round-trips so the event-processor's bits.OnesCount64 path
-		// works either way.
-		int64(a.PHash),
+		// works either way. nil → SQL NULL (manual flags).
+		nullablePHashArg(a.PHash),
 		a.FramePath, a.LabelPath, derefOrNil(a.CreatedBy),
-	).Scan(&f.ID, &f.DetectionID, &f.CameraID, &f.TS, &f.ClassOriginal,
-		&f.ClassCorrected, &bboxJSON, &scanPHash{&f.PHash}, &f.FramePath, &f.LabelPath,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if err != nil {
 		return Flag{}, err
@@ -150,9 +157,9 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Flag, error) {
 	for rows.Next() {
 		var fl Flag
 		var bboxJSON []byte
-		if err := rows.Scan(&fl.ID, &fl.DetectionID, &fl.CameraID, &fl.TS,
+		if err := rows.Scan(&fl.ID, &nullableInt64Scan{&fl.DetectionID}, &fl.CameraID, &fl.TS,
 			&fl.ClassOriginal, &fl.ClassCorrected, &bboxJSON,
-			&scanPHash{&fl.PHash}, &fl.FramePath, &fl.LabelPath,
+			&scanPHashPtr{&fl.PHash}, &fl.FramePath, &fl.LabelPath,
 			&fl.CreatedBy, &fl.CreatedAt, &fl.DismissedAt); err != nil {
 			return nil, err
 		}
@@ -174,8 +181,8 @@ func (s *Store) Dismiss(ctx context.Context, id int64) (Flag, error) {
 		RETURNING id, detection_id, camera_id, ts, class_original,
 		          class_corrected, bbox, phash, frame_path, label_path,
 		          created_by, created_at, dismissed_at`, id,
-	).Scan(&f.ID, &f.DetectionID, &f.CameraID, &f.TS, &f.ClassOriginal,
-		&f.ClassCorrected, &bboxJSON, &scanPHash{&f.PHash}, &f.FramePath, &f.LabelPath,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Flag{}, ErrNotFound
@@ -197,8 +204,8 @@ func (s *Store) Get(ctx context.Context, id int64) (Flag, error) {
 		       class_corrected, bbox, phash, frame_path, label_path,
 		       created_by, created_at, dismissed_at
 		FROM object_flags WHERE id = $1`, id,
-	).Scan(&f.ID, &f.DetectionID, &f.CameraID, &f.TS, &f.ClassOriginal,
-		&f.ClassCorrected, &bboxJSON, &scanPHash{&f.PHash}, &f.FramePath, &f.LabelPath,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Flag{}, ErrNotFound
@@ -250,19 +257,57 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// scanPHash adapts uint64 to the pgx int64 column. The 64-bit pattern
-// round-trips; bits.OnesCount64 is identity over signed reinterpret.
-type scanPHash struct{ dst *uint64 }
+// scanPHashPtr adapts a nullable int64 pgx column into a *uint64 dst.
+// NULL → nil; otherwise reinterpret the bit pattern (bits.OnesCount64
+// is identity over the signed/unsigned cast).
+type scanPHashPtr struct{ dst **uint64 }
 
-func (s *scanPHash) Scan(src any) error {
+func (s *scanPHashPtr) Scan(src any) error {
 	switch v := src.(type) {
 	case int64:
-		*s.dst = uint64(v)
+		u := uint64(v)
+		*s.dst = &u
 		return nil
 	case nil:
-		*s.dst = 0
+		*s.dst = nil
 		return nil
 	default:
-		return fmt.Errorf("scanPHash: unsupported %T", src)
+		return fmt.Errorf("scanPHashPtr: unsupported %T", src)
 	}
+}
+
+// nullableInt64Scan unmarshals a nullable BIGINT into a *int64 dst.
+type nullableInt64Scan struct{ dst **int64 }
+
+func (s *nullableInt64Scan) Scan(src any) error {
+	switch v := src.(type) {
+	case int64:
+		x := v
+		*s.dst = &x
+		return nil
+	case nil:
+		*s.dst = nil
+		return nil
+	default:
+		return fmt.Errorf("nullableInt64Scan: unsupported %T", src)
+	}
+}
+
+// nullableInt64 returns nil for a nil pointer (so pgx writes SQL
+// NULL) or the value otherwise. The arg type must be `any` because
+// pgx interprets typed-nil and untyped-nil differently for NOT NULL
+// columns; returning untyped nil is the safe path.
+func nullableInt64(p *int64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// nullablePHashArg returns nil or the int64 reinterpretation of *p.
+func nullablePHashArg(p *uint64) any {
+	if p == nil {
+		return nil
+	}
+	return int64(*p)
 }

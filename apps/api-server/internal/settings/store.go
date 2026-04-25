@@ -48,11 +48,30 @@ func (s *Store) Set(ctx context.Context, key string, value json.RawMessage) erro
 
 // --- typed helpers ---
 
-// validYoloVariants is the whitelist of YOLO26 size suffixes. Anything
-// else gets rejected at Set time so the pipeline entrypoint can trust
-// the DB value without re-validating.
+// validYoloVariants is the whitelist of stock YOLO26 size suffixes.
+// Custom fine-tuned models (fnvr-v1, fnvr-v2, ...) are *also* accepted
+// — see validYoloVariant below for the full predicate.
 var validYoloVariants = map[string]struct{}{
 	"yolo26n": {}, "yolo26s": {}, "yolo26m": {}, "yolo26l": {}, "yolo26x": {},
+}
+
+// validYoloVariant accepts either a stock variant or a custom-trained
+// model name in the form fnvr-vN (lowercase + digits + hyphens, ≤32
+// chars — same shape as Hailo's). The pipeline entrypoint trusts the
+// stored value and resolves it to a model file at startup; an unknown
+// fnvr-vN gracefully degrades to FP16 fallback (same path as a
+// missing ONNX) rather than crashing the worker.
+func validYoloVariant(v string) bool {
+	if _, ok := validYoloVariants[v]; ok {
+		return true
+	}
+	if !validHailoVersion(v) {
+		return false
+	}
+	// At least filter out empty / nonsense — any custom name should
+	// start with "fnvr-" by convention so it's distinguishable from
+	// the stock list at a glance in logs and Settings.
+	return len(v) >= 6 && v[:5] == "fnvr-"
 }
 // INT8 is served via offline trtexec calibration (see
 // docs/deployment/known-issues.md and deploy/docker/calibrate-yolo26.sh).
@@ -75,13 +94,21 @@ type Detector struct {
 	// FaceIDEnabled toggles the SCRFD + ArcFace SGIE chain for face
 	// detect + embed. Same scaling + restart story as AnprEnabled.
 	FaceIDEnabled bool `json:"face_id_enabled"`
+	// HailoModelVersion picks which HEF the hailo-broker container
+	// loads at startup. "stock" → /var/lib/fnvr/models/hailo/yolov11l.hef
+	// (Hailo Model Zoo's pre-compiled weights, 80 COCO classes).
+	// Anything else → /var/lib/fnvr/models/hailo/<version>.hef, which
+	// is what tools/compile-hef/ produces from a fine-tuned ONNX. The
+	// broker entrypoint script resolves the name and falls back to
+	// "stock" with a log line if the file's missing.
+	HailoModelVersion string `json:"hailo_model_version"`
 }
 
 // GetDetector reads the detector settings, falling back to defaults if a
 // key is missing (e.g. after a fresh install before the migration's seed
 // row runs — belt-and-braces).
 func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
-	d := Detector{YoloVariant: "yolo26x", YoloPrecision: "fp16"}
+	d := Detector{YoloVariant: "yolo26x", YoloPrecision: "fp16", HailoModelVersion: "stock"}
 	if raw, err := s.Get(ctx, "detector.yolo26_variant"); err == nil {
 		_ = json.Unmarshal(raw, &d.YoloVariant)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -102,22 +129,38 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
+	if raw, err := s.Get(ctx, "detector.hailo_model_version"); err == nil {
+		_ = json.Unmarshal(raw, &d.HailoModelVersion)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
 	return d, nil
 }
 
 // SetDetector validates and upserts detector settings. Any invalid value
 // produces an error and no write happens.
 func (s *Store) SetDetector(ctx context.Context, d Detector) error {
-	if _, ok := validYoloVariants[d.YoloVariant]; !ok {
-		return fmt.Errorf("invalid yolo26_variant %q", d.YoloVariant)
+	if !validYoloVariant(d.YoloVariant) {
+		return fmt.Errorf("invalid yolo26_variant %q (allowed: yolo26{n,s,m,l,x} or fnvr-v<N>)", d.YoloVariant)
 	}
 	if _, ok := validPrecisions[d.YoloPrecision]; !ok {
 		return fmt.Errorf("invalid yolo26_precision %q", d.YoloPrecision)
+	}
+	// Permissive validation on hailo_model_version: any
+	// alphanumeric/hyphen string up to 32 chars is allowed. The
+	// broker's entrypoint script does the actual file-exists check
+	// and falls back gracefully if a referenced HEF is missing.
+	if d.HailoModelVersion == "" {
+		d.HailoModelVersion = "stock"
+	}
+	if !validHailoVersion(d.HailoModelVersion) {
+		return fmt.Errorf("invalid hailo_model_version %q (allowed: a-z, 0-9, '-', max 32 chars)", d.HailoModelVersion)
 	}
 	vb, _ := json.Marshal(d.YoloVariant)
 	pb, _ := json.Marshal(d.YoloPrecision)
 	ab, _ := json.Marshal(d.AnprEnabled)
 	fb, _ := json.Marshal(d.FaceIDEnabled)
+	hb, _ := json.Marshal(d.HailoModelVersion)
 	if err := s.Set(ctx, "detector.yolo26_variant", vb); err != nil {
 		return err
 	}
@@ -127,7 +170,26 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	if err := s.Set(ctx, "detector.anpr_enabled", ab); err != nil {
 		return err
 	}
-	return s.Set(ctx, "detector.face_id_enabled", fb)
+	if err := s.Set(ctx, "detector.face_id_enabled", fb); err != nil {
+		return err
+	}
+	return s.Set(ctx, "detector.hailo_model_version", hb)
+}
+
+func validHailoVersion(v string) bool {
+	if len(v) == 0 || len(v) > 32 {
+		return false
+	}
+	for _, c := range v {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Face match threshold — cosine similarity floor above which a

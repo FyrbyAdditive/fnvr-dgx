@@ -459,11 +459,21 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     if (!batch) return GST_PAD_PROBE_OK;
 
     gint64 ts_ns = g_get_real_time() * 1000;  // µs → ns
+    // Millisecond-resolution ISO 8601. Second-resolution was too
+    // coarse for the Live overlay's age-out logic — multiple events
+    // emitted in the same wall-clock second shared one `ts`, and
+    // when the source clock drifted vs the client filter (or the
+    // broker introduced any latency) bboxes could vanish despite
+    // the object still being detected each frame.
     auto iso = [ts_ns]{
         std::time_t t = ts_ns / 1'000'000'000;
+        long ms = (ts_ns / 1'000'000) % 1000;
         std::tm tm{}; gmtime_r(&t, &tm);
-        char b[32]; std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tm);
-        return std::string(b);
+        char b[40];
+        std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", &tm);
+        char out[40];
+        std::snprintf(out, sizeof out, "%s.%03ldZ", b, ms);
+        return std::string(out);
     }();
 
     for (NvDsMetaList* fl = batch->frame_meta_list; fl; fl = fl->next) {

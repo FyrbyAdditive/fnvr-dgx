@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, APIToken, ClassMutes as ClassMutesT, DetectorSettings, HAConfig, NotificationChannel } from "@/lib/api";
+import { api, APIToken, ClassMutes as ClassMutesT, createDetectionClass, deleteDetectionClass, DetectionClass, DetectorSettings, fetchDetectionClasses, HAConfig, NotificationChannel, patchDetectionClass } from "@/lib/api";
 import { loadCocoLabels, classCategory, CATEGORY_ORDER } from "@/lib/classes";
 import { useMe } from "@/lib/me";
 
@@ -13,6 +13,7 @@ export function Settings() {
       <Detector />
       {me?.is_admin && <PipelineTunables />}
       <ClassMutes />
+      {me?.is_admin && <ClassesEditor />}
 
       {me?.is_admin && <Users />}
       {me?.is_admin && <HomeAssistant />}
@@ -111,6 +112,7 @@ function Detector() {
   const [precision, setPrecision] = useState<DetectorSettings["yolo26_precision"]>("fp16");
   const [anpr, setAnpr] = useState<boolean>(false);
   const [faceId, setFaceId] = useState<boolean>(false);
+  const [hailoVersion, setHailoVersion] = useState<string>("stock");
 
   // Seed local state from server once.
   useEffect(() => {
@@ -119,6 +121,7 @@ function Detector() {
       setPrecision(current.yolo26_precision);
       setAnpr(!!current.anpr_enabled);
       setFaceId(!!current.face_id_enabled);
+      setHailoVersion(current.hailo_model_version || "stock");
     }
   }, [current]);
 
@@ -129,6 +132,7 @@ function Detector() {
         yolo26_precision: precision,
         anpr_enabled: anpr,
         face_id_enabled: faceId,
+        hailo_model_version: hailoVersion,
       });
       await api.restartPipeline();
     },
@@ -144,7 +148,8 @@ function Detector() {
     (variant !== current.yolo26_variant ||
       precision !== current.yolo26_precision ||
       anpr !== !!current.anpr_enabled ||
-      faceId !== !!current.face_id_enabled);
+      faceId !== !!current.face_id_enabled ||
+      hailoVersion !== (current.hailo_model_version || "stock"));
 
   return (
     <section>
@@ -158,14 +163,43 @@ function Detector() {
           <label className="text-neutral-400">Model size</label>
           <select
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
-            value={variant}
-            onChange={(e) => setVariant(e.target.value as DetectorSettings["yolo26_variant"])}
+            value={
+              YOLO_VARIANTS.find((v) => v.value === variant)
+                ? variant
+                : "__custom__"
+            }
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === "__custom__") {
+                // Switching to custom mode — preserve any
+                // existing fnvr-vN value, default to fnvr-v1.
+                setVariant(variant.startsWith("fnvr-") ? variant : "fnvr-v1");
+              } else {
+                setVariant(v);
+              }
+            }}
           >
             {YOLO_VARIANTS.map((v) => (
               <option key={v.value} value={v.value}>{v.label}</option>
             ))}
+            <option value="__custom__">
+              Custom fine-tuned (fnvr-v1, fnvr-v2, …)
+            </option>
           </select>
         </div>
+
+        {variant.startsWith("fnvr-") && (
+          <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
+            <label className="text-neutral-400">Custom name</label>
+            <input
+              type="text"
+              className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+              value={variant}
+              placeholder="fnvr-v1"
+              onChange={(e) => setVariant(e.target.value.trim().toLowerCase())}
+            />
+          </div>
+        )}
 
         <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
           <label className="text-neutral-400">Precision</label>
@@ -222,6 +256,22 @@ function Detector() {
             />
             <span>Detect &amp; recognise faces (SCRFD-like + ArcFace)</span>
           </label>
+        </div>
+
+        <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
+          <label
+            className="text-neutral-400"
+            title="Which HEF the hailo-broker loads. 'stock' uses the Hailo Model Zoo's pre-compiled yolov11l (80 COCO classes). Set to a custom name like 'fnvr-v1' to load /var/lib/fnvr/models/hailo/fnvr-v1.hef from tools/compile-hef/. Missing files transparently fall back to stock."
+          >
+            Hailo model
+          </label>
+          <input
+            type="text"
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={hailoVersion}
+            placeholder="stock"
+            onChange={(e) => setHailoVersion(e.target.value.trim().toLowerCase())}
+          />
         </div>
 
         {isAdmin && (
@@ -1280,5 +1330,199 @@ function HomeAssistant() {
         </div>
       </div>
     </section>
+  );
+}
+
+// ClassesEditor lets admins curate the detection class taxonomy:
+// disable COCO classes the site doesn't care about, add custom
+// classes (e.g. "parcel", "amazon-van"), rename display labels.
+//
+// Disabling a class hides it from the relabel dropdown and excludes
+// it from the regenerated dataset.yaml. The numeric yolo_id is
+// immutable — already-written label files still resolve correctly.
+function ClassesEditor() {
+  const qc = useQueryClient();
+  const { data: classes = [], isLoading } = useQuery({
+    queryKey: ["detection-classes"],
+    queryFn: fetchDetectionClasses,
+  });
+
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      patchDetectionClass(id, { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["detection-classes"] }),
+  });
+  const create = useMutation({
+    mutationFn: ({ slug, displayName }: { slug: string; displayName: string }) =>
+      createDetectionClass(slug, displayName),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["detection-classes"] }),
+  });
+  const remove = useMutation({
+    mutationFn: (id: number) => deleteDetectionClass(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["detection-classes"] }),
+  });
+
+  // Group COCO seeds by category for readability; custom classes go in
+  // their own bucket pinned at the top.
+  const buckets = useMemo(() => {
+    const out: Record<string, DetectionClass[]> = { Custom: [] };
+    for (const c of classes) {
+      if (c.origin === "custom") out.Custom.push(c);
+      else {
+        const cat = classCategory(c.slug);
+        (out[cat] ??= []).push(c);
+      }
+    }
+    for (const k of Object.keys(out)) {
+      out[k].sort((a, b) => a.display_name.localeCompare(b.display_name));
+    }
+    return out;
+  }, [classes]);
+
+  const enabledCount = classes.filter((c) => c.enabled).length;
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-lg font-semibold">Detection classes</h2>
+      <p className="text-sm text-neutral-400 max-w-2xl">
+        The taxonomy your detector recognises. Tick the classes that
+        matter for your site; disabled classes are hidden from the
+        Live-tab relabel picker and excluded from the YOLO dataset.yaml
+        the next training pass consumes. Custom classes you add here
+        will be detected once a fine-tuned model is trained on labelled
+        samples.
+      </p>
+      <div className="text-xs text-neutral-500">
+        {enabledCount} of {classes.length} classes enabled
+      </div>
+
+      {isLoading && <div className="text-neutral-500">loading…</div>}
+
+      {!isLoading && (
+        <>
+          <NewClassForm
+            onSubmit={(slug, name) => create.mutate({ slug, displayName: name })}
+            error={create.isError ? String((create.error as Error)?.message) : null}
+          />
+
+          {/* Custom bucket first (most relevant), then COCO categories
+              in their established order. */}
+          {(["Custom", ...CATEGORY_ORDER] as const).map((cat) => {
+            const items = buckets[cat] ?? [];
+            if (cat !== "Custom" && items.length === 0) return null;
+            if (cat === "Custom" && items.length === 0) return null;
+            return (
+              <div key={cat} className="space-y-1">
+                <div className="text-xs uppercase tracking-wide text-neutral-500 mt-3">
+                  {cat}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1">
+                  {items.map((c) => (
+                    <ClassRow
+                      key={c.id}
+                      c={c}
+                      onToggle={(enabled) =>
+                        toggle.mutate({ id: c.id, enabled })
+                      }
+                      onDelete={
+                        c.origin === "custom"
+                          ? () => remove.mutate(c.id)
+                          : undefined
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ClassRow({
+  c,
+  onToggle,
+  onDelete,
+}: {
+  c: DetectionClass;
+  onToggle: (enabled: boolean) => void;
+  onDelete?: () => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 text-sm py-0.5 group">
+      <input
+        type="checkbox"
+        className="accent-blue-500"
+        checked={c.enabled}
+        onChange={(e) => onToggle(e.target.checked)}
+      />
+      <span className={c.enabled ? "" : "text-neutral-500"}>
+        {c.display_name}
+      </span>
+      <span className="text-[10px] text-neutral-600">#{c.yolo_id}</span>
+      {onDelete && (
+        <button
+          className="opacity-0 group-hover:opacity-100 text-[10px] text-red-400 hover:text-red-300 ml-auto"
+          title="Delete custom class (only if no flagged samples)"
+          onClick={(e) => {
+            e.preventDefault();
+            if (window.confirm(`Delete custom class "${c.display_name}"?`)) {
+              onDelete();
+            }
+          }}
+        >
+          delete
+        </button>
+      )}
+    </label>
+  );
+}
+
+function NewClassForm({
+  onSubmit,
+  error,
+}: {
+  onSubmit: (slug: string, displayName: string) => void;
+  error: string | null;
+}) {
+  const [slug, setSlug] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  return (
+    <form
+      className="flex items-center gap-2 flex-wrap text-xs bg-neutral-900/50 border border-neutral-800 rounded p-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!slug.trim()) return;
+        onSubmit(slug.trim().toLowerCase(), displayName.trim() || slug.trim());
+        setSlug("");
+        setDisplayName("");
+      }}
+    >
+      <span className="text-neutral-400">Add custom class</span>
+      <input
+        type="text"
+        placeholder="slug (e.g. parcel)"
+        className="bg-neutral-800 border border-neutral-700 rounded px-2 py-0.5 w-40"
+        value={slug}
+        onChange={(e) => setSlug(e.target.value)}
+      />
+      <input
+        type="text"
+        placeholder="display name (optional)"
+        className="bg-neutral-800 border border-neutral-700 rounded px-2 py-0.5 w-48"
+        value={displayName}
+        onChange={(e) => setDisplayName(e.target.value)}
+      />
+      <button
+        type="submit"
+        className="bg-blue-700 hover:bg-blue-600 px-2 py-0.5 rounded disabled:opacity-50"
+        disabled={!slug.trim()}
+      >
+        add
+      </button>
+      {error && <span className="text-red-400">{error}</span>}
+    </form>
   );
 }

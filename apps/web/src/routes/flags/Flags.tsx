@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, COCO_CLASSES, ObjectFlag, ObjectFlagStats } from "@/lib/api";
+import { api, fetchDetectionClasses, ObjectFlag, ObjectFlagStats } from "@/lib/api";
 import { useMe } from "@/lib/me";
 
 // Flags page. Surfaces everything the operator has ever flagged as a
@@ -50,10 +50,17 @@ export function Flags() {
   });
 
   // Distinct class list for the filter dropdown — drawn from the
-  // server's stats so dormant classes don't clutter.
-  const distinctClasses = stats
-    ? Object.keys(stats.by_class).sort()
-    : [];
+  // server's stats so dormant classes don't clutter. Falls back to
+  // the full enabled-class list (from /admin/classes) when stats are
+  // empty (fresh install with no flags yet).
+  const distinctClasses = stats ? Object.keys(stats.by_class).sort() : [];
+  const { data: allClasses = [] } = useQuery({
+    queryKey: ["detection-classes"],
+    queryFn: fetchDetectionClasses,
+  });
+  const fallbackClassSlugs = allClasses
+    .filter((c) => c.enabled)
+    .map((c) => c.slug);
 
   return (
     <div className="p-4 space-y-4 max-w-5xl">
@@ -97,7 +104,7 @@ export function Flags() {
             onChange={(e) => setFilterClass(e.target.value)}
           >
             <option value="">(any)</option>
-            {(distinctClasses.length ? distinctClasses : COCO_CLASSES).map((c) => (
+            {(distinctClasses.length ? distinctClasses : fallbackClassSlugs).map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>

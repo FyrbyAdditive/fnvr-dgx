@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api, COCO_CLASSES } from "@/lib/api";
+import { api, fetchDetectionClasses } from "@/lib/api";
 import { useRecentDetections, DetectionEvent } from "@/lib/events";
 import { useMe } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
@@ -54,7 +54,14 @@ export function Live() {
     const now = Date.now();
     const m = new Map<string, DetectionEvent[]>();
     for (const e of events) {
-      if (now - new Date(e.ts).getTime() > 2000) continue;
+      // Age out bboxes 2s after we saw them on the SSE stream. Falls
+      // back to source `ts` for events that predate the
+      // arrived_at_ms field (e.g. a build mismatch between web and
+      // pipeline).
+      const age = e.arrived_at_ms != null
+        ? now - e.arrived_at_ms
+        : now - new Date(e.ts).getTime();
+      if (age > 2000) continue;
       const arr = m.get(e.camera_id) ?? [];
       arr.push(e);
       m.set(e.camera_id, arr);
@@ -72,8 +79,11 @@ export function Live() {
     const WINDOW_MS = 5000;
     const perCam = new Map<string, Set<string>>();
     for (const e of events) {
-      const t = new Date(e.ts).getTime();
-      if (now - t > WINDOW_MS) continue;
+      // Window is in arrival time so an idle camera correctly drops
+      // to 0 fps. We still de-dup on source `ts` because one frame
+      // emits N events sharing the same ts (1 per detected object) —
+      // counting unique `ts` values approximates frames/sec.
+      if (now - e.arrived_at_ms > WINDOW_MS) continue;
       let s = perCam.get(e.camera_id);
       if (!s) { s = new Set(); perCam.set(e.camera_id, s); }
       s.add(e.ts);
@@ -154,6 +164,25 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   // popover. Clicking outside or hitting escape resumes live.
   const [pickedDetection, setPickedDetection] = useState<DetectionEvent | null>(null);
   const [pickedFrozenBoxes, setPickedFrozenBoxes] = useState<DetectionEvent[] | null>(null);
+
+  // Manual-label drawer state. When `drawing` is true the tile is in
+  // "draw a box" mode: cursor=crosshair, mousedown→mousemove→mouseup
+  // tracks `drawnRect` in normalised tile coordinates. After mouseup
+  // a class picker pops over the box; on submission we POST to
+  // /api/v1/flags/manual to land a YOLO training row.
+  const [drawing, setDrawing] = useState(false);
+  const [drawnRect, setDrawnRect] = useState<
+    { x: number; y: number; w: number; h: number } | null
+  >(null);
+  const [drawingDragStart, setDrawingDragStart] = useState<
+    { x: number; y: number } | null
+  >(null);
+  // Once the user releases the mouse with a non-degenerate rect, the
+  // popover comes up to choose a class. Setting this back to null on
+  // submit / cancel returns the tile to live.
+  const [pendingManualRect, setPendingManualRect] = useState<
+    { x: number; y: number; w: number; h: number } | null
+  >(null);
   // When opened from Timeline's "now" click, scroll this tile into
   // view and run a short highlight animation so the user sees where
   // they landed without hunting the grid.
@@ -181,6 +210,12 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   useEffect(() => {
     let pc: RTCPeerConnection | null = null;
     let cancelled = false;
+    // Captured from the WHEP server's Location header. Sent as DELETE on
+    // unmount so the pipeline worker can drop its webrtcbin + queue +
+    // tee request pad. Without this, every browser tab open leaves a
+    // webrtcbin (and ~70 internal threads) lingering for the lifetime
+    // of the worker process.
+    let sessionUrl: string | null = null;
 
     (async () => {
       try {
@@ -218,6 +253,9 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
           body: pc.localDescription!.sdp,
         });
         if (!res.ok) throw new Error(`whep ${res.status}`);
+        // The api-server rewrote Location to point back at this proxy
+        // (e.g. /api/v1/cameras/<id>/whep/<sid>); store it for cleanup.
+        sessionUrl = res.headers.get("Location");
         const answer = await res.text();
         if (cancelled) return;
         await pc.setRemoteDescription({ type: "answer", sdp: answer });
@@ -229,6 +267,20 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
     return () => {
       cancelled = true;
       if (pc) pc.close();
+      if (sessionUrl) {
+        // Best-effort DELETE — keepalive lets the request survive even
+        // when the page is being torn down (tab close, navigation away).
+        // We don't await; nothing depends on the response.
+        try {
+          fetch(sessionUrl, {
+            method: "DELETE",
+            credentials: "include",
+            keepalive: true,
+          }).catch(() => {});
+        } catch {
+          // ignore — leak is bounded by the server-side sweeper anyway
+        }
+      }
     };
   }, [id, retryTick]);
 
@@ -315,8 +367,49 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
       }`}
     >
       <div
-        className="relative max-w-full max-h-full"
+        className={`relative max-w-full max-h-full ${drawing ? "cursor-crosshair" : ""}`}
         style={{ aspectRatio: aspect, width: aspect >= 16 / 9 ? "100%" : "auto", height: aspect < 16 / 9 ? "100%" : "auto" }}
+        onMouseDown={
+          drawing
+            ? (e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = (e.clientX - rect.left) / rect.width;
+                const y = (e.clientY - rect.top) / rect.height;
+                setDrawingDragStart({ x, y });
+                setDrawnRect({ x, y, w: 0, h: 0 });
+              }
+            : undefined
+        }
+        onMouseMove={
+          drawing && drawingDragStart
+            ? (e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+                setDrawnRect({
+                  x: Math.min(drawingDragStart.x, x),
+                  y: Math.min(drawingDragStart.y, y),
+                  w: Math.abs(x - drawingDragStart.x),
+                  h: Math.abs(y - drawingDragStart.y),
+                });
+              }
+            : undefined
+        }
+        onMouseUp={
+          drawing && drawingDragStart
+            ? () => {
+                setDrawingDragStart(null);
+                if (drawnRect && drawnRect.w > 0.01 && drawnRect.h > 0.01) {
+                  // Lock the rect, exit draw mode, open the picker.
+                  setPendingManualRect(drawnRect);
+                  setDrawing(false);
+                } else {
+                  // Click without drag (or microscopic rect): cancel.
+                  setDrawnRect(null);
+                }
+              }
+            : undefined
+        }
       >
         {rtcLive ? (
           <video
@@ -377,6 +470,35 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
             }}
           />
         )}
+
+        {/* In-progress drawing rect, shown while the operator is
+            dragging in draw mode. Switches to the locked
+            ManualLabelPopover once mouseup fires with a non-trivial
+            box. */}
+        {drawing && drawnRect && (
+          <div
+            className="absolute pointer-events-none border-2 border-emerald-400 bg-emerald-400/10"
+            style={{
+              left: `${drawnRect.x * 100}%`,
+              top: `${drawnRect.y * 100}%`,
+              width: `${drawnRect.w * 100}%`,
+              height: `${drawnRect.h * 100}%`,
+            }}
+          />
+        )}
+
+        {/* Manual-label popover: same chrome as FlagPopover but with
+            no underlying detection — the bbox came from the drawer. */}
+        {pendingManualRect && (
+          <ManualLabelPopover
+            cameraId={id}
+            bbox={pendingManualRect}
+            onClose={() => {
+              setPendingManualRect(null);
+              setDrawnRect(null);
+            }}
+          />
+        )}
       </div>
 
       <div className="absolute bottom-2 left-2 text-xs bg-black/60 px-2 py-0.5 rounded">
@@ -391,6 +513,22 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
             disabled={!enabled}
             variant="overlay"
           />
+          <button
+            className={`text-xs px-2 py-0.5 rounded ${
+              drawing
+                ? "bg-emerald-700 hover:bg-emerald-600"
+                : "bg-neutral-800/80 hover:bg-neutral-700"
+            } border border-neutral-700`}
+            title="Draw a label box on this tile to add a YOLO training sample"
+            onClick={(e) => {
+              e.stopPropagation();
+              setDrawing((d) => !d);
+              setDrawnRect(null);
+              setDrawingDragStart(null);
+            }}
+          >
+            {drawing ? "cancel draw" : "+ label"}
+          </button>
         </div>
       )}
       {latest && (
@@ -625,23 +763,158 @@ function FlagPopover({
           >
             False positive — suppress future matches
           </button>
-          <details className="px-1">
-            <summary className="cursor-pointer text-neutral-400 hover:text-neutral-200 py-1">
-              Relabel as…
-            </summary>
-            <div className="max-h-40 overflow-auto mt-1 grid grid-cols-2 gap-1">
-              {COCO_CLASSES.filter((c) => c !== detection.class_name).map((c) => (
-                <button
-                  key={c}
-                  className="text-left px-1 py-0.5 rounded hover:bg-neutral-800 disabled:opacity-50"
-                  disabled={submitting}
-                  onClick={() => submit(c)}
-                >
-                  {c}
-                </button>
-              ))}
+          <RelabelPicker
+            currentClass={detection.class_name}
+            disabled={submitting}
+            onPick={submit}
+          />
+        </div>
+        {error && <div className="text-red-400 mt-2">{error}</div>}
+        <div className="text-neutral-500 text-[10px] mt-2">
+          Esc or click outside to cancel.
+        </div>
+      </div>
+    </>
+  );
+}
+
+// RelabelPicker fetches the enabled detection_classes list and renders
+// a clickable grid. Disabled / unknown classes are filtered out so the
+// user can't relabel into a class the trained model wouldn't emit.
+function RelabelPicker({
+  currentClass,
+  disabled,
+  onPick,
+}: {
+  currentClass: string;
+  disabled: boolean;
+  onPick: (slug: string) => void;
+}) {
+  const { data: classes = [], isLoading } = useQuery({
+    queryKey: ["detection-classes"],
+    queryFn: fetchDetectionClasses,
+  });
+  const options = classes
+    .filter((c) => c.enabled && c.slug !== currentClass)
+    .sort((a, b) => a.display_name.localeCompare(b.display_name));
+  return (
+    <details className="px-1">
+      <summary className="cursor-pointer text-neutral-400 hover:text-neutral-200 py-1">
+        Relabel as…
+      </summary>
+      <div className="max-h-40 overflow-auto mt-1 grid grid-cols-2 gap-1">
+        {isLoading && <div className="text-neutral-500">loading…</div>}
+        {!isLoading && options.length === 0 && (
+          <div className="text-neutral-500 col-span-2">
+            no other enabled classes — manage in Settings → Classes
+          </div>
+        )}
+        {options.map((c) => (
+          <button
+            key={c.slug}
+            className="text-left px-1 py-0.5 rounded hover:bg-neutral-800 disabled:opacity-50"
+            disabled={disabled}
+            onClick={() => onPick(c.slug)}
+          >
+            {c.display_name}
+          </button>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+// ManualLabelPopover anchors below the user-drawn rect and asks for a
+// class. On submit it POSTs to /api/v1/flags/manual which captures the
+// camera's most recent live JPEG and writes a YOLO training row.
+function ManualLabelPopover({
+  cameraId,
+  bbox,
+  onClose,
+}: {
+  cameraId: string;
+  bbox: { x: number; y: number; w: number; h: number };
+  onClose: () => void;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { data: classes = [], isLoading } = useQuery({
+    queryKey: ["detection-classes"],
+    queryFn: fetchDetectionClasses,
+  });
+  const enabled = classes
+    .filter((c) => c.enabled)
+    .sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  // Esc / click-outside cancel — same affordance as FlagPopover.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  async function submit(slug: string) {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.flagManual({ camera_id: cameraId, bbox, class: slug });
+      onClose();
+    } catch (e) {
+      setError((e as Error).message || "manual label failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  // Anchor the popover just under the drawn box, clamped inside the
+  // tile so it never escapes off the right edge.
+  const left = `${Math.max(0, Math.min(70, bbox.x * 100))}%`;
+  const top = `${Math.min(90, (bbox.y + bbox.h) * 100)}%`;
+
+  return (
+    <>
+      <div
+        className="absolute inset-0 z-10"
+        style={{ background: "rgba(0,0,0,0.25)" }}
+        onClick={onClose}
+      />
+      {/* Re-render the locked rect so it stays visible while choosing. */}
+      <div
+        className="absolute pointer-events-none border-2 border-emerald-400 bg-emerald-400/10 z-10"
+        style={{
+          left: `${bbox.x * 100}%`,
+          top: `${bbox.y * 100}%`,
+          width: `${bbox.w * 100}%`,
+          height: `${bbox.h * 100}%`,
+        }}
+      />
+      <div
+        className="absolute z-20 bg-neutral-900 border border-neutral-700 rounded p-2 text-xs shadow-xl min-w-[14rem]"
+        style={{ left, top, transform: "translate(0, 0.25rem)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-neutral-400 mb-2">
+          Label this box as…
+        </div>
+        <div className="max-h-56 overflow-auto grid grid-cols-2 gap-1">
+          {isLoading && <div className="text-neutral-500">loading…</div>}
+          {!isLoading && enabled.length === 0 && (
+            <div className="text-neutral-500 col-span-2">
+              no enabled classes — add one in Settings → Detection classes
             </div>
-          </details>
+          )}
+          {enabled.map((c) => (
+            <button
+              key={c.slug}
+              className="text-left px-1 py-0.5 rounded hover:bg-neutral-800 disabled:opacity-50"
+              disabled={submitting}
+              onClick={() => submit(c.slug)}
+            >
+              {c.display_name}
+            </button>
+          ))}
         </div>
         {error && <div className="text-red-400 mt-2">{error}</div>}
         <div className="text-neutral-500 text-[10px] mt-2">

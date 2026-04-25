@@ -11,7 +11,17 @@ export type DetectionEvent = {
    *  the race where the row hadn't landed yet at click time. */
   pg_id?: number;
   camera_id: string;
+  /** Source-side timestamp (ISO seconds resolution) — when the
+   *  pipeline emitted the detection. May lag wall-clock by up to a
+   *  few seconds under broker / queue back-pressure. */
   ts: string;
+  /** Client-side wall-clock (ms since epoch) at the moment this
+   *  event arrived on the SSE stream. Used by the Live overlay to
+   *  decide how long to keep the bbox on screen — `ts` alone is too
+   *  coarse (1-second resolution) and lags real time when broker
+   *  inference is slow, which previously made bboxes vanish despite
+   *  the object still being there. */
+  arrived_at_ms: number;
   class_name: string;
   /** "object" | "anpr" | "face". Absent on legacy payloads (treat as "object"). */
   kind?: "object" | "anpr" | "face";
@@ -33,7 +43,15 @@ export function useDetectionStream(onEvent: (d: DetectionEvent) => void) {
   useEffect(() => {
     const es = new EventSource("/api/v1/events/stream", { withCredentials: true });
     const h = (ev: MessageEvent) => {
-      try { cbRef.current(JSON.parse(ev.data) as DetectionEvent); } catch {}
+      try {
+        const d = JSON.parse(ev.data) as DetectionEvent;
+        // Stamp arrival time so the overlay can age bboxes off based
+        // on when we saw them, not when the pipeline thinks the
+        // detection happened. Source-side `ts` has 1-second resolution
+        // and can lag actual wall-clock when the broker is busy.
+        d.arrived_at_ms = Date.now();
+        cbRef.current(d);
+      } catch {}
     };
     es.addEventListener("detection", h as EventListener);
     return () => {

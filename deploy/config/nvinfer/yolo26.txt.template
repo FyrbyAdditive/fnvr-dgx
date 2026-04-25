@@ -5,10 +5,13 @@
 # effective file.
 #
 # Placeholders resolved by the entrypoint:
-#   $MODEL         e.g. yolo26x / yolo26s
+#   $MODEL         e.g. yolo26x / yolo26s / fnvr-v1 (custom-trained)
 #   $NETWORK_MODE  2 for FP16, 1 for INT8
 #   $ENGINE_SUFFIX fp16 or int8 (in the engine filename, for cache keying)
 #   $INT8_LINE     empty line for FP16; "int8-calib-file=..." for INT8
+#   $NUM_CLASSES   integer count of enabled detection_classes rows
+#                  (80 for the stock COCO model; smaller for custom
+#                  fine-tunes that target the user's trimmed taxonomy)
 
 [property]
 gpu-id=0
@@ -18,9 +21,16 @@ onnx-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx
 model-engine-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx_b1_gpu0_$ENGINE_SUFFIX.engine
 labelfile-path=/var/lib/fnvr/models/yolo26/labels.txt
 batch-size=1
+# 4 GB workspace lets TensorRT pick its full tactic catalogue
+# during engine build. Without this nvinfer defaults to ~31 MB and
+# logs "Tactic Device request: 31MB Available: 27MB" while skipping
+# the larger (and faster) tactics — engine builds slower AND the
+# resulting engine is slower at runtime. Orin AGX has 64 GB unified
+# memory; 4 GB workspace is comfortably available.
+workspace-size=4096
 network-mode=$NETWORK_MODE
 $INT8_LINE
-num-detected-classes=80
+num-detected-classes=$NUM_CLASSES
 interval=0
 gie-unique-id=1
 process-mode=1

@@ -138,7 +138,8 @@ struct HailoInference::Impl {
     std::unique_ptr<VDevice>            vdevice;
     std::shared_ptr<InferModel>         infer_model;
     ConfiguredInferModel                configured;
-    std::vector<Slot>                   slots;  // kMaxBatch entries
+    std::vector<Slot>                   slots;  // batch_size entries
+    size_t                              batch_size = 1;  // resolved at configure()
 
     // Decoded NMS shape — same for every slot.
     uint32_t                            num_classes      = 0;
@@ -199,19 +200,51 @@ struct HailoInference::Impl {
     // `run_async(vector<Bindings>)` call.
     void RunLoop() {
         std::vector<std::unique_ptr<Request>> batch;
-        batch.reserve(kMaxBatch);
+        batch.reserve(batch_size);
+
+        // Latency-bounded batching window. After the first request lands
+        // we wait briefly for additional cameras to enqueue their frame
+        // so we hit batch_size and amortise the per-call hailort overhead
+        // across multiple frames. Without this, two cameras at ~20 fps
+        // each (50 ms inter-arrival) tend to alternate (A's inference
+        // completes → A's worker fetches next frame → B's frame arrives
+        // mid-cycle → broker processes batch=1 of just B → ...) and
+        // never reach batch=2 in practice. With 5 ms tolerance we get
+        // batch=2 nearly every time the load can support it; per-camera
+        // latency cost is bounded at 5 ms which is < 1 frame at 60 fps.
+        constexpr auto kBatchFillWait = std::chrono::milliseconds(5);
 
         while (!stop.load()) {
             batch.clear();
             {
                 std::unique_lock<std::mutex> lk(q_mu);
+                // First request: unbounded wait — broker is idle until
+                // any client sends a frame.
                 q_cv.wait(lk, [&]{ return stop.load() || !queue.empty(); });
                 if (stop.load() && queue.empty()) break;
 
-                // Drain up to kMaxBatch without blocking.
-                while (batch.size() < kMaxBatch && !queue.empty()) {
+                // Take what's already there, then wait up to
+                // kBatchFillWait for more, capped at batch_size.
+                while (batch.size() < batch_size && !queue.empty()) {
                     batch.emplace_back(std::move(queue.front()));
                     queue.pop();
+                }
+                if (batch.size() < batch_size) {
+                    // Timed wait for more arrivals. Wakes early if a
+                    // request arrives or stop fires.
+                    const auto deadline = std::chrono::steady_clock::now() + kBatchFillWait;
+                    while (batch.size() < batch_size && !stop.load()) {
+                        if (queue.empty()) {
+                            if (q_cv.wait_until(lk, deadline) ==
+                                std::cv_status::timeout) {
+                                break;
+                            }
+                        }
+                        while (batch.size() < batch_size && !queue.empty()) {
+                            batch.emplace_back(std::move(queue.front()));
+                            queue.pop();
+                        }
+                    }
                 }
             }
             if (batch.empty()) continue;
@@ -229,7 +262,7 @@ struct HailoInference::Impl {
 
     void ProcessBatch(std::vector<std::unique_ptr<Request>>& batch) {
         const size_t n = batch.size();
-        assert(n > 0 && n <= kMaxBatch);
+        assert(n > 0 && n <= batch_size);
 
         // Copy each request's RGB into its slot and point Bindings there.
         // set_buffer() each call — same pattern as the single-frame path,
@@ -342,16 +375,37 @@ HailoInference::HailoInference(const std::string& hef_path)
     // CRITICAL: set batch size BEFORE configure(). Without this the
     // configured model is batch-1 and the vector<Bindings> run_async
     // overload either errors or silently serialises.
-    impl_->infer_model->set_batch_size(static_cast<uint16_t>(kMaxBatch));
-
-    auto conf_exp = impl_->infer_model->configure();
-    if (!conf_exp) {
-        throw std::runtime_error(
-            "HailoInference: configure(batch=" + std::to_string(kMaxBatch) +
-            ") failed: " +
-            std::to_string(static_cast<int>(conf_exp.status())));
+    //
+    // Different HEFs have different memory budgets — a multi-context
+    // HEF (typical for big-backbone YOLOs on hailo8l) can fail at
+    // batch=4 with HAILO_CANT_MEET_BUFFER_REQUIREMENTS (status=84)
+    // because per-batch slot allocations don't fit in the chip's
+    // SRAM. Try descending batch sizes until one configures cleanly,
+    // and remember it as the runtime cap for the inference loop.
+    size_t configured_batch = 0;
+    int last_status = 0;
+    for (size_t b : {kMaxBatch, size_t{2}, size_t{1}}) {
+        if (b > kMaxBatch) continue;
+        if (configured_batch != 0) break;
+        impl_->infer_model->set_batch_size(static_cast<uint16_t>(b));
+        auto conf_exp = impl_->infer_model->configure();
+        if (conf_exp) {
+            impl_->configured = conf_exp.release();
+            configured_batch = b;
+            std::cerr << "hailo: configured batch=" << b << "\n";
+            break;
+        }
+        last_status = static_cast<int>(conf_exp.status());
+        std::cerr << "hailo: configure(batch=" << b
+                  << ") failed status=" << last_status
+                  << "; trying smaller batch\n";
     }
-    impl_->configured = conf_exp.release();
+    if (configured_batch == 0) {
+        throw std::runtime_error(
+            "HailoInference: configure failed at all batch sizes; "
+            "last status=" + std::to_string(last_status));
+    }
+    impl_->batch_size = configured_batch;
 
     // Discover input/output sizes + NMS shape from the just-configured
     // model. These are the same for every slot.
@@ -398,9 +452,10 @@ HailoInference::HailoInference(const std::string& hef_path)
 
     // Allocate slots: each gets its own input/output scratch + a fresh
     // Bindings pre-pointed at them. These persist for the lifetime of the
-    // singleton.
-    impl_->slots.resize(kMaxBatch);
-    for (size_t i = 0; i < kMaxBatch; ++i) {
+    // singleton. Sized to the actual configured batch (may be < kMaxBatch
+    // for HEFs whose context layout can't fit the cap on hailo8l).
+    impl_->slots.resize(impl_->batch_size);
+    for (size_t i = 0; i < impl_->batch_size; ++i) {
         impl_->slots[i].input.allocate(expected_in);
         impl_->slots[i].output.allocate(out_frame_size);
 
@@ -430,10 +485,10 @@ HailoInference::HailoInference(const std::string& hef_path)
         }
     }
 
-    std::cerr << "hailo: configured yolov11l — "
+    std::cerr << "hailo: configured "
               << impl_->num_classes << " classes, up to "
               << impl_->max_bboxes_class << " bboxes/class, "
-              << "batch_size=" << kMaxBatch << ", "
+              << "batch_size=" << impl_->batch_size << ", "
               << "input=" << expected_in << "B, output=" << out_frame_size << "B\n";
 
     // Spawn the inference thread last so Impl is fully constructed before

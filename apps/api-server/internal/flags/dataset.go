@@ -20,37 +20,19 @@ import (
 // is created or dismissed.
 const DatasetRoot = "datasets/objects"
 
-// YOLO 80-class COCO index. Used to translate class_corrected to a
-// numeric class id in the label file. Anything not in this list is
-// skipped (label file is written without that row). For this slice
-// we restrict class_corrected to the COCO list; new classes are a
-// deferred slice.
-//
-// Source: the pipeline's detector parser emits these names verbatim;
-// this map must stay in lock-step with deploy/config/nvinfer/coco.labels.
-var CocoClasses = []string{
-	"person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-	"truck", "boat", "traffic light", "fire hydrant", "stop sign",
-	"parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-	"elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-	"handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-	"sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-	"surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-	"knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-	"broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-	"couch", "potted plant", "bed", "dining table", "toilet", "tv",
-	"laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-	"oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-	"scissors", "teddy bear", "hair drier", "toothbrush",
+// ClassEntry is the minimal view of a detection_classes row that the
+// dataset writer needs: a human slug ("person") and the integer the
+// model emits (0..N). The handler resolves these from the classes
+// package and threads them in so this file stays DB-independent.
+type ClassEntry struct {
+	Slug   string
+	YoloID int
 }
 
-var cocoClassIndex = func() map[string]int {
-	m := make(map[string]int, len(CocoClasses))
-	for i, c := range CocoClasses {
-		m[c] = i
-	}
-	return m
-}()
+// ClassLookup is just a slug→yolo_id map; passed to WriteArtifacts so
+// it can translate `class_corrected` to the integer the YOLO label
+// file expects. Built once per request from the classes table.
+type ClassLookup map[string]int
 
 // SplitFor picks train/ or val/ based on a stable hash of the flag
 // id. 10 % of flags end up under val/. Deterministic so calling it
@@ -73,8 +55,13 @@ func SplitFor(flagID int64) string {
 // copy into the dataset (typically the most recent live-preview ring
 // file for the camera). If jpegSrc doesn't exist the caller should
 // bail before calling; we don't synthesise images.
+//
+// classes is a slug→yolo_id map sourced from the detection_classes
+// table. classCorrected slugs not present in the map are silently
+// dropped — the label file gets written empty, which YOLO interprets
+// as "no objects in this frame."
 func WriteArtifacts(dataDir string, flagID int64, jpegSrc string,
-	bbox BBox, classCorrected *string) (framePath, labelPath string, err error) {
+	bbox BBox, classCorrected *string, classes ClassLookup) (framePath, labelPath string, err error) {
 
 	split := SplitFor(flagID)
 	absImgDir := filepath.Join(dataDir, DatasetRoot, "images", split)
@@ -100,13 +87,13 @@ func WriteArtifacts(dataDir string, flagID int64, jpegSrc string,
 	// image at this bbox") — YOLO-trains the detector away from the
 	// false positive.
 	//
-	// class_corrected non-null and in CocoClasses → one line.
+	// class_corrected non-null and known → one line.
 	//
-	// class_corrected non-null but NOT in CocoClasses (shouldn't
-	// happen in slice 1; defensive) → empty file + log.
+	// class_corrected non-null but unknown to the lookup → empty file
+	// (defensive; the API handler validates against the same source).
 	var labelContent string
 	if classCorrected != nil {
-		if idx, ok := cocoClassIndex[*classCorrected]; ok {
+		if idx, ok := classes[*classCorrected]; ok {
 			xc := bbox.X + bbox.W/2
 			yc := bbox.Y + bbox.H/2
 			labelContent = fmt.Sprintf("%d %.6f %.6f %.6f %.6f\n",
@@ -134,7 +121,11 @@ func WriteArtifacts(dataDir string, flagID int64, jpegSrc string,
 //	  0: person
 //	  1: bicycle
 //	  ...
-func RegenerateDatasetYAML(dataDir string) error {
+//
+// `classes` should be the enabled subset of detection_classes sorted
+// by yolo_id; disabled classes are deliberately omitted so the
+// trainer doesn't waste capacity on classes the user has hidden.
+func RegenerateDatasetYAML(dataDir string, classes []ClassEntry) error {
 	root := filepath.Join(dataDir, DatasetRoot)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
@@ -147,10 +138,10 @@ func RegenerateDatasetYAML(dataDir string) error {
 	b.WriteString("train: images/train\n")
 	b.WriteString("val: images/val\n")
 	b.WriteString("names:\n")
-	// Write classes in id order so the numeric labels in .txt files
-	// line up when trainers consume this.
-	for i, name := range CocoClasses {
-		fmt.Fprintf(&b, "  %d: %s\n", i, name)
+	// Write classes in yolo_id order so the numeric labels in .txt
+	// files line up when trainers consume this.
+	for _, c := range classes {
+		fmt.Fprintf(&b, "  %d: %s\n", c.YoloID, c.Slug)
 	}
 
 	return os.WriteFile(filepath.Join(root, "dataset.yaml"), []byte(b.String()), 0o644)

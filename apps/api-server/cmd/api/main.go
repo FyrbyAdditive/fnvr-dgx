@@ -13,6 +13,7 @@ import (
 
 	"github.com/fnvr/fnvr/apps/api-server/internal/auth"
 	"github.com/fnvr/fnvr/apps/api-server/internal/camera"
+	"github.com/fnvr/fnvr/apps/api-server/internal/classes"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/db"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
@@ -200,6 +201,7 @@ func runServe() error {
 		Plates:        plates.NewStore(pool),
 		Persons:       persons.NewStore(pool),
 		Flags:         flags.NewStore(pool),
+		Classes:       classes.NewStore(pool),
 		MLWorker:      mlworker.NewClient(),
 	})
 

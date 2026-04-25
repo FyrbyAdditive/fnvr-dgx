@@ -1635,10 +1635,15 @@ func loadPHashHamming(ctx context.Context, pool *pgxpool.Pool) int {
 // Missing table (fresh install predating migration 0024) returns
 // empty / no error, consistent with loadFaceNegatives.
 func (e *Engine) loadObjectFlags(ctx context.Context) (map[string]map[string][]uint64, int, error) {
+	// Manual flags (drawn straight on a frozen tile to teach the
+	// detector about a missed object) have no phash — they're
+	// training data only, not suppression entries. Filter them out
+	// so the live-suppression library only contains real
+	// detection-derived pHashes.
 	rows, err := e.pool.Query(ctx, `
 		SELECT camera_id, class_original, phash
 		FROM object_flags
-		WHERE dismissed_at IS NULL`)
+		WHERE dismissed_at IS NULL AND phash IS NOT NULL`)
 	if err != nil {
 		if isRelationMissing(err) {
 			return map[string]map[string][]uint64{}, 0, nil

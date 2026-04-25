@@ -16,6 +16,7 @@ import (
 
 	"github.com/fnvr/fnvr/apps/api-server/internal/auth"
 	"github.com/fnvr/fnvr/apps/api-server/internal/camera"
+	"github.com/fnvr/fnvr/apps/api-server/internal/classes"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/events"
@@ -60,6 +61,7 @@ type Server struct {
 	plates       *plates.Store
 	persons      *persons.Store
 	flags        *flags.Store
+	classes      *classes.Store
 	mlWorker     *mlworker.Client
 }
 
@@ -84,6 +86,7 @@ type Deps struct {
 	Plates        *plates.Store
 	Persons       *persons.Store
 	Flags         *flags.Store
+	Classes       *classes.Store
 	MLWorker      *mlworker.Client
 }
 
@@ -109,6 +112,7 @@ func New(d Deps) *Server {
 		plates:       d.Plates,
 		persons:      d.Persons,
 		flags:        d.Flags,
+		classes:      d.Classes,
 		mlWorker:     d.MLWorker,
 	}
 }
@@ -134,6 +138,12 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.cameras != nil {
 		mux.HandleFunc("GET /api/v1/internal/cameras", s.handleInternalListCameras)
+	}
+	if s.classes != nil {
+		// Pipeline entrypoint reads this to render num-detected-classes
+		// in the nvinfer config when running a custom (fnvr-vN) model.
+		// Auth-free because the docker bridge isolates it.
+		mux.HandleFunc("GET /api/v1/internal/classes", s.handleListClasses)
 	}
 	if s.auth != nil {
 		mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
@@ -175,6 +185,10 @@ func (s *Server) Handler() http.Handler {
 			// authenticated users.
 			protected.HandleFunc("POST /api/v1/cameras/{id}/whep", s.handleWhepOffer)
 			protected.HandleFunc("OPTIONS /api/v1/cameras/{id}/whep", s.handleWhepOptions)
+			// DELETE /api/v1/cameras/{id}/whep/{sid} — WHEP-spec session
+			// termination. Without it the pipeline worker accumulates
+			// webrtcbin elements on every browser tab open/close cycle.
+			protected.HandleFunc("DELETE /api/v1/cameras/{id}/whep/{sid}", s.handleWhepDelete)
 		}
 
 		if s.rules != nil {
@@ -247,11 +261,23 @@ func (s *Server) Handler() http.Handler {
 			// (they drive real-time suppression); list + stats +
 			// thumbnail are viewer-safe.
 			protected.Handle("POST /api/v1/detections/{id}/flag", auth.AdminFunc(s.handleFlagDetection))
+			protected.Handle("POST /api/v1/flags/manual", auth.AdminFunc(s.handleManualFlag))
 			protected.HandleFunc("GET /api/v1/object-flags", s.handleListFlags)
 			protected.HandleFunc("GET /api/v1/object-flags/stats", s.handleFlagStats)
 			protected.Handle("DELETE /api/v1/object-flags/{id}", auth.AdminFunc(s.handleDismissFlag))
 			protected.HandleFunc("GET /api/v1/object-thumbnail/{detection_id}", s.handleObjectThumbnail)
 			protected.HandleFunc("GET /api/v1/ml/drift/status", s.handleDriftStatus)
+		}
+
+		// Detection class taxonomy. Reads viewable by anyone authenticated
+		// (Live tab pulls the enabled list to populate relabel dropdowns);
+		// writes admin-only — they reshape what the dataset.yaml + future
+		// fine-tuned model will recognise.
+		if s.classes != nil {
+			protected.HandleFunc("GET /api/v1/admin/classes", s.handleListClasses)
+			protected.Handle("POST /api/v1/admin/classes", auth.AdminFunc(s.handleCreateClass))
+			protected.Handle("PATCH /api/v1/admin/classes/{id}", auth.AdminFunc(s.handlePatchClass))
+			protected.Handle("DELETE /api/v1/admin/classes/{id}", auth.AdminFunc(s.handleDeleteClass))
 		}
 
 		if s.notifs != nil {
@@ -341,9 +367,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		if s.flags != nil {
 			mux.Handle("/api/v1/detections/", guarded)   // catches .../flag
+			mux.Handle("/api/v1/flags/manual", guarded)
 			mux.Handle("/api/v1/object-flags", guarded)
 			mux.Handle("/api/v1/object-flags/", guarded)
 			mux.Handle("/api/v1/object-thumbnail/", guarded)
+		}
+		if s.classes != nil {
+			mux.Handle("/api/v1/admin/classes", guarded)
+			mux.Handle("/api/v1/admin/classes/", guarded)
 		}
 		if s.notifs != nil {
 			mux.Handle("/api/v1/notifications/channels", guarded)
@@ -822,14 +853,64 @@ func (s *Server) handleWhepOffer(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	w.Header().Set("Content-Type", "application/sdp")
+	// Rewrite the Location header from the worker's "/whep/<sid>" form
+	// to the api-server's "/api/v1/cameras/<id>/whep/<sid>" form so the
+	// browser's DELETE goes back through this proxy (the worker is on
+	// the docker-internal network and unreachable directly from the UI).
+	if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, "/whep/") {
+		sid := strings.TrimPrefix(loc, "/whep/")
+		if sid != "" {
+			w.Header().Set("Location",
+				fmt.Sprintf("/api/v1/cameras/%s/whep/%s", id, sid))
+			w.Header().Set("Access-Control-Expose-Headers", "Location")
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 }
 
 func (s *Server) handleWhepOptions(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, DELETE")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleWhepDelete proxies a session-termination DELETE through to the
+// pipeline worker that owns the camera. Stops the leak that would
+// otherwise accumulate one webrtcbin per UI tab open across the worker's
+// lifetime.
+func (s *Server) handleWhepDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sid := r.PathValue("sid")
+	if sid == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+	entry, ok := s.whep.Lookup(id)
+	if !ok {
+		// Camera not streaming — session can't exist; treat as already
+		// gone. UI doesn't need to retry.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	url := fmt.Sprintf("http://pipeline:%d/whep/%s", entry.Port, sid)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Warn("whep delete proxy", "camera", id, "sid", sid, "err", err)
+		// Worker unreachable: still tell the UI it's gone, since there's
+		// nothing useful for them to do with a retry.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

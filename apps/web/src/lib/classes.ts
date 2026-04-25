@@ -1,29 +1,19 @@
-// COCO class label helpers shared by Settings and Cameras UIs. Labels are
-// fetched once from /coco.labels (static asset) and memoised.
+// Class label helpers shared by Settings and Cameras UIs. Labels are
+// fetched from /api/v1/admin/classes and memoised.
+//
+// Returns *enabled* slugs — disabled classes shouldn't appear in
+// muting / per-camera override pickers since they aren't in the
+// trained taxonomy any more.
 //
 // CATEGORY ordering groups classes so the Settings grid stays readable
 // instead of a flat 80-row wall. Labels that aren't in the map fall
 // through to "Other" — which keeps future model swaps working.
 
-let cache: string[] | null = null;
-let pending: Promise<string[]> | null = null;
+import { fetchDetectionClasses } from "./api";
 
 export async function loadCocoLabels(): Promise<string[]> {
-  if (cache) return cache;
-  if (pending) return pending;
-  pending = fetch("/coco.labels")
-    .then((r) => r.text())
-    .then((t) => {
-      cache = t
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      return cache;
-    })
-    .finally(() => {
-      pending = null;
-    });
-  return pending;
+  const cs = await fetchDetectionClasses();
+  return cs.filter((c) => c.enabled).map((c) => c.slug);
 }
 
 // Seven buckets chosen by operator-mental-model, not taxonomy. "Outdoor

@@ -554,6 +554,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ class_corrected: classCorrected }),
     }),
+  // Manual flag: the user drew a fresh bbox on a frozen tile (no
+  // underlying detection row). bbox values are normalised [0,1] in
+  // the tile coordinate system. The class slug must match an enabled
+  // row in detection_classes.
+  flagManual: (args: {
+    camera_id: string;
+    bbox: { x: number; y: number; w: number; h: number };
+    class: string;
+  }) =>
+    req<ObjectFlag>("/flags/manual", {
+      method: "POST",
+      body: JSON.stringify(args),
+    }),
   listObjectFlags: (params?: {
     camera_id?: string;
     class_original?: string;
@@ -574,11 +587,22 @@ export const api = {
   objectFlagStats: () => req<ObjectFlagStats>("/object-flags/stats"),
 };
 
+// yolo26_variant is now an open string: it accepts the 5 stock sizes
+// (yolo26n..yolo26x) plus any custom-trained model name like
+// "fnvr-v1" produced by tools/train-detector/ --target gpu. The UI
+// presents the stock list in a dropdown alongside any fnvr-vN
+// values it discovers.
 export type DetectorSettings = {
-  yolo26_variant: "yolo26n" | "yolo26s" | "yolo26m" | "yolo26l" | "yolo26x";
+  yolo26_variant: string;
   yolo26_precision: "fp16" | "int8";
   anpr_enabled?: boolean;
   face_id_enabled?: boolean;
+  // Hailo HEF version: "stock" loads the pre-compiled
+  // yolov11l.hef from Hailo Model Zoo; any other string loads
+  // /var/lib/fnvr/models/hailo/<name>.hef (fine-tuned via
+  // tools/compile-hef/). Broker resolves at startup with graceful
+  // fallback to stock if the file's missing.
+  hailo_model_version?: string;
 };
 
 // Current INT8 calibration state. image_count reflects the on-disk
@@ -781,24 +805,65 @@ export type ObjectFlagStats = {
   by_class: Record<string, number>;
 };
 
-// COCO-80 class list — same order + spellings as the YOLO26
-// detector emits, and the Go CocoClasses slice in
-// apps/api-server/internal/flags/dataset.go. Used by the relabel
-// dropdown and the Flags page's class filter. Keep in sync if the
-// detector ever swaps classes.
-export const COCO_CLASSES = [
-  "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-  "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-  "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-  "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-  "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-  "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-  "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-  "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-  "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-  "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-  "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-  "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-  "scissors", "teddy bear", "hair drier", "toothbrush",
-] as const;
-export type CocoClass = typeof COCO_CLASSES[number];
+// Detection class taxonomy — server-driven via /admin/classes, backed
+// by the detection_classes Postgres table. Fetched once and cached.
+// The user manages enabled/disabled + custom additions from the
+// Settings → Classes page.
+export type DetectionClass = {
+  id: number;
+  slug: string;
+  display_name: string;
+  yolo_id: number;
+  origin: "coco" | "custom";
+  enabled: boolean;
+  created_at: string;
+};
+
+let _classCache: Promise<DetectionClass[]> | null = null;
+
+// fetchDetectionClasses returns the full list (enabled + disabled).
+// Cached per page-load; call invalidateDetectionClasses() after a
+// mutation to force a refresh.
+export function fetchDetectionClasses(): Promise<DetectionClass[]> {
+  if (!_classCache) {
+    _classCache = req<DetectionClass[]>("/admin/classes");
+  }
+  return _classCache;
+}
+
+export function invalidateDetectionClasses() {
+  _classCache = null;
+}
+
+export function createDetectionClass(slug: string, displayName: string) {
+  invalidateDetectionClasses();
+  return req<DetectionClass>("/admin/classes", {
+    method: "POST",
+    body: JSON.stringify({ slug, display_name: displayName }),
+  });
+}
+
+export function patchDetectionClass(
+  id: number,
+  patch: { enabled?: boolean; display_name?: string },
+) {
+  invalidateDetectionClasses();
+  return req<DetectionClass>(`/admin/classes/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteDetectionClass(id: number) {
+  invalidateDetectionClasses();
+  return req<void>(`/admin/classes/${id}`, { method: "DELETE" });
+}
+
+// Legacy alias kept temporarily while callers migrate to the
+// server-driven list. Returns the slug strings of every enabled
+// class (synthesised from the cached fetch). Most callers should
+// switch to fetchDetectionClasses() and read .display_name for UI.
+export async function enabledClassSlugs(): Promise<string[]> {
+  const cs = await fetchDetectionClasses();
+  return cs.filter((c) => c.enabled).map((c) => c.slug);
+}

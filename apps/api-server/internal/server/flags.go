@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fnvr/fnvr/apps/api-server/internal/auth"
@@ -33,9 +35,8 @@ import (
 //
 //	{"class_corrected": "person" | null}
 //
-// Null class_corrected = "this is nothing". Non-null must be one of
-// the COCO class names — anything else 400s; new-class support is a
-// later slice.
+// Null class_corrected = "this is nothing". Non-null must match the
+// slug of an enabled row in detection_classes; anything else 400s.
 func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	if s.flags == nil {
 		http.Error(w, "flags not configured", http.StatusNotImplemented)
@@ -55,17 +56,17 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.ClassCorrected != nil {
-		// Non-null corrections must match a known YOLO class.
-		found := false
-		for _, c := range flags.CocoClasses {
-			if c == *body.ClassCorrected {
-				found = true
-				break
-			}
+		// Non-null corrections must match a known + enabled class. The
+		// list comes from the detection_classes table, not a hard-coded
+		// slice — users add their own classes there.
+		ok, err := s.classCorrectionAllowed(r.Context(), *body.ClassCorrected)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		if !found {
-			http.Error(w, "class_corrected must be one of the COCO 80 classes "+
-				"(new classes are not supported yet)", http.StatusBadRequest)
+		if !ok {
+			http.Error(w, "class_corrected must match an enabled detection class "+
+				"(see Settings → Classes)", http.StatusBadRequest)
 			return
 		}
 	}
@@ -147,13 +148,13 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	// the row atomic (the row exists without files only for a few
 	// milliseconds before paths are patched).
 	created, err := s.flags.Create(r.Context(), flags.CreateArgs{
-		DetectionID:    detID,
+		DetectionID:    &detID,
 		CameraID:       cameraID,
 		TS:             ts,
 		ClassOriginal:  className,
 		ClassCorrected: body.ClassCorrected,
 		BBox:           bbox,
-		PHash:          phash,
+		PHash:          &phash,
 		FramePath:      "", // filled after WriteArtifacts
 		LabelPath:      "",
 		CreatedBy:      sessionUserID(r),
@@ -163,8 +164,15 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	classLookup, err := s.classes.SlugToYoloID(r.Context())
+	if err != nil {
+		slog.Error("flag: load class lookup", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	framePath, labelPath, err := flags.WriteArtifacts(
-		s.cfg.DataDir, created.ID, jpegSrc, bbox, body.ClassCorrected)
+		s.cfg.DataDir, created.ID, jpegSrc, bbox, body.ClassCorrected,
+		flags.ClassLookup(classLookup))
 	if err != nil {
 		// Best-effort rollback: soft-dismiss the orphaned row so the
 		// suppression library doesn't pick it up with empty paths.
@@ -184,13 +192,147 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	created.FramePath = framePath
 	created.LabelPath = labelPath
 
-	if err := flags.RegenerateDatasetYAML(s.cfg.DataDir); err != nil {
+	entries, _ := s.enabledClassEntries(r.Context())
+	if err := flags.RegenerateDatasetYAML(s.cfg.DataDir, entries); err != nil {
 		slog.Warn("flag: regenerate dataset.yaml", "err", err)
 		// Non-fatal — the YAML can be regenerated later via any
 		// subsequent flag or dismissal.
 	}
 
 	writeJSON(w, http.StatusCreated, created)
+}
+
+// handleManualFlag accepts a hand-drawn bounding box and persists it
+// as a YOLO training label. Unlike handleFlagDetection, there's no
+// underlying `detections` row — the operator drew a box on a frozen
+// tile to teach the detector about something it currently misses.
+//
+// Body:
+//
+//	{
+//	  "camera_id": "house-side",
+//	  "bbox":      {"x": 0.21, "y": 0.40, "w": 0.14, "h": 0.22},
+//	  "class":     "parcel"
+//	}
+//
+// The bbox values are normalised [0,1] in the live tile's coordinate
+// system — same convention as detection rows. We capture the most
+// recent live-preview JPEG for the camera and write the YOLO label
+// for it, so the dataset row trains the model to detect the class at
+// roughly the spot the user drew.
+//
+// detection_id and phash on the resulting object_flags row are NULL,
+// which keeps it out of the live-suppression library (the engine
+// only loads phash-bearing rows). Class is required.
+func (s *Server) handleManualFlag(w http.ResponseWriter, r *http.Request) {
+	if s.flags == nil {
+		http.Error(w, "flags not configured", http.StatusNotImplemented)
+		return
+	}
+	var body struct {
+		CameraID string     `json:"camera_id"`
+		BBox     flags.BBox `json:"bbox"`
+		Class    string     `json:"class"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	body.Class = trimSpaceLower(body.Class)
+	if body.CameraID == "" || body.Class == "" {
+		http.Error(w, "camera_id and class are required", http.StatusBadRequest)
+		return
+	}
+	// Reject degenerate or out-of-frame boxes — these are almost
+	// always front-end bugs, not legitimate labels, and they'd train
+	// the model on garbage.
+	if body.BBox.W <= 0 || body.BBox.H <= 0 ||
+		body.BBox.X < 0 || body.BBox.Y < 0 ||
+		body.BBox.X+body.BBox.W > 1 || body.BBox.Y+body.BBox.H > 1 {
+		http.Error(w, "bbox must be normalised within [0,1] with positive width and height",
+			http.StatusBadRequest)
+		return
+	}
+	// Validate class against the enabled-class list — same check the
+	// detection-derived flag handler uses for class_corrected.
+	ok, err := s.classCorrectionAllowed(r.Context(), body.Class)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "class must match an enabled detection class "+
+			"(see Settings → Classes)", http.StatusBadRequest)
+		return
+	}
+
+	jpegSrc, err := latestLiveJPEG(s.cfg.DataDir, body.CameraID)
+	if err != nil {
+		slog.Warn("manual flag: latest live jpeg missing",
+			"camera", body.CameraID, "err", err)
+		http.Error(w, "no recent live frame for this camera",
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	classCorrected := body.Class
+	created, err := s.flags.Create(r.Context(), flags.CreateArgs{
+		DetectionID:    nil, // manual flag — no underlying detection
+		CameraID:       body.CameraID,
+		TS:             time.Now().UTC(),
+		ClassOriginal:  body.Class,
+		ClassCorrected: &classCorrected,
+		BBox:           body.BBox,
+		PHash:          nil, // manual flag — no phash to suppress against
+		FramePath:      "",
+		LabelPath:      "",
+		CreatedBy:      sessionUserID(r),
+	})
+	if err != nil {
+		slog.Error("manual flag: create failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	classLookup, err := s.classes.SlugToYoloID(r.Context())
+	if err != nil {
+		slog.Error("manual flag: load class lookup", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	framePath, labelPath, err := flags.WriteArtifacts(
+		s.cfg.DataDir, created.ID, jpegSrc, body.BBox, &classCorrected,
+		flags.ClassLookup(classLookup))
+	if err != nil {
+		_, _ = s.flags.Dismiss(r.Context(), created.ID)
+		slog.Error("manual flag: write artefacts",
+			"flag_id", created.ID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := s.pool.Exec(r.Context(),
+		`UPDATE object_flags SET frame_path=$1, label_path=$2 WHERE id=$3`,
+		framePath, labelPath, created.ID); err != nil {
+		slog.Error("manual flag: patch paths",
+			"flag_id", created.ID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	created.FramePath = framePath
+	created.LabelPath = labelPath
+
+	entries, _ := s.enabledClassEntries(r.Context())
+	if err := flags.RegenerateDatasetYAML(s.cfg.DataDir, entries); err != nil {
+		slog.Warn("manual flag: regenerate dataset.yaml", "err", err)
+	}
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// trimSpaceLower normalises a class slug from the wire body so casing
+// or stray whitespace doesn't cause a "match an enabled class" error.
+func trimSpaceLower(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 func (s *Server) handleListFlags(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +386,8 @@ func (s *Server) handleDismissFlag(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("flag: purge files", "err", err)
 		}
 	}
-	if err := flags.RegenerateDatasetYAML(s.cfg.DataDir); err != nil {
+	entries, _ := s.enabledClassEntries(r.Context())
+	if err := flags.RegenerateDatasetYAML(s.cfg.DataDir, entries); err != nil {
 		slog.Warn("flag: regenerate dataset.yaml after dismiss", "err", err)
 	}
 	writeJSON(w, http.StatusOK, dismissed)
@@ -394,4 +537,44 @@ func sessionUserID(r *http.Request) *string {
 		return &uid
 	}
 	return nil
+}
+
+// enabledClassEntries fetches the enabled rows of detection_classes
+// in yolo_id order and projects to the minimal shape RegenerateDatasetYAML
+// consumes. Returned slice is empty (not nil) on no rows.
+func (s *Server) enabledClassEntries(ctx context.Context) ([]flags.ClassEntry, error) {
+	if s.classes == nil {
+		return nil, nil
+	}
+	cs, err := s.classes.Enabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]flags.ClassEntry, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, flags.ClassEntry{Slug: c.Slug, YoloID: c.YoloID})
+	}
+	return out, nil
+}
+
+// classCorrectionAllowed returns true if `slug` matches an enabled
+// row in detection_classes. Used by the flag-create handler to refuse
+// relabels into disabled or unknown classes.
+func (s *Server) classCorrectionAllowed(ctx context.Context, slug string) (bool, error) {
+	if s.classes == nil {
+		// Defensive: if the classes store is unwired (shouldn't happen
+		// in production) fall back to allowing any non-empty string so
+		// flag creation isn't blocked.
+		return slug != "", nil
+	}
+	enabled, err := s.classes.Enabled(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range enabled {
+		if c.Slug == slug {
+			return true, nil
+		}
+	}
+	return false, nil
 }

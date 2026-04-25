@@ -11,7 +11,7 @@
 FROM ubuntu:22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake pkg-config git ca-certificates \
+    build-essential cmake pkg-config git ca-certificates wget \
   && rm -rf /var/lib/apt/lists/*
 
 # HailoRT userspace v4.23.0. Build from public source (no dev-zone login).
@@ -55,5 +55,11 @@ RUN mkdir -p /var/run/fnvr && chmod 0777 /var/run/fnvr
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
-ENTRYPOINT ["/usr/local/bin/fnvr-hailo-broker"]
-CMD ["/var/lib/fnvr/models/hailo/yolov11l.hef"]
+# Entrypoint script resolves the HEF path from
+# `detector.hailo_model_version` via api-server, then exec's the broker
+# binary. Lets the user flip between stock and fine-tuned models from
+# the Settings UI without rebuilding the image.
+COPY deploy/docker/hailo-broker-entrypoint.sh /usr/local/bin/hailo-broker-entrypoint.sh
+RUN chmod +x /usr/local/bin/hailo-broker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/hailo-broker-entrypoint.sh"]
