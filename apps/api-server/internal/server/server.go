@@ -1,12 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -33,7 +31,6 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
 	"github.com/fnvr/fnvr/apps/api-server/internal/system"
-	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
 )
 
 type Server struct {
@@ -46,7 +43,6 @@ type Server struct {
 	rules     *rules.Store
 	snaps     *snapshot.Service
 	segments  *segments.Store
-	whep      *whep.Registry
 	camStates    *camera.StateTracker
 	notifs       *notifications.Store
 	settings     *settings.Store
@@ -75,7 +71,6 @@ type Deps struct {
 	Rules         *rules.Store
 	Snapshots     *snapshot.Service
 	Segments      *segments.Store
-	Whep          *whep.Registry
 	CamStates     *camera.StateTracker
 	Notifications *notifications.Store
 	Settings      *settings.Store
@@ -101,7 +96,6 @@ func New(d Deps) *Server {
 		rules:     d.Rules,
 		snaps:     d.Snapshots,
 		segments:  d.Segments,
-		whep:      d.Whep,
 		camStates:    d.CamStates,
 		notifs:       d.Notifications,
 		settings:     d.Settings,
@@ -179,18 +173,6 @@ func (s *Server) Handler() http.Handler {
 		if s.snaps != nil {
 			protected.HandleFunc("GET /api/v1/cameras/{id}/snapshot.jpg", s.handleSnapshot)
 		}
-		if s.whep != nil {
-			// WHEP negotiation is a viewer action (it establishes a live
-			// playback session, not a mutation), so stays open to all
-			// authenticated users.
-			protected.HandleFunc("POST /api/v1/cameras/{id}/whep", s.handleWhepOffer)
-			protected.HandleFunc("OPTIONS /api/v1/cameras/{id}/whep", s.handleWhepOptions)
-			// DELETE /api/v1/cameras/{id}/whep/{sid} — WHEP-spec session
-			// termination. Without it the pipeline worker accumulates
-			// webrtcbin elements on every browser tab open/close cycle.
-			protected.HandleFunc("DELETE /api/v1/cameras/{id}/whep/{sid}", s.handleWhepDelete)
-		}
-
 		if s.rules != nil {
 			protected.HandleFunc("GET /api/v1/zones", s.handleListZones)
 			protected.Handle("POST /api/v1/zones", auth.AdminFunc(s.handleCreateZone))
@@ -810,107 +792,6 @@ func (s *Server) handleUpdateCameraStorage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// handleWhepOffer proxies a browser's SDP offer to the pipeline worker that
-// owns the camera. Returns the worker's SDP answer verbatim.
-func (s *Server) handleWhepOffer(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	entry, ok := s.whep.Lookup(id)
-	if !ok {
-		http.Error(w, "camera not streaming", http.StatusNotFound)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
-		return
-	}
-	if len(body) == 0 {
-		http.Error(w, "empty offer", http.StatusBadRequest)
-		return
-	}
-
-	// Worker binds on pipeline container network interface; docker DNS
-	// resolves "pipeline" to that container. Any port the worker bound
-	// is reachable internally regardless of compose `ports:` declaration.
-	url := fmt.Sprintf("http://pipeline:%d/whep", entry.Port)
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Content-Type", "application/sdp")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Warn("whep proxy", "camera", id, "err", err)
-		http.Error(w, "worker unreachable", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	w.Header().Set("Content-Type", "application/sdp")
-	// Rewrite the Location header from the worker's "/whep/<sid>" form
-	// to the api-server's "/api/v1/cameras/<id>/whep/<sid>" form so the
-	// browser's DELETE goes back through this proxy (the worker is on
-	// the docker-internal network and unreachable directly from the UI).
-	if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, "/whep/") {
-		sid := strings.TrimPrefix(loc, "/whep/")
-		if sid != "" {
-			w.Header().Set("Location",
-				fmt.Sprintf("/api/v1/cameras/%s/whep/%s", id, sid))
-			w.Header().Set("Access-Control-Expose-Headers", "Location")
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(respBody)
-}
-
-func (s *Server) handleWhepOptions(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// handleWhepDelete proxies a session-termination DELETE through to the
-// pipeline worker that owns the camera. Stops the leak that would
-// otherwise accumulate one webrtcbin per UI tab open across the worker's
-// lifetime.
-func (s *Server) handleWhepDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	sid := r.PathValue("sid")
-	if sid == "" {
-		http.Error(w, "missing session id", http.StatusBadRequest)
-		return
-	}
-	entry, ok := s.whep.Lookup(id)
-	if !ok {
-		// Camera not streaming — session can't exist; treat as already
-		// gone. UI doesn't need to retry.
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	url := fmt.Sprintf("http://pipeline:%d/whep/%s", entry.Port, sid)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Warn("whep delete proxy", "camera", id, "sid", sid, "err", err)
-		// Worker unreachable: still tell the UI it's gone, since there's
-		// nothing useful for them to do with a retry.
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	defer resp.Body.Close()
-	w.WriteHeader(resp.StatusCode)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

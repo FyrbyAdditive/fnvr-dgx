@@ -30,7 +30,6 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/server"
 	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 	"github.com/fnvr/fnvr/apps/api-server/internal/snapshot"
-	"github.com/fnvr/fnvr/apps/api-server/internal/whep"
 )
 
 func main() {
@@ -130,14 +129,6 @@ func runServe() error {
 		return fmt.Errorf("events start: %w", err)
 	}
 
-	whepReg, err := whep.NewRegistry(cfg.NATSURL)
-	if err != nil {
-		return fmt.Errorf("whep registry: %w", err)
-	}
-	if err := whepReg.Start(ctx); err != nil {
-		return fmt.Errorf("whep start: %w", err)
-	}
-
 	camStore := camera.NewStore(pool)
 	camStates, err := camera.NewStateTracker(cfg.NATSURL)
 	if err != nil {
@@ -190,7 +181,6 @@ func runServe() error {
 		Rules:         rules.NewStore(pool),
 		Snapshots:     snapshot.New(cfg.DataDir + "/recordings"),
 		Segments:      segStore,
-		Whep:          whepReg,
 		CamStates:     camStates,
 		Notifications: notifications.NewStore(pool),
 		Settings:      settings.NewStore(pool),

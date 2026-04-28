@@ -32,7 +32,6 @@ add_executable(pipeline-supervisor
   src/config.cpp
   src/db_reconciler.cpp
   src/rtsp_probe.cpp
-  src/whep_server.cpp
   src/hailo_inference.cpp
   src/hailo_probe.cpp
 )
