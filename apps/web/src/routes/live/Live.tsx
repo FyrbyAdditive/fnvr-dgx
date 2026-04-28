@@ -208,81 +208,75 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   const [retryTick, setRetryTick] = useState(0);
 
   useEffect(() => {
-    let pc: RTCPeerConnection | null = null;
+    // The vendored MediaMTX reader (public/mtx-reader.js) handles the
+    // WHEP offer/answer dance, codec negotiation (incl. non-advertised
+    // codecs like H.265 + AV1 the browser doesn't list by default),
+    // trickle ICE, and session teardown. Our previous in-house client
+    // skipped all of that — its offer only listed H.264 default codecs
+    // so MediaMTX couldn't deliver H.265 tracks, which silently kept
+    // ontrack from firing and the tile fell back to the 1-fps JPEG.
     let cancelled = false;
-    // Captured from the WHEP server's Location header. Sent as DELETE on
-    // unmount so the pipeline worker can drop its webrtcbin + queue +
-    // tee request pad. Without this, every browser tab open leaves a
-    // webrtcbin (and ~70 internal threads) lingering for the lifetime
-    // of the worker process.
-    let sessionUrl: string | null = null;
-
-    (async () => {
-      try {
-        pc = new RTCPeerConnection({
-          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-        });
-        pc.addTransceiver("video", { direction: "recvonly" });
-
-        pc.ontrack = (e) => {
-          if (!cancelled && videoRef.current && e.streams[0]) {
-            videoRef.current.srcObject = e.streams[0];
-            setRtcLive(true);
-          }
-        };
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        // Wait for ICE gathering to complete so the offer contains candidates.
-        await new Promise<void>((resolve) => {
-          if (pc!.iceGatheringState === "complete") return resolve();
-          const h = () => {
-            if (pc!.iceGatheringState === "complete") {
-              pc!.removeEventListener("icegatheringstatechange", h);
-              resolve();
-            }
-          };
-          pc!.addEventListener("icegatheringstatechange", h);
-          setTimeout(() => resolve(), 3000);
-        });
-
-        const res = await fetch(`/api/v1/cameras/${encodeURIComponent(id)}/whep`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/sdp" },
-          body: pc.localDescription!.sdp,
-        });
-        if (!res.ok) throw new Error(`whep ${res.status}`);
-        // The api-server rewrote Location to point back at this proxy
-        // (e.g. /api/v1/cameras/<id>/whep/<sid>); store it for cleanup.
-        sessionUrl = res.headers.get("Location");
-        const answer = await res.text();
+    const Reader = (window as unknown as {
+      MediaMTXWebRTCReader?: new (conf: {
+        url: string;
+        onError?: (e: string) => void;
+        onTrack?: (e: RTCTrackEvent) => void;
+      }) => { close: () => void };
+    }).MediaMTXWebRTCReader;
+    if (!Reader) {
+      // Script didn't load (network error, blocked, very old build) —
+      // tile stays on JPEG fallback.
+      setRtcLive(false);
+      return;
+    }
+    // MediaMTX speaks WHEP on :8889 with permissive CORS. Hitting it
+    // directly avoids the proxy_redirect-vs-port mess we'd otherwise
+    // have routing through nginx — MediaMTX's Location header is
+    // root-relative and resolves against the WHEP base URL, which
+    // works only if the base URL is MediaMTX's actual origin (any
+    // proxy prefix gets stripped during root-relative URL resolution).
+    // Host derived from the page origin so this works on any LAN
+    // deployment without a config flag.
+    const mtxOrigin = `${window.location.protocol}//${window.location.hostname}:8889`;
+    const url = `${mtxOrigin}/live_${encodeURIComponent(id)}/whep`;
+    // Captured stream attaches in a separate effect once <video>
+    // exists. We can't write to videoRef.current here because the
+    // <video> only renders when rtcLive is true — chicken-and-egg.
+    const reader = new Reader({
+      url,
+      onTrack: (e) => {
         if (cancelled) return;
-        await pc.setRemoteDescription({ type: "answer", sdp: answer });
-      } catch {
-        setRtcLive(false);
-      }
-    })();
-
+        // Safari sometimes emits empty `streams` for recvonly
+        // transceivers; build one from the track in that case.
+        const stream = e.streams[0] ?? new MediaStream([e.track]);
+        setStreamObj(stream);
+        setRtcLive(true);
+      },
+      onError: () => {
+        if (!cancelled) setRtcLive(false);
+      },
+    });
     return () => {
       cancelled = true;
-      if (pc) pc.close();
-      if (sessionUrl) {
-        // Best-effort DELETE — keepalive lets the request survive even
-        // when the page is being torn down (tab close, navigation away).
-        // We don't await; nothing depends on the response.
-        try {
-          fetch(sessionUrl, {
-            method: "DELETE",
-            credentials: "include",
-            keepalive: true,
-          }).catch(() => {});
-        } catch {
-          // ignore — leak is bounded by the server-side sweeper anyway
-        }
+      try {
+        reader.close();
+      } catch {
+        // ignore
       }
     };
   }, [id, retryTick]);
+
+  // Hold the MediaStream out-of-band so it survives the rtcLive=false
+  // → rtcLive=true render and lands on the <video> element via the
+  // attach-effect below. Setting srcObject during onTrack didn't work
+  // because videoRef is null on the first render (rtcLive is still
+  // false — the <video> isn't mounted until the state flip).
+  const [streamObj, setStreamObj] = useState<MediaStream | null>(null);
+  useEffect(() => {
+    if (rtcLive && streamObj && videoRef.current) {
+      videoRef.current.srcObject = streamObj;
+    }
+  }, [rtcLive, streamObj]);
 
   // Snapshot fallback refresh.
   const [t, setT] = useState(() => Date.now());

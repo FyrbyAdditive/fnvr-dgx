@@ -266,9 +266,30 @@ services:
       MTX_AUTHINTERNALUSERS_1_USER: "any"
       MTX_AUTHINTERNALUSERS_1_IPS: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.1"
       MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_ACTION: "api"
+      # MediaMTX accepts publishes on any path by default (the auto
+      # `all_others` catch-all has source=publisher out of the box).
+      # No per-path env vars needed beyond the explicit `test` and
+      # `usb0` entries above.
+      #
+      # Tell MediaMTX's WebRTC server to advertise this LAN IP as a
+      # host candidate alongside its own container-bridge IP. Browsers
+      # on the same LAN reach this; without it ICE only sees 172.18.x.x
+      # which is unreachable from the user's Mac at 172.16.x.x.
+      MTX_WEBRTCADDITIONALHOSTS: "172.16.4.23"
+      # Single-port UDP for ICE so we can publish exactly one UDP port
+      # through docker. Without this MediaMTX uses ephemeral UDP ports
+      # and we'd need to expose a wide range or use host networking.
+      # 8189 chosen to avoid collisions.
+      MTX_WEBRTCLOCALUDPADDRESS: ":8189"
     ports:
       - "8554:8554" # rtsp
-      - "8889:8889" # webrtc (optional)
+      - "8889:8889" # webrtc (whep on /<path>/whep)
+      # WebRTC media uses ICE/UDP. Mediamtx default ICE port range is
+      # the OS-ephemeral; pin a known range here so it can be exposed
+      # cleanly. Browsers connect from the LAN, so this bridge needs to
+      # forward ICE UDP from the host to the container. Range chosen
+      # to fit a few hundred concurrent sessions without colliding.
+      - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
 
   # USB→RTSP bridge. When /dev/video0 exists on the host, reads MJPEG and
   # publishes H.264 to rtsp://mediamtx:8554/fnvr-usb0. Camera entries in the

@@ -7,6 +7,12 @@
   </head>
   <body class="bg-neutral-950 text-neutral-100">
     <div id="root"></div>
+    <!--
+      MediaMTX WHEP reader (vendored). Live tiles use it to negotiate
+      WebRTC with the local MediaMTX. Loaded as a non-module so it
+      attaches to window before the React bundle runs.
+    -->
+    <script src="/mtx-reader.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

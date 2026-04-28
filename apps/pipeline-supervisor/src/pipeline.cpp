@@ -1138,30 +1138,32 @@ p << "rtspsrc location=" << url
     // directly via NvBufSurfTransform on the inference buffer.)
 
     // --- WebRTC live-view branch ---
-    // A dedicated RTP payloader fed from the H.264 elementary stream;
-    // a tee downstream lets multiple per-viewer webrtcbins (added at
-    // WHEP-negotiation time) tap the same RTP packets. Without the
-    // fakesink here the payloader pad has no peer on startup and the
-    // pipeline won't preroll.
+    // Publish the source bitstream to MediaMTX over RTSP at
+    // rtsp://mediamtx:8554/live_<camera_id>. Browsers fetch live
+    // video via MediaMTX's built-in WHEP server (port 8889 on the
+    // host LAN IP) — that path handles ICE/STUN/NAT-1to1 properly.
+    //
+    // Earlier shape used an in-process webrtcbin per viewer fed from
+    // an rtph264pay/rtp_tee branch; that never worked end-to-end from
+    // a LAN browser because GStreamer's webrtcbin doesn't expose a
+    // nat-1to1-ip override and only ever advertised host candidates
+    // on the docker bridge (172.18.x.x), unreachable from the LAN.
+    // MediaMTX has webrtcAdditionalHosts and a single-port UDP mux
+    // for ICE; both are wired in deploy/docker/docker-compose.yml.
+    //
+    // rtspclientsink takes parsed elementary-stream input and lets
+    // its built-in payloader handle RTP framing. protocols=tcp keeps
+    // the publish on the same TCP path the rest of the docker network
+    // uses; UDP would need extra port-forwarding inside the bridge.
     p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
-    // RTP payloader matched to pipeline_codec. WHEP server's
-    // queue→webrtcbin link uses the same codec to advertise the
-    // right encoding-name in the SDP we hand back to the browser.
-    // Payload type 96 = H.264 dynamic-payload convention; 97 keeps
-    // H.265 in the same dynamic range with no overlap.
     if (pipeline_codec_ == "h265") {
-        p << "h265parse config-interval=-1 ! "
-             "rtph265pay name=pay pt=97 config-interval=-1 "
-             "  aggregate-mode=zero-latency ! "
-             "application/x-rtp,media=video,encoding-name=H265,payload=97 ! ";
+        p << "h265parse config-interval=-1 ! ";
     } else {
-        p << "h264parse config-interval=-1 ! "
-             "rtph264pay name=pay pt=96 config-interval=-1 "
-             "  aggregate-mode=zero-latency ! "
-             "application/x-rtp,media=video,encoding-name=H264,payload=96 ! ";
+        p << "h264parse config-interval=-1 ! ";
     }
-    p << "tee name=rtp_tee allow-not-linked=true ! "
-         "fakesink sync=false async=false";
+    p << "rtspclientsink name=mtxpush "
+         "  location=rtsp://mediamtx:8554/live_" << cam_.id
+      << " protocols=tcp";
 
     std::string desc = p.str();
     std::cerr << "pipeline[" << cam_.id << "]: " << desc << "\n";
