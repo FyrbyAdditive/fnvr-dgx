@@ -345,6 +345,33 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
     return () => { cancelled = true; };
   }, [rtcLive]);
 
+  // Frame-stall watchdog. WebRTC sessions sometimes go quiet — a
+  // brief network blip causes MediaMTX to log "reader is too slow,
+  // discarding frames", the H.264/H.265 decoder loses I-frame
+  // reference, and the <video> freezes on the last good frame.
+  // Detection events keep flowing (different transport) so the user
+  // sees the bbox overlay continue while video is stuck. The
+  // existing retryTick effect only fires when `rtcLive=false`, so
+  // the frozen-but-connected state was self-perpetuating until a
+  // manual page refresh. Bump retryTick when we haven't received a
+  // frame in 4 s — the WHEP effect tears the session down and
+  // re-negotiates, which forces MediaMTX to send a fresh keyframe
+  // from the camera's current GOP.
+  useEffect(() => {
+    if (!rtcLive) return;
+    const h = setInterval(() => {
+      const arr = previewTicksRef.current;
+      const last = arr.length > 0 ? arr[arr.length - 1] : 0;
+      if (Date.now() - last > 4000) {
+        // No frames in 4 s — re-negotiate.
+        setRtcLive(false);
+        setStreamObj(null);
+        setRetryTick((v) => v + 1);
+      }
+    }, 2000);
+    return () => clearInterval(h);
+  }, [rtcLive]);
+
   const latest = detections[0];
 
   // Source aspect ratio — starts at 16:9 and refines once the media loads

@@ -281,6 +281,32 @@ services:
       # and we'd need to expose a wide range or use host networking.
       # 8189 chosen to avoid collisions.
       MTX_WEBRTCLOCALUDPADDRESS: ":8189"
+      # Recording. MediaMTX writes one fragmented MP4 per
+      # recordSegmentDuration window per path. fMP4 (moof+mdat) seeks
+      # mid-write — unlike progressive MP4 from qtmux, which requires
+      # a final moov for the full duration to be addressable. The
+      # timeline player can therefore play current-hour clips without
+      # the "stuck on first frame" bug.
+      #
+      # Path layout: /var/lib/fnvr/recordings/<camera>/<YYYY-MM-DD>/<HH-MM-SS>-<frac>.mp4
+      # — kept simple. storage-manager walks this and rolls fragments
+      # into per-hour segment rows in postgres.
+      MTX_RECORD: "yes"
+      MTX_RECORDPATH: "/var/lib/fnvr/recordings/%path/%Y-%m-%d_%H-%M-%S-%f"
+      MTX_RECORDFORMAT: "fmp4"
+      MTX_RECORDSEGMENTDURATION: "1h"
+      MTX_RECORDPARTDURATION: "1s"
+      MTX_RECORDDELETEAFTER: "14d"
+      # Playback HTTP server — serves stitched fMP4/MP4 clips for any
+      # path + start + duration window. Used by the timeline view to
+      # play back recordings (replaces the per-segment-MP4 endpoint
+      # in api-server which couldn't handle progressive MP4 mid-write).
+      MTX_PLAYBACK: "yes"
+      MTX_PLAYBACKADDRESS: ":9996"
+    volumes:
+      # MediaMTX writes recordings here; storage-manager + api-server
+      # read from the same path via the same volume.
+      - fnvr-data:/var/lib/fnvr
     ports:
       - "8554:8554" # rtsp
       - "8889:8889" # webrtc (whep on /<path>/whep)
@@ -290,6 +316,7 @@ services:
       # forward ICE UDP from the host to the container. Range chosen
       # to fit a few hundred concurrent sessions without colliding.
       - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
+      - "9996:9996" # playback API (timeline /get clips)
 
   # USB→RTSP bridge. When /dev/video0 exists on the host, reads MJPEG and
   # publishes H.264 to rtsp://mediamtx:8554/fnvr-usb0. Camera entries in the

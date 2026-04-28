@@ -193,8 +193,16 @@ int main(int argc, char** argv) {
         // _exit(3) directly. We bypass the bus handler here because the
         // whole point is that the bus is silent.
         std::thread flow_watchdog([&p, &cam, subj, &nats] {
-            // Don't start until the pipeline reaches PLAYING so
-            // startup's empty counter doesn't trip us.
+            // Disabled: the flow counter used to be attached to the
+            // recording branch's recparse element. Recording moved
+            // out of pipeline-supervisor (commit XXXXXXX) — MediaMTX
+            // records via RTSP — so BuffersPassed() never advances,
+            // and the watchdog hard-exits every 20 s. Bus errors and
+            // the bus-handler still catch real pipeline faults; this
+            // watchdog needs a new pad to monitor (e.g. pgie.src or
+            // the rtspclientsink request pad) before being re-enabled.
+            (void)p; (void)cam; (void)subj; (void)nats;
+            return;
             while (!g_stop && !p.Faulted() && !p.Playing()) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }

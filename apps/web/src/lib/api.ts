@@ -335,6 +335,32 @@ export const api = {
   // browser saves the file rather than streaming it inline. Filename
   // is built server-side from camera + start time + codec.
   segmentDownloadUrl: (id: number) => `${base}/segments/${id}/file?download=1`,
+  // MediaMTX `/get` playback URL. MediaMTX's recorder writes
+  // fragmented MP4 (moof+mdat) to disk per camera path; the
+  // playback HTTP server (port 9996, exposed on the host) stitches
+  // an arbitrary [start, start+duration) window into a single fMP4
+  // (or progressive MP4 if format=mp4) and streams it to the
+  // browser. fMP4 seeks correctly even mid-write — the qtmux
+  // progressive-MP4 we used to write didn't, which broke
+  // click-through to the current hour.
+  //
+  // Path naming follows pipeline.cpp's rtspclientsink target —
+  // `live_<camera_id>` per camera.
+  playbackUrl: (
+    cameraId: string,
+    start: Date,
+    durationSec: number,
+    opts: { download?: boolean } = {},
+  ) => {
+    const origin = `${window.location.protocol}//${window.location.hostname}:9996`;
+    const p = new URLSearchParams({
+      path: `live_${cameraId}`,
+      start: start.toISOString(),
+      duration: String(durationSec),
+      format: opts.download ? "mp4" : "fmp4",
+    });
+    return `${origin}/get?${p}`;
+  },
 
   listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number; kind?: string; plate?: string } = {}) => {
     const p = new URLSearchParams();

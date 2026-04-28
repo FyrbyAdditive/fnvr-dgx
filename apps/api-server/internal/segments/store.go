@@ -66,8 +66,14 @@ func (s *Store) List(ctx context.Context, q ListQuery) ([]Segment, error) {
 	if q.CameraID != "" {
 		sql += " AND camera_id = " + addArg(q.CameraID)
 	}
+	// Overlap-style filter so a segment that started before the
+	// window but ends inside it (e.g. spans midnight) appears on
+	// both days' rulers. The previous `started_at >= from AND
+	// started_at < to` excluded such segments and the timeline showed
+	// "Click the timeline to play" with no ruler bars to click for
+	// incidents in the first few minutes after midnight.
 	if !q.From.IsZero() {
-		sql += " AND started_at >= " + addArg(q.From)
+		sql += " AND COALESCE(ended_at, NOW()) > " + addArg(q.From)
 	}
 	if !q.To.IsZero() {
 		sql += " AND started_at < " + addArg(q.To)

@@ -990,121 +990,49 @@ p << "rtspsrc location=" << url
             "nvinfer name=pgie config-file-path=") + infer_config_ + " ! ";
     }
 
+    // Recording is now MediaMTX's job — it subscribes to the same
+    // RTSP stream the WHEP/WebRTC live tile uses, writes fragmented
+    // MP4 (moof+mdat), serves both live and playback HTTP clips out
+    // of the same files. Pipeline-supervisor used to record here via
+    // qtmux+filesink, which produced progressive MP4 with a giant
+    // pre-allocated moov rewritten every second. Browsers opening
+    // an in-progress file saw whatever moov was last flushed and
+    // failed to seek past it — most visibly with HEVC, where the
+    // mvhd-driven seek table is stricter than H.264.
+    //
+    // The graph below stays for the inference probes (pgie + tracker
+    // + ANPR/face SGIEs publish detections to NATS via a pad probe
+    // installed in Start()). It terminates at fakesink because none
+    // of the post-tracker frames need to reach disk anymore.
     if (skip_inference_) {
-        // No-AI tier: the stream into the tee is already parsed
-        // (either source-passthrough or post-rotation transcode
-        // above). Route it straight into qtmux — no decode/re-
-        // encode here. The post-tee parser converts byte-stream →
-        // length-prefixed for qtmux. Caps target stream-format
-        // matches the codec: H.264 uses 'avc', H.265 uses 'hvc1'.
-        if (pipeline_codec_ == "h265") {
-            p << "h265parse name=recparse config-interval=-1 ! "
-                 "video/x-h265,stream-format=hvc1,alignment=au ! ";
-        } else {
-            p << "h264parse name=recparse config-interval=-1 ! "
-                 "video/x-h264,stream-format=avc,alignment=au ! ";
-        }
-        p << "queue max-size-buffers=300 max-size-time=2000000000 "
-             "  max-size-bytes=0 ! "
-             "qtmux reserved-max-duration=4500000000000 "
-             "      reserved-moov-update-period=1000000000 ! "
-             "filesink location=" << dir.string() << "/rec.mp4 "
-             "         append=false ";
-    } else if (use_deepstream_ && is_v4l2) {
+        // No-AI tier: nothing to do — the WHEP/recording branches
+        // are off the source tee `t.` independently. Just sink this
+        // arm of the tee to keep the pipeline preroll happy.
+        p << "fakesink sync=false ";
+    } else if (use_deepstream_) {
+        // Common to is_v4l2 + RTSP — they used to differ on whether
+        // the inference branch fed an encoder; with recording gone
+        // both terminate at fakesink. nvv4l2decoder is required even
+        // for non-v4l2 sources because the inference branch consumes
+        // decoded NVMM frames; nvstreammux + nvinfer + nvtracker
+        // operate on those.
         p << "nvv4l2decoder ! "
              "mux.sink_0 nvstreammux name=mux batch-size=1 "
              "  width=" << mux_w << " height=" << mux_h
              << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
           << pgie_element
-          << // NvDCF tracker gives us stable per-object track_ids.
-             // Required for tripwire line-crossing evaluation (which
-             // needs to see an object on both sides of the line across
-             // consecutive frames) and for future cross-camera ReID.
-             "nvtracker name=tracker "
+          << "nvtracker name=tracker "
              "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
              "  tracker-width=960 tracker-height=544 ! "
           << anpr_chain
           << face_chain
           << "fakesink sync=false ";
-    } else if (use_deepstream_) {
-        // DeepStream detection needs decoded frames; re-decode from the
-        // elementary stream so it works from both source types. Memory
-        // stays NVMM from nvv4l2decoder onward.
-        p << "nvv4l2decoder ! "
-             "mux.sink_0 nvstreammux name=mux batch-size=1 "
-             "  width=" << mux_w << " height=" << mux_h
-             << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
-          << pgie_element
-          << // NvDCF tracker gives us stable per-object track_ids.
-             // Required for tripwire line-crossing evaluation (which
-             // needs to see an object on both sides of the line across
-             // consecutive frames) and for future cross-camera ReID.
-             "nvtracker name=tracker "
-             "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
-             "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
-             "  tracker-width=960 tracker-height=544 ! "
-          << anpr_chain
-          << face_chain
-          << "nvvideoconvert ! "
-          // Pin framerate before the encoder. Without this nvstreammux
-          // strips the framerate field from the negotiated caps (its
-          // live-source=1 batch path computes per-batch PTS but doesn't
-          // assert a downstream framerate), the encoder ships caps
-          // with no framerate, and qtmux falls back to writing
-          // r_frame_rate=10000/1 in the MP4 mvhd. Players that key
-          // playback speed off r_frame_rate (browsers in MSE mode,
-          // default ffplay, several phone gallery apps) then play the
-          // file at 10000 fps so a 1-hour clip "completes" in ~7s and
-          // the visible image appears stuck on a single frame.
-          //
-          // videorate adapts to whatever framerate upstream provides
-          // (or doesn't) and emits at the asserted 20/1 — drops/dupes
-          // as needed. Verified in a standalone gst rig that
-          // (a) frame-duration on nvstreammux doesn't fix it,
-          // (b) a bare capsfilter without videorate doesn't fix it,
-          // (c) videorate + capsfilter does. All currently-configured
-          // cameras run at 20 fps at the source; if a future camera
-          // runs at a different rate this should become a per-camera
-          // value derived from probe.r_frame_rate (rtsp_probe.cpp
-          // doesn't capture framerate today; tracked as a follow-up).
-             "videorate ! video/x-raw(memory:NVMM),framerate=20/1 ! ";
-        // Recording-branch re-encode: match pipeline_codec. H.264
-        // sources record as H.264, HEVC sources record as H.265 —
-        // halves disk usage on HEVC streams. Tradeoff: H.265-in-MP4
-        // doesn't play back in Firefox or non-Apple-Silicon Chrome
-        // (timeline player breaks for those browsers on HEVC
-        // recordings). Acceptable per user decision 2026-04-28.
-        if (pipeline_codec_ == "h265") {
-            p << "nvv4l2h265enc bitrate=3000000 insert-sps-pps=1 "
-                 "  idrinterval=30 iframeinterval=30 ! "
-                 "h265parse name=recparse config-interval=-1 ! "
-                 "video/x-h265,stream-format=hvc1,alignment=au ! ";
-        } else {
-            p << "nvv4l2h264enc bitrate=6000000 insert-sps-pps=1 "
-                 "  idrinterval=30 iframeinterval=30 ! "
-                 "h264parse name=recparse config-interval=-1 ! "
-                 "video/x-h264,stream-format=avc,alignment=au ! ";
-        }
-        p << // Write plain (non-fragmented) MP4 with moov reserved up-front
-             // and refreshed every second. This produces a browser-playable
-             // file that's valid mid-write, unlike:
-             //   - mp4mux fragmented: no sidx, Firefox refused to play
-             //   - qtmux faststart=true: needs EOS to finalise; if the
-             //     worker is SIGKILLed, the .mp4 never appears (all data
-             //     lives in the .faststart temp file).
-             // 4500s headroom covers the hourly rotation with margin.
-             "queue max-size-buffers=300 max-size-time=2000000000 "
-             "  max-size-bytes=0 ! "
-             "qtmux reserved-max-duration=4500000000000 "
-             "      reserved-moov-update-period=1000000000 ! "
-             "filesink location=" << dir.string() << "/rec.mp4 "
-             "         append=false ";
     } else {
-        p << "splitmuxsink "
-             "  location=" << dir.string() << "/seg-%05d.mp4 "
-             "  max-size-time=60000000000 muxer=mp4mux "
-             "  send-keyframe-requests=true ";
+        // No DeepStream tier — pipeline only exists to get RTSP into
+        // MediaMTX via the WHEP branch elsewhere; this arm just
+        // sinks the tee.
+        p << "fakesink sync=false ";
     }
 
     // --- Live-thumbnail branch ---
@@ -1284,18 +1212,11 @@ p << "rtspsrc location=" << url
     }
 #endif
 
-    // Keyframe gate on the H.265 record-parse element.
-    if (use_deepstream_) {
-        AttachKeyframeGate(pipeline, "recparse");
-    }
-
-    // Data-flow counter on the record-parse src pad. Bumped for every
-    // encoded frame that reaches the recording mux. main.cpp's
-    // flow_watchdog samples BuffersPassed() every 5 s and hard-exits
-    // the worker if it doesn't advance for 20 s while Playing() is
-    // true. Catches silent stalls (NvMedia wedge, thread deadlock)
-    // that don't fire a bus ERROR.
-    AttachFlowCounter(pipeline, "recparse", &buffersPassed_);
+    // Recording is now MediaMTX's job. The keyframe-gate + flow
+    // watchdog used to sit on `recparse` (the post-encoder parser
+    // before qtmux) — both are gone now. If we ever need flow
+    // monitoring back, attach the counter to a still-flowing pad
+    // (e.g. tracker.src or the WHEP rtspclientsink request pad).
 
     return pipeline;
 }

@@ -233,11 +233,16 @@ func (m *Manager) applyDiskPressure(ctx context.Context) error {
 }
 
 // indexNewSegments walks recordings dir and upserts any segment not in the DB.
-// Directory layout (set by the pipeline):
+// Directory layout (MediaMTX recordPath
+// `/var/lib/fnvr/recordings/%path/%Y-%m-%d_%H-%M-%S-%f`):
 //
-//	<root>/YYYY/MM/DD/HH/<camera-id>/seg-NNNNN.mp4   (old splitmuxsink layout)
-//	<root>/YYYY/MM/DD/HH/<camera-id>/rec.mp4          (current mp4mux+filesink)
-//	<root>/YYYY/MM/DD/HH/<camera-id>/rec-NNNNN.mp4    (future hourly rotation)
+//	<root>/live_<camera-id>/YYYY-MM-DD_HH-MM-SS-ffffff.mp4
+//
+// The `live_` prefix is set by pipeline.cpp's rtspclientsink target
+// path (rtsp://mediamtx:8554/live_<cam>); strip it to recover the
+// camera id. The filename's timestamp is the segment's started_at —
+// far more accurate than mtime because mtime advances as MediaMTX
+// flushes fragments mid-segment.
 func (m *Manager) indexNewSegments(ctx context.Context) error {
 	root := m.cfg.RecordingsDir
 	info, err := os.Stat(root)
@@ -251,27 +256,52 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 		return fmt.Errorf("%s is not a directory", root)
 	}
 
-	segRe := regexp.MustCompile(`^(seg-\d+|rec(-\d+)?)\.mp4$`)
+	// MediaMTX filename pattern: 2026-04-28_15-19-14-694879.mp4.
+	// %f produces 6-digit microseconds.
+	mtxRe := regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})-(\d{6})\.mp4$`)
 
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if d.IsDir() || !segRe.MatchString(d.Name()) {
+		if d.IsDir() {
 			return nil
 		}
-		// camera id is the segment's parent dir name.
-		cameraID := filepath.Base(filepath.Dir(path))
+		match := mtxRe.FindStringSubmatch(d.Name())
+		if match == nil {
+			return nil
+		}
+		// Parent dir name is `live_<camera_id>` per pipeline.cpp's
+		// rtspclientsink target. Strip the prefix; if it doesn't
+		// match this layout (e.g. MediaMTX's `test` path), drop the
+		// file from indexing — those aren't real cameras.
+		parent := filepath.Base(filepath.Dir(path))
+		const livePrefix = "live_"
+		if !strings.HasPrefix(parent, livePrefix) {
+			return nil
+		}
+		cameraID := parent[len(livePrefix):]
+		// Started_at from the filename is reliable (MediaMTX names
+		// the file at fragment-open). Use UTC since MediaMTX
+		// formats with the container's clock which we keep on UTC.
+		startedAt, perr := time.Parse(
+			"2006-01-02_15-04-05",
+			match[1]+"_"+match[2]+"-"+match[3]+"-"+match[4],
+		)
+		if perr != nil {
+			return nil
+		}
 		st, err := os.Stat(path)
 		if err != nil {
 			return nil
 		}
-		// Upsert on the unique `path`. A file is tracked once and its
-		// bytes / ended_at / duration_ms refresh as the file grows —
-		// the pipeline is still appending (mp4 + qtmux + filesink
-		// writes the moov back every ~1s so mtime tracks reality).
-		// `started_at` is locked in on first insert; only end-side
-		// fields move forward on subsequent scans.
+		// ended_at = mtime; updated each scan as MediaMTX appends.
+		// Codec is unknown without ffprobe; the pipeline's rtspclientsink
+		// passthrough preserves source codec, but we don't record that
+		// here — the timeline player doesn't need codec to call
+		// MediaMTX /get. Stamp 'h264' as a default so downstream code
+		// expecting a non-empty codec value doesn't break; the actual
+		// stream codec is whatever's on disk.
 		mtime := st.ModTime()
 		_, err = m.pool.Exec(ctx, `
 			INSERT INTO segments (camera_id, path, started_at, ended_at,
@@ -280,11 +310,10 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 			        GREATEST(0, EXTRACT(EPOCH FROM ($4::timestamptz - $3::timestamptz))*1000)::int)
 			ON CONFLICT (path) DO UPDATE
 			  SET bytes       = EXCLUDED.bytes,
-			      codec       = EXCLUDED.codec,
 			      ended_at    = EXCLUDED.ended_at,
 			      duration_ms = GREATEST(0, EXTRACT(EPOCH FROM
 			                    (EXCLUDED.ended_at - segments.started_at))*1000)::int`,
-			cameraID, path, mtime, mtime, st.Size())
+			cameraID, path, startedAt, mtime, st.Size())
 		if err != nil && !strings.Contains(err.Error(), "foreign key") {
 			slog.Debug("segment insert", "err", err, "path", path)
 		}
