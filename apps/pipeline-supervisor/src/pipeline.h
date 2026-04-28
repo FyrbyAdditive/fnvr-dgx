@@ -71,6 +71,12 @@ private:
     // inference encoder key off these so aspect is preserved end-to-end.
     int rec_width_ = 0;
     int rec_height_ = 0;
+    // Codec carried on the gst tee — "h264" or "h265". Set during
+    // BuildPipelineString based on probed source codec + transcode
+    // decision; consumed when the WHEP server is constructed in
+    // Start() so it can advertise the matching encoding-name in
+    // the SDP it returns to browsers.
+    std::string pipeline_codec_ = "h264";
 
 public:
     bool Faulted() const { return faulted_.load(); }

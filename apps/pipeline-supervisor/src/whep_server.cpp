@@ -176,8 +176,10 @@ GstPadProbeReturn TeardownPadIdleCb(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, 
 
 }  // namespace
 
-WhepServer::WhepServer(std::string camera_id, GstElement* pipeline, GstElement* rtp_tee)
-    : camera_id_(std::move(camera_id)), pipeline_(pipeline), rtp_tee_(rtp_tee) {}
+WhepServer::WhepServer(std::string camera_id, GstElement* pipeline, GstElement* rtp_tee,
+                       std::string codec)
+    : camera_id_(std::move(camera_id)), pipeline_(pipeline), rtp_tee_(rtp_tee),
+      codec_(std::move(codec)) {}
 
 WhepServer::~WhepServer() { Stop(); }
 
@@ -307,9 +309,17 @@ bool WhepServer::handleOffer(const std::string& offer_sdp,
     }
     gst_object_unref(q_sink);
 
-    GstCaps* caps = gst_caps_from_string(
-        "application/x-rtp,media=video,encoding-name=H264,payload=96,"
-        "clock-rate=90000,packetization-mode=(string)1");
+    // RTP caps for the queue → webrtcbin link. Determines the SDP
+    // the browser sees. H.265 doesn't take packetization-mode (that's
+    // H.264-specific); use payload type 97 to match how rtph265pay
+    // is wired upstream in pipeline.cpp.
+    GstCaps* caps = (codec_ == "h265")
+        ? gst_caps_from_string(
+              "application/x-rtp,media=video,encoding-name=H265,payload=97,"
+              "clock-rate=90000")
+        : gst_caps_from_string(
+              "application/x-rtp,media=video,encoding-name=H264,payload=96,"
+              "clock-rate=90000,packetization-mode=(string)1");
     if (!gst_element_link_filtered(queue, webrtc, caps)) {
         std::cerr << "whep: queue→webrtcbin link failed\n";
         gst_caps_unref(caps);

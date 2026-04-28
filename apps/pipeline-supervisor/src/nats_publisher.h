@@ -45,6 +45,9 @@ private:
     // Rate-limit noisy CLOSED-state log spam when the broker is actually
     // down for an extended window.
     std::chrono::steady_clock::time_point last_closed_log_{};
+    // Same idea for publish-failure logs (every Publish call would log
+    // otherwise; we want one line per second when something is wrong).
+    std::chrono::steady_clock::time_point last_pub_fail_log_{};
 };
 
 }  // namespace fnvr

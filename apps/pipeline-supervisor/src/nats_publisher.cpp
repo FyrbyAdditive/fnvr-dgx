@@ -65,7 +65,15 @@ bool NatsPublisher::Publish(std::string_view subject, std::string_view payload, 
     std::string subj(subject);
     natsStatus s = natsConnection_Publish(conn_, subj.c_str(), payload.data(),
                                           static_cast<int>(payload.size()));
-    if (s != NATS_OK) return false;
+    if (s != NATS_OK) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_pub_fail_log_ > std::chrono::seconds(1)) {
+            std::cerr << "nats: publish to " << subj << " failed: "
+                      << natsStatus_GetText(s) << "\n";
+            last_pub_fail_log_ = now;
+        }
+        return false;
+    }
     if (flush) {
         // Short-lived callers (e.g. pipeline-supervisor --publish) would
         // Drain + Destroy before the async send reaches the broker

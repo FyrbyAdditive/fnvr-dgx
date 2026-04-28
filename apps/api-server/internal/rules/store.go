@@ -47,6 +47,18 @@ type Incident struct {
 	Severity     string     `json:"severity"`
 	Summary      string     `json:"summary"`
 	Acknowledged bool       `json:"acknowledged"`
+	// Merged-incident fields (added by migration 0031). Populated by
+	// the event-processor's fireIncident path: every detection that
+	// folds into an existing incident in the merge window appends to
+	// Classes / RuleIDs (set semantics, no duplicates), bumps
+	// LastDetectionAt + DetectionCount, and updates Severity to the
+	// max contributing rule. UI renders ClassesJoined ("person + car")
+	// and the duration (StartedAt → LastDetectionAt) plus DetectionCount
+	// as the two-line summary.
+	Classes          []string  `json:"classes"`
+	RuleIDs          []string  `json:"rule_ids"`
+	LastDetectionAt  time.Time `json:"last_detection_at"`
+	DetectionCount   int       `json:"detection_count"`
 }
 
 type Store struct{ pool *pgxpool.Pool }
@@ -214,7 +226,8 @@ func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, rule_id::text, camera_id, started_at, ended_at,
-		       severity, summary, acknowledged
+		       severity, summary, acknowledged,
+		       classes, rule_ids::text[], last_detection_at, detection_count
 		FROM incidents ORDER BY started_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -225,7 +238,8 @@ func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error
 		var i Incident
 		var ruleID *string
 		if err := rows.Scan(&i.ID, &ruleID, &i.CameraID, &i.StartedAt, &i.EndedAt,
-			&i.Severity, &i.Summary, &i.Acknowledged); err != nil {
+			&i.Severity, &i.Summary, &i.Acknowledged,
+			&i.Classes, &i.RuleIDs, &i.LastDetectionAt, &i.DetectionCount); err != nil {
 			return nil, err
 		}
 		i.RuleID = ruleID

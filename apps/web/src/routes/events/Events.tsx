@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { api } from "@/lib/api";
+import { api, Incident } from "@/lib/api";
 import { useRecentDetections } from "@/lib/events";
 import { useMe } from "@/lib/me";
 
@@ -50,7 +50,7 @@ export function Events() {
                 ${i.acknowledged ? "opacity-50" : ""}`}>
                 <button
                   type="button"
-                  className={`col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-center text-left p-2 rounded-l ${
+                  className={`col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-start text-left p-2 rounded-l ${
                     i.camera_id ? "hover:bg-neutral-900" : "cursor-default"
                   }`}
                   onClick={() => {
@@ -66,10 +66,7 @@ export function Events() {
                   <span className="text-neutral-500 tabular-nums">
                     {new Date(i.started_at).toLocaleTimeString()}
                   </span>
-                  <span>
-                    <span className={`font-medium ${severityColor(i.severity)}`}>{i.severity}</span>
-                    <span className="text-neutral-400"> · {i.summary}</span>
-                  </span>
+                  <IncidentSummary i={i} />
                 </button>
                 {isAdmin ? (
                   <div className="flex items-center justify-end gap-3 pr-2 text-xs">
@@ -164,4 +161,56 @@ function severityColor(s: string) {
   if (s === "critical") return "text-red-400";
   if (s === "warning") return "text-amber-400";
   return "text-blue-400";
+}
+
+// IncidentSummary renders the two-line description of a (possibly
+// merged) incident. Line 1 is the human-friendly classes-on-camera
+// label ("person + car at house-side"); line 2 is the duration +
+// detection count ("4m32s · ×14") so the operator can see at a
+// glance how busy / sustained the event was.
+function IncidentSummary({ i }: { i: Incident }) {
+  const classes = i.classes && i.classes.length > 0 ? i.classes : null;
+  const camera = i.camera_id ?? "system";
+  const headline = classes
+    ? `${classes.join(" + ")} at ${camera}`
+    : i.summary; // fall back to legacy single-class summary
+  const duration = formatIncidentDuration(i);
+  return (
+    <span className="grid gap-0.5">
+      <span>
+        <span className={`font-medium ${severityColor(i.severity)}`}>
+          {i.severity}
+        </span>
+        <span className="text-neutral-300"> · {headline}</span>
+      </span>
+      {(duration || i.detection_count > 1) && (
+        <span className="text-xs text-neutral-500">
+          {duration && <>{duration}</>}
+          {duration && i.detection_count > 1 && <> · </>}
+          {i.detection_count > 1 && <>×{i.detection_count}</>}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// formatIncidentDuration returns a "4m 32s" / "12s" style string, or
+// empty when the incident is a single instantaneous firing
+// (last_detection_at == started_at). Uses last_detection_at as the
+// end of the activity window — ended_at is set to the same value
+// today, but if we ever add a "manual close" feature they could
+// diverge and we'd want the activity window, not the lifetime.
+function formatIncidentDuration(i: Incident): string {
+  if (!i.last_detection_at) return "";
+  const start = new Date(i.started_at).getTime();
+  const last = new Date(i.last_detection_at).getTime();
+  const secs = Math.floor((last - start) / 1000);
+  if (secs <= 0) return "";
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm ? `${h}h ${mm}m` : `${h}h`;
 }

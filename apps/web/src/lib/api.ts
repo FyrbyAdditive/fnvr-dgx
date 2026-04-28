@@ -149,6 +149,8 @@ export type Rule = {
 
 export type Incident = {
   id: string;
+  /** First rule that opened this incident. For UI display prefer
+   *  `rule_ids` (the full set of contributing rules). */
   rule_id: string | null;
   /** null for system-scope incidents (e.g. ML drift alerts). */
   camera_id: string | null;
@@ -157,6 +159,17 @@ export type Incident = {
   severity: "info" | "warning" | "critical";
   summary: string;
   acknowledged: boolean;
+  /** All distinct class names that contributed to this incident
+   *  inside its merge window. UI joins with " + " for display. */
+  classes: string[];
+  /** All distinct rule IDs that contributed. */
+  rule_ids: string[];
+  /** Wall-clock timestamp of the most recent detection that folded
+   *  in. Drives the "last seen" line and the live age indicator. */
+  last_detection_at: string;
+  /** Total number of detections folded into this incident. Renders
+   *  as the "×N" badge. */
+  detection_count: number;
 };
 
 export type Segment = {

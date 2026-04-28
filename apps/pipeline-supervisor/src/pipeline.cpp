@@ -80,6 +80,14 @@ struct ProbeCtx {
     // 128x128 @ quality 75). Used by the Flags page to show what was
     // flagged. Empty = don't write (probe still computes phash).
     std::string           thumbs_dir_objects;
+    // Heartbeat counters. Logged every ~250 buffers so a silent probe
+    // (attached but seeing no objects, or no batch meta) is visible
+    // in the pipeline log without needing a debugger attached.
+    std::uint64_t         hb_buffers     = 0;
+    std::uint64_t         hb_batch_null  = 0;
+    std::uint64_t         hb_frames_obj  = 0;
+    std::uint64_t         hb_objects     = 0;
+    std::uint64_t         hb_published   = 0;
 };
 
 // JSON-escape minimal — only the fields we emit. Labels are small ASCII, IDs
@@ -455,8 +463,17 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
     if (!buf) return GST_PAD_PROBE_OK;
 
+    ctx->hb_buffers++;
     NvDsBatchMeta* batch = gst_buffer_get_nvds_batch_meta(buf);
-    if (!batch) return GST_PAD_PROBE_OK;
+    if (!batch) {
+        ctx->hb_batch_null++;
+        if ((ctx->hb_buffers % 250) == 0) {
+            std::cerr << "probe[" << ctx->camera_id << "]: buffers="
+                      << ctx->hb_buffers << " batch_null=" << ctx->hb_batch_null
+                      << " (no NvDsBatchMeta on pad)\n";
+        }
+        return GST_PAD_PROBE_OK;
+    }
 
     gint64 ts_ns = g_get_real_time() * 1000;  // µs → ns
     // Millisecond-resolution ISO 8601. Second-resolution was too
@@ -481,10 +498,13 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         if (!frame) continue;
         const int W = frame->source_frame_width  ? frame->source_frame_width  : 1920;
         const int H = frame->source_frame_height ? frame->source_frame_height : 1080;
+        bool frame_had_obj = false;
 
         for (NvDsMetaList* ol = frame->obj_meta_list; ol; ol = ol->next) {
             auto* obj = static_cast<NvDsObjectMeta*>(ol->data);
             if (!obj) continue;
+            ctx->hb_objects++;
+            frame_had_obj = true;
 
             float x = obj->rect_params.left   / float(W);
             float y = obj->rect_params.top    / float(H);
@@ -584,8 +604,18 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             js << "}";
             std::string payload = js.str();
             std::string subj = std::string("fnvr.events.detection.") + ctx->camera_id;
-            if (ctx->nats) ctx->nats->Publish(subj, payload);
+            if (ctx->nats && ctx->nats->Publish(subj, payload)) {
+                ctx->hb_published++;
+            }
         }
+        if (frame_had_obj) ctx->hb_frames_obj++;
+    }
+    if ((ctx->hb_buffers % 250) == 0) {
+        std::cerr << "probe[" << ctx->camera_id << "]: buffers=" << ctx->hb_buffers
+                  << " batch_null=" << ctx->hb_batch_null
+                  << " frames_with_obj=" << ctx->hb_frames_obj
+                  << " objects=" << ctx->hb_objects
+                  << " published=" << ctx->hb_published << "\n";
     }
     return GST_PAD_PROBE_OK;
 }
@@ -729,22 +759,32 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
         std::cerr << "pipeline[" << cam_.id << "]: probed codec=" << probe.codec
                   << " size=" << probe.width << "x" << probe.height << "\n";
 
-        // Take the transcode path whenever we need to rotate the stream
-        // or the source codec isn't H.264 — both require decode + NVENC.
-        // Rotation via nvvideoconvert flip-method operates on decoded
-        // NVMM surfaces, so H.264 passthrough is incompatible with any
-        // non-zero rotation.
-        // Also force transcode when mtx_proxy is set. The cameras we
-        // route through MediaMTX are by definition "broken at the
-        // source" (Bambu H2D, cheap Rockchip RTSP servers, etc.) and
-        // their H.264 bitstreams tend to include mid-stream SPS/PPS
-        // changes that qtmux rejects with "Could not multiplex
-        // stream" 10-20s into a recording. Decoding via NVDEC and
-        // re-encoding via NVENC normalises the bitstream so qtmux
-        // sees a clean, monotonic stream. Costs a few percent GPU
-        // per proxied camera; worth it for record stability.
+        // Take the transcode path only when we have to: rotation
+        // requires nvvideoconvert flip-method which only works on
+        // decoded NVMM surfaces; mtx_proxy cameras have broken H.264
+        // bitstreams (Bambu H2D, cheap Rockchip RTSP servers, etc.)
+        // with mid-stream SPS/PPS changes that qtmux rejects with
+        // "Could not multiplex stream" 10-20s into a recording, so
+        // we route them through NVDEC+NVENC to launder the bitstream.
+        //
+        // HEVC sources used to force transcode too (the rest of the
+        // gst graph was hard-wired to H.264). After the H.265
+        // passthrough refactor that's no longer required: parsers,
+        // muxers, RTP payloader and the WHEP webrtcbin caps all
+        // branch on `pipeline_codec` below. So an HEVC source with
+        // no rotation and no mtx_proxy now stays HEVC end-to-end —
+        // skips one NVENC session per camera and halves recording
+        // disk usage on those streams.
         const bool needs_transcode =
-            (probe.codec == "h265") || (cam_.rotation != 0) || cam_.mtx_proxy;
+            (cam_.rotation != 0) || cam_.mtx_proxy;
+        // pipeline_codec is the codec the gst tee carries. After
+        // transcode it's always H.264 (NVENC encoder above is fixed
+        // to nvv4l2h264enc). After passthrough it equals the source
+        // codec. Stash on the class so Start() can pass it to the
+        // WhepServer when building the webrtcbin RTP caps.
+        const std::string pipeline_codec =
+            needs_transcode ? std::string("h264") : probe.codec;
+        pipeline_codec_ = pipeline_codec;
         // GStreamer nvvideoconvert flip-method mapping:
         //   0 = none, 1 = CCW 90°, 2 = 180°, 3 = CW 90°, 4/5 = flips
         // Our camera rotation is clockwise degrees; translate.
@@ -823,9 +863,12 @@ p << "rtspsrc location=" << url
             rec_width_ = tw;
             rec_height_ = th;
         } else {
-            // Source is already H.264 and no rotation requested — pass
-            // through the parsed elementary stream; downstream infers
-            // dims from the caps. Record at source resolution.
+            // Source passes through unchanged — no rotation, no
+            // mtx_proxy. Branch the depay+parse on the source codec
+            // so HEVC and H.264 both reach the tee in their native
+            // codec. Downstream branches (recording, WHEP, JPEG)
+            // also branch on `pipeline_codec` to avoid forcing a
+            // re-encode.
             // tcp-timeout=15s + retry=3 so a hung RTSP SETUP bails instead of
 // blocking a worker forever (observed: Reolink firmware hang where
 // TCP/554 accepts connects but SETUP never completes, starving the
@@ -834,16 +877,24 @@ p << "rtspsrc location=" << url
 // supervisor respawn with its backoff.
 p << "rtspsrc location=" << url
   << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3"
-  << " name=src ! "
-                 "rtph264depay ! ";
-            // Pre-tee h264parse: needed on the inference path (our
+  << " name=src ! ";
+            if (pipeline_codec_ == "h265") {
+                p << "rtph265depay ! ";
+            } else {
+                p << "rtph264depay ! ";
+            }
+            // Pre-tee parser: needed on the inference path (our
             // nvstreammux branch consumes parsed AU-aligned frames).
             // Skipped for skip_inference because each tee branch has
-            // its own h264parse and two parsers around a tee trip
+            // its own parser and two parsers around a tee trip
             // qtmux with "Could not multiplex stream" — same fix we
             // applied earlier for the transcode+skip_inference case.
             if (!skip_inference_early) {
-                p << "h264parse config-interval=1 ! ";
+                if (pipeline_codec_ == "h265") {
+                    p << "h265parse config-interval=1 ! ";
+                } else {
+                    p << "h264parse config-interval=1 ! ";
+                }
             }
             if (probe.width > 0 && probe.height > 0) {
                 rec_width_ = probe.width;
@@ -940,16 +991,20 @@ p << "rtspsrc location=" << url
     }
 
     if (skip_inference_) {
-        // No-AI tier: the stream into the tee is already parsed H.264
-        // (either source-passthrough or post-rotation transcode above).
-        // Route it straight into qtmux — no decode/re-encode here. The
-        // post-tee h264parse converts byte-stream → avc (length-
-        // prefixed) for qtmux; the pre-tee parser in the transcode
-        // path is explicitly pinned to byte-stream output so the two
-        // parsers don't conflict through the tee.
-        p << "h264parse name=recparse config-interval=-1 ! "
-             "video/x-h264,stream-format=avc,alignment=au ! "
-             "queue max-size-buffers=300 max-size-time=2000000000 "
+        // No-AI tier: the stream into the tee is already parsed
+        // (either source-passthrough or post-rotation transcode
+        // above). Route it straight into qtmux — no decode/re-
+        // encode here. The post-tee parser converts byte-stream →
+        // length-prefixed for qtmux. Caps target stream-format
+        // matches the codec: H.264 uses 'avc', H.265 uses 'hvc1'.
+        if (pipeline_codec_ == "h265") {
+            p << "h265parse name=recparse config-interval=-1 ! "
+                 "video/x-h265,stream-format=hvc1,alignment=au ! ";
+        } else {
+            p << "h264parse name=recparse config-interval=-1 ! "
+                 "video/x-h264,stream-format=avc,alignment=au ! ";
+        }
+        p << "queue max-size-buffers=300 max-size-time=2000000000 "
              "  max-size-bytes=0 ! "
              "qtmux reserved-max-duration=4500000000000 "
              "      reserved-moov-update-period=1000000000 ! "
@@ -991,16 +1046,25 @@ p << "rtspsrc location=" << url
              "  tracker-width=960 tracker-height=544 ! "
           << anpr_chain
           << face_chain
-          << "nvvideoconvert ! "
-             // H.264 (not H.265) for the recording branch: browsers play
-             // H.264-in-MP4 universally; H.265-in-MP4 works only in Safari
-             // and some Chrome-on-Apple-Silicon builds, so clips looked
-             // "corrupt" in the timeline player. 6 Mbps at 1080p keeps
-             // bitrate budget within shouting distance of the old H.265.
-             "nvv4l2h264enc bitrate=6000000 insert-sps-pps=1 idrinterval=30 iframeinterval=30 ! "
-             "h264parse name=recparse config-interval=-1 ! "
-             "video/x-h264,stream-format=avc,alignment=au ! "
-             // Write plain (non-fragmented) MP4 with moov reserved up-front
+          << "nvvideoconvert ! ";
+        // Recording-branch re-encode: match pipeline_codec. H.264
+        // sources record as H.264, HEVC sources record as H.265 —
+        // halves disk usage on HEVC streams. Tradeoff: H.265-in-MP4
+        // doesn't play back in Firefox or non-Apple-Silicon Chrome
+        // (timeline player breaks for those browsers on HEVC
+        // recordings). Acceptable per user decision 2026-04-28.
+        if (pipeline_codec_ == "h265") {
+            p << "nvv4l2h265enc bitrate=3000000 insert-sps-pps=1 "
+                 "  idrinterval=30 iframeinterval=30 ! "
+                 "h265parse name=recparse config-interval=-1 ! "
+                 "video/x-h265,stream-format=hvc1,alignment=au ! ";
+        } else {
+            p << "nvv4l2h264enc bitrate=6000000 insert-sps-pps=1 "
+                 "  idrinterval=30 iframeinterval=30 ! "
+                 "h264parse name=recparse config-interval=-1 ! "
+                 "video/x-h264,stream-format=avc,alignment=au ! ";
+        }
+        p << // Write plain (non-fragmented) MP4 with moov reserved up-front
              // and refreshed every second. This produces a browser-playable
              // file that's valid mid-write, unlike:
              //   - mp4mux fragmented: no sidx, Firefox refused to play
@@ -1032,8 +1096,15 @@ p << "rtspsrc location=" << url
     // Explicit 480x270 output (16:9) because videoscale with a width-only
     // caps filter doesn't reliably preserve aspect when the upstream
     // reports a weird pixel-aspect-ratio or has no height in negotiation.
-    p << "t. ! queue max-size-buffers=10 leaky=downstream ! "
-         "h264parse ! nvv4l2decoder ! nvvideoconvert ! "
+    p << "t. ! queue max-size-buffers=10 leaky=downstream ! ";
+    // Codec-matched parser before nvv4l2decoder. The decoder itself
+    // auto-detects from input caps but the parser is codec-specific.
+    if (pipeline_codec_ == "h265") {
+        p << "h265parse ! ";
+    } else {
+        p << "h264parse ! ";
+    }
+    p << "nvv4l2decoder ! nvvideoconvert ! "
          "video/x-raw,format=I420 ! videoscale add-borders=true ! "
          "video/x-raw,width=480,height=270,pixel-aspect-ratio=1/1 ! "
          "videorate ! video/x-raw,framerate=1/1 ! "
@@ -1050,11 +1121,24 @@ p << "rtspsrc location=" << url
     // WHEP-negotiation time) tap the same RTP packets. Without the
     // fakesink here the payloader pad has no peer on startup and the
     // pipeline won't preroll.
-    p << "t. ! queue max-size-buffers=200 leaky=downstream ! "
-         "h264parse config-interval=-1 ! "
-         "rtph264pay name=pay pt=96 config-interval=-1 aggregate-mode=zero-latency ! "
-         "application/x-rtp,media=video,encoding-name=H264,payload=96 ! "
-         "tee name=rtp_tee allow-not-linked=true ! "
+    p << "t. ! queue max-size-buffers=200 leaky=downstream ! ";
+    // RTP payloader matched to pipeline_codec. WHEP server's
+    // queue→webrtcbin link uses the same codec to advertise the
+    // right encoding-name in the SDP we hand back to the browser.
+    // Payload type 96 = H.264 dynamic-payload convention; 97 keeps
+    // H.265 in the same dynamic range with no overlap.
+    if (pipeline_codec_ == "h265") {
+        p << "h265parse config-interval=-1 ! "
+             "rtph265pay name=pay pt=97 config-interval=-1 "
+             "  aggregate-mode=zero-latency ! "
+             "application/x-rtp,media=video,encoding-name=H265,payload=97 ! ";
+    } else {
+        p << "h264parse config-interval=-1 ! "
+             "rtph264pay name=pay pt=96 config-interval=-1 "
+             "  aggregate-mode=zero-latency ! "
+             "application/x-rtp,media=video,encoding-name=H264,payload=96 ! ";
+    }
+    p << "tee name=rtp_tee allow-not-linked=true ! "
          "fakesink sync=false async=false";
 
     std::string desc = p.str();
@@ -1125,13 +1209,16 @@ p << "rtspsrc location=" << url
         // cameras until we figure out how to make nvtracker accept our
         // injected objects.
         GstElement* attach = nullptr;
+        const char* attach_name = nullptr;
         if (cam_.detector_backend == "hailo") {
             attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+            attach_name = "pgie";
         } else {
             attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
-            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet");
-            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
-            if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+            attach_name = "arcface";
+            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet"); attach_name = "lprnet"; }
+            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker"); attach_name = "tracker"; }
+            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie"); attach_name = "pgie"; }
         }
         if (attach) {
             GstPad* src = gst_element_get_static_pad(attach, "src");
@@ -1160,9 +1247,15 @@ p << "rtspsrc location=" << url
                     std::filesystem::create_directories(ctx->thumbs_dir_objects, _ec);
                 }
                 gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe, ctx, nullptr);
+                std::cerr << "pipeline[" << cam_.id
+                          << "]: detection probe attached on " << attach_name << ".src\n";
                 gst_object_unref(src);
             }
             gst_object_unref(attach);
+        } else {
+            std::cerr << "pipeline[" << cam_.id
+                      << "]: FAILED to attach detection probe — no element matched"
+                      << " (looked for arcface/lprnet/tracker/pgie)\n";
         }
     }
 #endif
@@ -1303,7 +1396,8 @@ bool SingleCameraPipeline::Start() {
         std::cerr << "pipeline[" << cam_.id << "]: rtp_tee not found in pipeline; webrtc disabled\n";
     } else {
         std::cerr << "pipeline[" << cam_.id << "]: rtp_tee found, starting WHEP server\n";
-        whep_ = std::make_unique<WhepServer>(cam_.id, pipeline_, rtp_tee);
+        whep_ = std::make_unique<WhepServer>(cam_.id, pipeline_, rtp_tee,
+                                             pipeline_codec_);
         if (!whep_->Start()) {
             std::cerr << "pipeline[" << cam_.id << "]: whep server failed to start\n";
             whep_.reset();

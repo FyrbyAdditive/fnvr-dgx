@@ -41,7 +41,13 @@ class WhepServer {
 public:
     // `rtp_tee` is a `tee` element the main pipeline exposes; new
     // webrtcbins get linked to a fresh src pad on this tee.
-    WhepServer(std::string camera_id, GstElement* pipeline, GstElement* rtp_tee);
+    // `codec` is "h264" or "h265" — selects the RTP caps the
+    // queue→webrtcbin link advertises (encoding-name + payload type).
+    // The pipeline upstream of the rtp_tee is already paying out
+    // RTP packets in the matching codec (rtph264pay vs rtph265pay
+    // are wired in pipeline.cpp based on the same codec value).
+    WhepServer(std::string camera_id, GstElement* pipeline, GstElement* rtp_tee,
+               std::string codec);
     ~WhepServer();
 
     bool Start();
@@ -68,6 +74,10 @@ private:
     std::string camera_id_;
     GstElement* pipeline_ = nullptr;
     GstElement* rtp_tee_  = nullptr;
+    // Codec carried over the RTP tee — "h264" or "h265". Decides
+    // the queue→webrtcbin caps in handleOffer() and ultimately the
+    // SDP the browser sees.
+    std::string codec_;
 
     int               port_ = 0;
     int               listen_fd_ = -1;

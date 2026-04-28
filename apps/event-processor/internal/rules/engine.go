@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -30,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 
@@ -189,6 +191,16 @@ type RuleDef struct {
 	ZoneID         string          `json:"zone_id,omitempty"`
 	Direction      string          `json:"direction,omitempty"` // "in" | "out" | "" for both
 	CooldownSec    int             `json:"cooldown_sec"`
+	// MergeWindowSec controls how far back this rule looks for an
+	// existing open incident on the same camera to merge into. The
+	// merge target is the most recent incident on the camera within
+	// the window — so this rule's firings will fold into incidents
+	// originally opened by ANY rule on the same camera, not just
+	// itself. Set:
+	//   0  — use engine default (180s, 3 minutes)
+	//  -1  — never merge; every detection past CooldownSec creates
+	//        a fresh incident (legacy behaviour, useful for test rules)
+	MergeWindowSec int             `json:"merge_window_sec,omitempty"`
 	Schedule       Schedule        `json:"schedule"`
 	Severity       string          `json:"severity"` // info | warning | critical
 	// ActiveWhen gates the rule on the global alarm state:
@@ -1142,18 +1154,139 @@ func (e *Engine) cooldownOK(ruleID string, seconds int, now time.Time) bool {
 	return true
 }
 
+// defaultMergeWindow is the merge window applied to rules that
+// don't override MergeWindowSec. Three minutes is long enough to
+// fold "same actor still in frame" into one incident across the
+// natural gaps between detections, short enough that distinct
+// visits an hour apart stay distinct.
+const defaultMergeWindow = 180 * time.Second
+
+// fireIncident is the entry point used by the rule loop. It tries
+// to fold this firing into an existing open incident on the same
+// camera within the rule's merge window; if there's nothing to
+// merge into, it creates a new incident. NATS publishing is split
+// between the creation subject (drives notification dispatch — fires
+// once per incident) and the update subject (UI-only, fires on
+// every merge so the row's badges update without a refetch).
 func (e *Engine) fireIncident(ctx context.Context, r compiledRule, d Detection) error {
 	severity := r.Definition.Severity
 	if severity == "" {
 		severity = "info"
 	}
+
+	window := mergeWindowFor(r.Definition.MergeWindowSec)
+	if window > 0 {
+		if merged, err := e.tryMergeIncident(ctx, r, d, severity, window); err != nil {
+			return err
+		} else if merged {
+			return nil
+		}
+	}
+	return e.createIncident(ctx, r, d, severity)
+}
+
+// mergeWindowFor resolves the rule's MergeWindowSec into a duration.
+// 0 means "use default", negative means "never merge".
+func mergeWindowFor(secs int) time.Duration {
+	switch {
+	case secs == 0:
+		return defaultMergeWindow
+	case secs < 0:
+		return 0
+	default:
+		return time.Duration(secs) * time.Second
+	}
+}
+
+// tryMergeIncident does a single-statement UPDATE that finds the
+// most recent incident on this camera within the merge window and
+// folds the new detection into it: bumps last_detection_at + ended_at,
+// increments detection_count, adds the class + rule_id to their
+// respective sets if not already present, raises severity if the
+// new firing's severity is higher.
+//
+// Returns (merged=true, nil) when an incident was updated, (false, nil)
+// when there was nothing in the window to merge into, or (false, err)
+// on a real DB error. The caller falls through to createIncident
+// only on the (false, nil) path.
+//
+// Concurrency: two engine goroutines (or two rules firing in the
+// same tick) can race to merge into the same incident. The
+// UPDATE...WHERE id=(SELECT...LIMIT 1) is a single statement and
+// runs atomically; the second writer's SELECT sees the
+// already-bumped last_detection_at and merges into the now-current
+// state. No double insert.
+func (e *Engine) tryMergeIncident(ctx context.Context, r compiledRule,
+	d Detection, severity string, window time.Duration) (bool, error) {
+	cutoff := d.TS.Add(-window)
+
+	var incidentID string
+	err := e.pool.QueryRow(ctx, `
+		UPDATE incidents
+		   SET ended_at          = $1,
+		       last_detection_at = $1,
+		       detection_count   = detection_count + 1,
+		       classes = CASE
+		           WHEN $2 = ANY(classes) THEN classes
+		           ELSE array_append(classes, $2)
+		         END,
+		       rule_ids = CASE
+		           WHEN $3::uuid = ANY(rule_ids) THEN rule_ids
+		           ELSE array_append(rule_ids, $3::uuid)
+		         END,
+		       severity = CASE
+		           WHEN severity_rank($4) > severity_rank(severity)
+		           THEN $4 ELSE severity
+		         END
+		 WHERE id = (
+		     SELECT id FROM incidents
+		      WHERE camera_id = $5
+		        AND last_detection_at >= $6
+		      ORDER BY last_detection_at DESC
+		      LIMIT 1)
+		RETURNING id::text`,
+		d.TS, d.ClassName, r.ID, severity, d.CameraID, cutoff,
+	).Scan(&incidentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// Update — broadcast on the incident_update subject so the UI can
+	// re-render the row. Notification dispatcher does NOT subscribe
+	// to this subject — it would spam users with duplicate alerts.
+	payload, _ := json.Marshal(map[string]any{
+		"id":              incidentID,
+		"camera_id":       d.CameraID,
+		"class_added":     d.ClassName,
+		"rule_added":      r.ID,
+		"last_detection":  d.TS,
+		"severity":        severity,
+	})
+	_ = e.nc.Publish("fnvr.events.incident_update."+d.CameraID, payload)
+	metrics.IncidentsFired.WithLabelValues(severity, "merged").Inc()
+	return true, nil
+}
+
+// createIncident inserts a fresh incidents row. Used both when the
+// merge window is disabled and when no existing incident was found
+// in the window. Publishes on the canonical creation subject so
+// the notification dispatcher fans out once per real event.
+func (e *Engine) createIncident(ctx context.Context, r compiledRule,
+	d Detection, severity string) error {
 	summary := fmt.Sprintf("%s on %s (%.0f%%)", d.ClassName, d.CameraID, d.Confidence*100)
 
 	var incidentID string
 	err := e.pool.QueryRow(ctx, `
-		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at, severity, summary)
-		VALUES ($1,$2,$3,$3,$4,$5) RETURNING id::text`,
-		r.ID, d.CameraID, d.TS, severity, summary).Scan(&incidentID)
+		INSERT INTO incidents (rule_id, camera_id, started_at, ended_at,
+		                       last_detection_at, detection_count,
+		                       classes, rule_ids, severity, summary)
+		VALUES ($1,$2,$3,$3,$3,1,ARRAY[$4]::TEXT[],ARRAY[$1]::UUID[],$5,$6)
+		RETURNING id::text`,
+		r.ID, d.CameraID, d.TS, d.ClassName, severity, summary,
+	).Scan(&incidentID)
 	if err != nil {
 		return err
 	}
@@ -1165,6 +1298,7 @@ func (e *Engine) fireIncident(ctx context.Context, r compiledRule, d Detection) 
 		"started_at": d.TS,
 		"severity":   severity,
 		"summary":    summary,
+		"classes":    []string{d.ClassName},
 	})
 	metrics.IncidentsFired.WithLabelValues(severity, "object").Inc()
 	return e.nc.Publish("fnvr.events.incident."+d.CameraID, payload)
