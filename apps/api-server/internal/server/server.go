@@ -265,7 +265,7 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/object-flags", s.handleListFlags)
 			protected.HandleFunc("GET /api/v1/object-flags/stats", s.handleFlagStats)
 			protected.Handle("DELETE /api/v1/object-flags/{id}", auth.AdminFunc(s.handleDismissFlag))
-			protected.HandleFunc("GET /api/v1/object-thumbnail/{detection_id}", s.handleObjectThumbnail)
+			protected.HandleFunc("GET /api/v1/object-thumbnail/{id}", s.handleObjectThumbnail)
 			protected.HandleFunc("GET /api/v1/ml/drift/status", s.handleDriftStatus)
 		}
 

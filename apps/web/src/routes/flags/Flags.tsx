@@ -166,7 +166,7 @@ function FlagTile({
     >
       <div className="aspect-square bg-neutral-900 flex items-center justify-center overflow-hidden relative">
         <img
-          src={`/api/v1/object-thumbnail/${flag.detection_id}.jpg`}
+          src={`/api/v1/object-thumbnail/${flag.id}.jpg`}
           alt=""
           className="w-full h-full object-cover"
           onError={(ev) => {

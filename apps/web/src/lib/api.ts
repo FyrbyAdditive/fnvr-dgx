@@ -331,6 +331,10 @@ export const api = {
     return req<Segment[]>(`/segments${p.size ? `?${p}` : ""}`);
   },
   segmentFileUrl: (id: number) => `${base}/segments/${id}/file`,
+  // Same endpoint, but the server attaches Content-Disposition so the
+  // browser saves the file rather than streaming it inline. Filename
+  // is built server-side from camera + start time + codec.
+  segmentDownloadUrl: (id: number) => `${base}/segments/${id}/file?download=1`,
 
   listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number; kind?: string; plate?: string } = {}) => {
     const p = new URLSearchParams();
@@ -796,13 +800,17 @@ export type NotificationDelivery = {
 // under /var/lib/fnvr/datasets/objects/ for future off-device training.
 export type ObjectFlag = {
   id: number;
-  detection_id: number;
+  detection_id: number | null;
+  // Snapshotted from the source detection so the thumbnail keeps
+  // resolving after detection retention has pruned the source row.
+  // Null for manual flags (no underlying detection).
+  event_id: string | null;
   camera_id: string;
   ts: string;
   class_original: string;
   class_corrected: string | null;
   bbox: { x: number; y: number; w: number; h: number };
-  phash: number;
+  phash: number | null;
   frame_path: string;
   label_path: string;
   created_by: string | null;

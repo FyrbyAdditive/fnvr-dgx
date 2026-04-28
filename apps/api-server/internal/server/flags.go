@@ -75,24 +75,27 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	// short hex string from the pipeline, used by pre-pg_id clients)
 	// or the PG row id (numeric, from the accepted-subject payload's
 	// `pg_id` field). Try numeric first — it's unambiguous — else fall
-	// through to event_id.
+	// through to event_id. We always also read event_id back so we can
+	// snapshot it onto the flag row (the on-disk JPEG thumb is keyed
+	// by event_id; snapshotting lets the thumbnail endpoint survive
+	// the source detection getting pruned by retention).
 	var detID int64
-	var cameraID, className string
+	var cameraID, className, detEventID string
 	var ts time.Time
 	var bboxJSON, attrJSON []byte
 	var err error
 	if pg, convErr := strconv.ParseInt(eventID, 10, 64); convErr == nil && pg > 0 {
 		err = s.pool.QueryRow(r.Context(),
-			`SELECT id, camera_id, ts, class_name, bbox, attributes
+			`SELECT id, event_id, camera_id, ts, class_name, bbox, attributes
 			 FROM detections WHERE id = $1`, pg).
-			Scan(&detID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
 	} else {
 		err = s.pool.QueryRow(r.Context(),
-			`SELECT id, camera_id, ts, class_name, bbox, attributes
+			`SELECT id, event_id, camera_id, ts, class_name, bbox, attributes
 			 FROM detections
 			 WHERE event_id = $1
 			 ORDER BY ts DESC LIMIT 1`, eventID).
-			Scan(&detID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
 	}
 	if err != nil {
 		// Most likely: the detection is already being suppressed by an
@@ -149,6 +152,7 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	// milliseconds before paths are patched).
 	created, err := s.flags.Create(r.Context(), flags.CreateArgs{
 		DetectionID:    &detID,
+		EventID:        &detEventID,
 		CameraID:       cameraID,
 		TS:             ts,
 		ClassOriginal:  className,
@@ -409,12 +413,17 @@ func (s *Server) handleFlagStats(w http.ResponseWriter, r *http.Request) {
 
 // handleObjectThumbnail serves the pipeline-cached object-detection
 // JPEG. The pipeline writes these under {DataDir}/thumbs/objects/
-// keyed by the detection's event_id (short hex string). We look the
-// event_id up by PG detection id so the UI can build stable URLs
-// from the detection row. 404 for detections predating this slice or
-// whose thumb has been pruned.
+// keyed by the detection's event_id (short hex string).
+//
+// The path id is the flag row id (object_flags.id). The flag carries
+// a snapshot of the source detection's event_id, so the JPEG keeps
+// resolving even after detection retention prunes the source row.
+//
+// Legacy clients passed the detection id directly; we still try that
+// path as a fallback (lookup detections.event_id by id) so existing
+// bookmarks don't 404.
 func (s *Server) handleObjectThumbnail(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("detection_id")
+	idStr := r.PathValue("id")
 	if i := len(idStr) - 4; i > 0 && idStr[i:] == ".jpg" {
 		idStr = idStr[:i]
 	}
@@ -423,26 +432,56 @@ func (s *Server) handleObjectThumbnail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad id", http.StatusBadRequest)
 		return
 	}
-	var eventID string
-	if err := s.pool.QueryRow(r.Context(),
-		`SELECT event_id FROM detections WHERE id = $1`, id).Scan(&eventID); err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	if s.cfg == nil || s.cfg.DataDir == "" {
 		http.Error(w, "no data dir", http.StatusNotFound)
 		return
 	}
-	path := filepath.Join(s.cfg.DataDir, "thumbs", "objects", eventID+".jpg")
-	fd, err := os.Open(path)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+	// Preferred path: id is a flag row id with a snapshotted event_id.
+	// If the flag predates the event_id snapshot column the field is
+	// NULL and we fall back to (a) treating the id as a detection id,
+	// then (b) the flag's own captured frame_path as a last resort —
+	// an old flag without event_id has no recoverable bbox-crop, but
+	// frame_path points at the full live thumbnail at flag time which
+	// at least shows the operator what they flagged.
+	var eventID, framePath string
+	var hasEvent, hasFrame bool
+	if err := s.pool.QueryRow(r.Context(),
+		`SELECT COALESCE(event_id, ''), frame_path FROM object_flags WHERE id = $1`,
+		id).Scan(&eventID, &framePath); err == nil {
+		hasEvent = eventID != ""
+		hasFrame = framePath != ""
+	} else {
+		// Legacy URL: id is a detection id, look up its event_id.
+		if err := s.pool.QueryRow(r.Context(),
+			`SELECT event_id FROM detections WHERE id = $1`, id).Scan(&eventID); err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		hasEvent = true
 	}
-	defer fd.Close()
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	_, _ = io.Copy(w, fd)
+	if hasEvent {
+		path := filepath.Join(s.cfg.DataDir, "thumbs", "objects", eventID+".jpg")
+		if fd, err := os.Open(path); err == nil {
+			defer fd.Close()
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			_, _ = io.Copy(w, fd)
+			return
+		}
+	}
+	if hasFrame {
+		path := filepath.Join(s.cfg.DataDir, framePath)
+		if fd, err := os.Open(path); err == nil {
+			defer fd.Close()
+			w.Header().Set("Content-Type", "image/jpeg")
+			// Shorter cache: dataset frame is a fallback, not the
+			// canonical thumb.
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			_, _ = io.Copy(w, fd)
+			return
+		}
+	}
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 // --- helpers ---

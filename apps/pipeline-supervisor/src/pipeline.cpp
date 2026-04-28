@@ -1046,7 +1046,29 @@ p << "rtspsrc location=" << url
              "  tracker-width=960 tracker-height=544 ! "
           << anpr_chain
           << face_chain
-          << "nvvideoconvert ! ";
+          << "nvvideoconvert ! "
+          // Pin framerate before the encoder. Without this nvstreammux
+          // strips the framerate field from the negotiated caps (its
+          // live-source=1 batch path computes per-batch PTS but doesn't
+          // assert a downstream framerate), the encoder ships caps
+          // with no framerate, and qtmux falls back to writing
+          // r_frame_rate=10000/1 in the MP4 mvhd. Players that key
+          // playback speed off r_frame_rate (browsers in MSE mode,
+          // default ffplay, several phone gallery apps) then play the
+          // file at 10000 fps so a 1-hour clip "completes" in ~7s and
+          // the visible image appears stuck on a single frame.
+          //
+          // videorate adapts to whatever framerate upstream provides
+          // (or doesn't) and emits at the asserted 20/1 — drops/dupes
+          // as needed. Verified in a standalone gst rig that
+          // (a) frame-duration on nvstreammux doesn't fix it,
+          // (b) a bare capsfilter without videorate doesn't fix it,
+          // (c) videorate + capsfilter does. All currently-configured
+          // cameras run at 20 fps at the source; if a future camera
+          // runs at a different rate this should become a per-camera
+          // value derived from probe.r_frame_rate (rtsp_probe.cpp
+          // doesn't capture framerate today; tracked as a follow-up).
+             "videorate ! video/x-raw(memory:NVMM),framerate=20/1 ! ";
         // Recording-branch re-encode: match pipeline_codec. H.264
         // sources record as H.264, HEVC sources record as H.265 —
         // halves disk usage on HEVC streams. Tradeoff: H.265-in-MP4

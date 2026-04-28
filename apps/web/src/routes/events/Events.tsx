@@ -46,11 +46,11 @@ export function Events() {
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm">
             {incidents.map((i) => (
-              <li key={i.id} className={`grid grid-cols-[8rem_1fr_9rem] gap-2 items-center
+              <li key={i.id} className={`grid grid-cols-[12rem_1fr_9rem] gap-2 items-center
                 ${i.acknowledged ? "opacity-50" : ""}`}>
                 <button
                   type="button"
-                  className={`col-span-2 grid grid-cols-[8rem_1fr] gap-2 items-start text-left p-2 rounded-l ${
+                  className={`col-span-2 grid grid-cols-[12rem_1fr] gap-2 items-start text-left p-2 rounded-l ${
                     i.camera_id ? "hover:bg-neutral-900" : "cursor-default"
                   }`}
                   onClick={() => {
@@ -64,7 +64,7 @@ export function Events() {
                   }
                 >
                   <span className="text-neutral-500 tabular-nums">
-                    {new Date(i.started_at).toLocaleTimeString()}
+                    {formatIncidentTimestamp(i.started_at)}
                   </span>
                   <IncidentSummary i={i} />
                 </button>
@@ -192,6 +192,16 @@ function IncidentSummary({ i }: { i: Incident }) {
       )}
     </span>
   );
+}
+
+// formatIncidentTimestamp renders a short date+time the operator can
+// scan — incidents persist long enough that a bare time-of-day is
+// ambiguous once you scroll past today.
+function formatIncidentTimestamp(iso: string): string {
+  const d = new Date(iso);
+  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const time = d.toLocaleTimeString();
+  return `${date} ${time}`;
 }
 
 // formatIncidentDuration returns a "4m 32s" / "12s" style string, or

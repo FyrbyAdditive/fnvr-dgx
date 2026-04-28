@@ -31,6 +31,12 @@ type BBox struct {
 type Flag struct {
 	ID             int64     `json:"id"`
 	DetectionID    *int64    `json:"detection_id"`
+	// EventID is the short hex string the pipeline assigned to the
+	// source detection — also the filename of the JPEG thumb written
+	// at probe time under {DataDir}/thumbs/objects/{event_id}.jpg.
+	// Snapshotted onto the flag so retention pruning the underlying
+	// detection row doesn't break the thumbnail endpoint.
+	EventID        *string   `json:"event_id"`
 	CameraID       string    `json:"camera_id"`
 	TS             time.Time `json:"ts"`
 	ClassOriginal  string    `json:"class_original"`
@@ -57,6 +63,7 @@ type Flag struct {
 // pHash-based suppression library.
 type CreateArgs struct {
 	DetectionID    *int64
+	EventID        *string // short hex string keying the on-disk thumb
 	CameraID       string
 	TS             time.Time
 	ClassOriginal  string
@@ -86,13 +93,14 @@ func (s *Store) Create(ctx context.Context, a CreateArgs) (Flag, error) {
 	var f Flag
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO object_flags
-		    (detection_id, camera_id, ts, class_original, class_corrected,
+		    (detection_id, event_id, camera_id, ts, class_original, class_corrected,
 		     bbox, phash, frame_path, label_path, created_by)
-		VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10)
-		RETURNING id, detection_id, camera_id, ts, class_original,
+		VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11)
+		RETURNING id, detection_id, event_id, camera_id, ts, class_original,
 		          class_corrected, bbox, phash, frame_path, label_path,
 		          created_by, created_at, dismissed_at`,
-		nullableInt64(a.DetectionID), a.CameraID, a.TS, a.ClassOriginal,
+		nullableInt64(a.DetectionID), derefOrNil(a.EventID),
+		a.CameraID, a.TS, a.ClassOriginal,
 		derefOrNil(a.ClassCorrected), string(bboxJSON),
 		// pgx's pgtype for bigint is int64; pHash is a full 64-bit
 		// value which we store as a *signed* int64. The bit pattern
@@ -100,7 +108,7 @@ func (s *Store) Create(ctx context.Context, a CreateArgs) (Flag, error) {
 		// works either way. nil → SQL NULL (manual flags).
 		nullablePHashArg(a.PHash),
 		a.FramePath, a.LabelPath, derefOrNil(a.CreatedBy),
-	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.EventID, &f.CameraID, &f.TS, &f.ClassOriginal,
 		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if err != nil {
@@ -139,7 +147,7 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Flag, error) {
 	if f.ClassOriginal != "" {
 		where = append(where, "class_original = "+add(f.ClassOriginal))
 	}
-	sql := `SELECT id, detection_id, camera_id, ts, class_original,
+	sql := `SELECT id, detection_id, event_id, camera_id, ts, class_original,
 	               class_corrected, bbox, phash, frame_path, label_path,
 	               created_by, created_at, dismissed_at
 	        FROM object_flags`
@@ -157,7 +165,8 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Flag, error) {
 	for rows.Next() {
 		var fl Flag
 		var bboxJSON []byte
-		if err := rows.Scan(&fl.ID, &nullableInt64Scan{&fl.DetectionID}, &fl.CameraID, &fl.TS,
+		if err := rows.Scan(&fl.ID, &nullableInt64Scan{&fl.DetectionID}, &fl.EventID,
+			&fl.CameraID, &fl.TS,
 			&fl.ClassOriginal, &fl.ClassCorrected, &bboxJSON,
 			&scanPHashPtr{&fl.PHash}, &fl.FramePath, &fl.LabelPath,
 			&fl.CreatedBy, &fl.CreatedAt, &fl.DismissedAt); err != nil {
@@ -178,10 +187,10 @@ func (s *Store) Dismiss(ctx context.Context, id int64) (Flag, error) {
 	err := s.pool.QueryRow(ctx, `
 		UPDATE object_flags SET dismissed_at = NOW()
 		WHERE id = $1 AND dismissed_at IS NULL
-		RETURNING id, detection_id, camera_id, ts, class_original,
+		RETURNING id, detection_id, event_id, camera_id, ts, class_original,
 		          class_corrected, bbox, phash, frame_path, label_path,
 		          created_by, created_at, dismissed_at`, id,
-	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.EventID, &f.CameraID, &f.TS, &f.ClassOriginal,
 		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -200,11 +209,11 @@ func (s *Store) Get(ctx context.Context, id int64) (Flag, error) {
 	var f Flag
 	var bboxJSON []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, detection_id, camera_id, ts, class_original,
+		SELECT id, detection_id, event_id, camera_id, ts, class_original,
 		       class_corrected, bbox, phash, frame_path, label_path,
 		       created_by, created_at, dismissed_at
 		FROM object_flags WHERE id = $1`, id,
-	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.CameraID, &f.TS, &f.ClassOriginal,
+	).Scan(&f.ID, &nullableInt64Scan{&f.DetectionID}, &f.EventID, &f.CameraID, &f.TS, &f.ClassOriginal,
 		&f.ClassCorrected, &bboxJSON, &scanPHashPtr{&f.PHash}, &f.FramePath, &f.LabelPath,
 		&f.CreatedBy, &f.CreatedAt, &f.DismissedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

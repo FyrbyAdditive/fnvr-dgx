@@ -101,7 +101,27 @@ func (s *Server) handleSegmentFile(w http.ResponseWriter, r *http.Request) {
 	// Short cache — segments don't change once closed, but "hot" ones may
 	// still be appending while a browser replays them.
 	w.Header().Set("Cache-Control", "private, max-age=5")
+	// Download mode: prompt the browser to save rather than play
+	// inline. Filename includes camera + UTC start time + codec so
+	// the user can scan a folder of saved clips. Inline playback
+	// (the bare URL) keeps working unchanged so the timeline player
+	// is untouched.
+	if r.URL.Query().Get("download") == "1" {
+		w.Header().Set("Content-Disposition",
+			`attachment; filename="`+downloadFilename(seg.CameraID, seg.StartedAt, seg.Codec)+`"`)
+	}
 	http.ServeContent(w, r, filepath.Base(clean), st.ModTime(), f)
+}
+
+// downloadFilename builds a filesystem-safe name for the saved clip.
+// Underscores everywhere because ISO 8601's colons and slashes trip up
+// Windows and older Finder.
+func downloadFilename(cameraID string, startedAt time.Time, codec string) string {
+	ts := startedAt.UTC().Format("2006-01-02_15-04-05")
+	if codec == "" {
+		codec = "mp4"
+	}
+	return cameraID + "_" + ts + "_" + codec + ".mp4"
 }
 
 // handleListDetections: GET /api/v1/detections?camera_id=X&from=TS&to=TS&limit=N

@@ -338,17 +338,31 @@ function Player({
           detections={active}
         />
       )}
-      {isAdmin && cameraId && cameraEnabled !== undefined && (
-        <div className="absolute top-2 right-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <CameraToggle cameraId={cameraId} enabled={cameraEnabled} variant="overlay" />
-          <CameraDetectorChips
-            cameraId={cameraId}
-            enabledDetectors={cameraEnabledDetectors ?? []}
-            disabled={!cameraEnabled}
-            variant="overlay"
-          />
-        </div>
-      )}
+      <div className="absolute top-2 right-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        {isAdmin && cameraId && cameraEnabled !== undefined && (
+          <>
+            <CameraToggle cameraId={cameraId} enabled={cameraEnabled} variant="overlay" />
+            <CameraDetectorChips
+              cameraId={cameraId}
+              enabledDetectors={cameraEnabledDetectors ?? []}
+              disabled={!cameraEnabled}
+              variant="overlay"
+            />
+          </>
+        )}
+        {/* Download is available to admins and viewers — these are
+            clips the user is already allowed to watch; gating download
+            would just be theatre. The server adds Content-Disposition
+            with a filesystem-safe filename so right-click also works. */}
+        <a
+          href={api.segmentDownloadUrl(clip.segment.id)}
+          download
+          className="text-xs px-2 py-1 rounded border bg-neutral-900/80 border-neutral-700 text-neutral-300 hover:text-white"
+          title="Download this hour as MP4"
+        >
+          ↓ download
+        </a>
+      </div>
     </div>
   );
 }
