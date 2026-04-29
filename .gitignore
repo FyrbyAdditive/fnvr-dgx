@@ -5,6 +5,7 @@ out/
 target/
 *.engine
 *.trt
+*.tsbuildinfo
 
 # Go
 bin/

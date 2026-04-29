@@ -6,6 +6,8 @@ import { useRecentDetections, DetectionEvent } from "@/lib/events";
 import { useMe } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
 import { CameraDetectorChips } from "@/components/CameraDetectorChips";
+import { useWhepStream } from "./useWhepStream";
+import { EnlargedCameraModal } from "./EnlargedCameraModal";
 
 export function Live() {
   const { data: me } = useMe();
@@ -104,6 +106,14 @@ export function Live() {
     cameras.length <= 9 ? "grid-cols-3" :
     "grid-cols-4";
 
+  // Single-camera enlarged view. Null = no modal; a camera id renders
+  // the EnlargedCameraModal on top of the mosaic. The mosaic continues
+  // streaming behind it so closing the modal feels instant.
+  const [enlargedCamId, setEnlargedCamId] = useState<string | null>(null);
+  const enlargedCam = enlargedCamId
+    ? cameras.find((c) => c.id === enlargedCamId) ?? null
+    : null;
+
   return (
     <div className="p-4 h-full flex flex-col gap-2">
       <div className="flex justify-end">
@@ -137,15 +147,23 @@ export function Live() {
               showStats={showStats}
               focus={focusCameraId === c.id}
               isAdmin={isAdmin}
+              onEnlarge={() => setEnlargedCamId(c.id)}
             />
           ))}
         </div>
+      )}
+      {enlargedCam && (
+        <EnlargedCameraModal
+          cameraId={enlargedCam.id}
+          cameraName={enlargedCam.name}
+          onClose={() => setEnlargedCamId(null)}
+        />
       )}
     </div>
   );
 }
 
-function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin }: {
+function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin, onEnlarge }: {
   id: string;
   name: string;
   enabled: boolean;
@@ -157,6 +175,7 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   showStats: boolean;
   focus?: boolean;
   isAdmin: boolean;
+  onEnlarge: () => void;
 }) {
   // Flag-popover state. `pickedDetection` is the detection the
   // operator clicked on; `pickedFrozenBoxes` is the snapshot of boxes
@@ -195,90 +214,8 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
     const t = setTimeout(() => setHighlight(false), 2500);
     return () => clearTimeout(t);
   }, [focus]);
-  // WebRTC live view. Falls back to the 1-fps JPEG snapshot below if the
-  // peer connection can't be established (camera not streaming, browser
-  // blocks insecure getUserMedia, etc.).
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [rtcLive, setRtcLive] = useState(false);
-  // retryTick bumps every 10s while the tile has no working stream
-  // (neither WHEP nor JPEG). Each bump re-runs the WHEP negotiation
-  // and — via imgOk — re-attempts the JPEG path. Without this, a tile
-  // whose pipeline wasn't ready at mount time shows "No recording yet"
-  // forever until the user refreshes the page.
-  const [retryTick, setRetryTick] = useState(0);
-
-  useEffect(() => {
-    // The vendored MediaMTX reader (public/mtx-reader.js) handles the
-    // WHEP offer/answer dance, codec negotiation (incl. non-advertised
-    // codecs like H.265 + AV1 the browser doesn't list by default),
-    // trickle ICE, and session teardown. Our previous in-house client
-    // skipped all of that — its offer only listed H.264 default codecs
-    // so MediaMTX couldn't deliver H.265 tracks, which silently kept
-    // ontrack from firing and the tile fell back to the 1-fps JPEG.
-    let cancelled = false;
-    const Reader = (window as unknown as {
-      MediaMTXWebRTCReader?: new (conf: {
-        url: string;
-        onError?: (e: string) => void;
-        onTrack?: (e: RTCTrackEvent) => void;
-      }) => { close: () => void };
-    }).MediaMTXWebRTCReader;
-    if (!Reader) {
-      // Script didn't load (network error, blocked, very old build) —
-      // tile stays on JPEG fallback.
-      setRtcLive(false);
-      return;
-    }
-    // MediaMTX speaks WHEP on :8889 with permissive CORS. Hitting it
-    // directly avoids the proxy_redirect-vs-port mess we'd otherwise
-    // have routing through nginx — MediaMTX's Location header is
-    // root-relative and resolves against the WHEP base URL, which
-    // works only if the base URL is MediaMTX's actual origin (any
-    // proxy prefix gets stripped during root-relative URL resolution).
-    // Host derived from the page origin so this works on any LAN
-    // deployment without a config flag.
-    const mtxOrigin = `${window.location.protocol}//${window.location.hostname}:8889`;
-    const url = `${mtxOrigin}/live_${encodeURIComponent(id)}/whep`;
-    // Captured stream attaches in a separate effect once <video>
-    // exists. We can't write to videoRef.current here because the
-    // <video> only renders when rtcLive is true — chicken-and-egg.
-    const reader = new Reader({
-      url,
-      onTrack: (e) => {
-        if (cancelled) return;
-        // Safari sometimes emits empty `streams` for recvonly
-        // transceivers; build one from the track in that case.
-        const stream = e.streams[0] ?? new MediaStream([e.track]);
-        setStreamObj(stream);
-        setRtcLive(true);
-      },
-      onError: () => {
-        if (!cancelled) setRtcLive(false);
-      },
-    });
-    return () => {
-      cancelled = true;
-      try {
-        reader.close();
-      } catch {
-        // ignore
-      }
-    };
-  }, [id, retryTick]);
-
-  // Hold the MediaStream out-of-band so it survives the rtcLive=false
-  // → rtcLive=true render and lands on the <video> element via the
-  // attach-effect below. Setting srcObject during onTrack didn't work
-  // because videoRef is null on the first render (rtcLive is still
-  // false — the <video> isn't mounted until the state flip).
-  const [streamObj, setStreamObj] = useState<MediaStream | null>(null);
-  useEffect(() => {
-    if (rtcLive && streamObj && videoRef.current) {
-      videoRef.current.srcObject = streamObj;
-    }
-  }, [rtcLive, streamObj]);
-
-  // Snapshot fallback refresh.
+  // Snapshot fallback refresh — refreshes a 1-fps JPEG below the WebRTC
+  // <video> when the WHEP path isn't yet established.
   const [t, setT] = useState(() => Date.now());
   useEffect(() => {
     const h = setInterval(() => setT(Date.now()), 1000);
@@ -289,88 +226,27 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   const [imgOk, setImgOk] = useState(true);
   useEffect(() => { setImgOk(true); }, [id]);
 
-  // Every 10s while this tile has no working stream, bump retryTick
-  // to re-attempt both WHEP and the JPEG snapshot. Covers the common
-  // "pipeline not ready when page loaded" case — the worker comes up
-  // later and the tile picks it up automatically, no refresh needed.
-  useEffect(() => {
-    if (rtcLive && imgOk) return;
-    const h = setInterval(() => {
-      // Reset the JPEG-failed flag so the <img> re-renders and tries
-      // the latest snapshot; if it errors again, setImgOk(false) just
-      // flips us back and we wait another 10s.
-      setImgOk(true);
-      setRetryTick((v) => v + 1);
-    }, 10_000);
-    return () => clearInterval(h);
-  }, [rtcLive, imgOk]);
+  // WHEP / WebRTC plumbing + frame-stall watchdog. See useWhepStream for
+  // the gory details. We pass imgOk so the hook's 10s retry only fires
+  // when neither path is producing.
+  const { videoRef, rtcLive, tickPreview, previewTicksRef } = useWhepStream(id, { imgOk });
 
-  // Preview FPS — tracked by counting successful image loads in the last
-  // 5s. For WebRTC we register a requestVideoFrameCallback. Both feed
-  // the same displayed number ("preview fps") so the user sees the
-  // effective on-screen refresh rate regardless of which path renders.
-  const previewTicksRef = useRef<number[]>([]);
+  // Preview FPS readout for the stats overlay. tickPreview already
+  // populates the rolling window; we just sample its size every 500ms.
   const [previewFps, setPreviewFps] = useState(0);
-  const tickPreview = () => {
-    const now = Date.now();
-    previewTicksRef.current.push(now);
-    // Keep only last 5s.
-    while (previewTicksRef.current.length > 0 &&
-           now - previewTicksRef.current[0] > 5000) {
-      previewTicksRef.current.shift();
-    }
-  };
   useEffect(() => {
     const h = setInterval(() => {
-      const arr = previewTicksRef.current;
-      setPreviewFps(arr.length / 5);
+      setPreviewFps(previewTicksRef.current.length / 5);
     }, 500);
     return () => clearInterval(h);
-  }, []);
+  }, [previewTicksRef]);
 
-  // Hook rVFC for WebRTC frames when the track is live.
+  // Reset the JPEG-failed flag when the WebRTC retry kicks — gives the
+  // <img> another chance alongside the renegotiated WHEP session.
   useEffect(() => {
-    if (!rtcLive || !videoRef.current) return;
-    const v = videoRef.current as HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
-    };
-    if (!v.requestVideoFrameCallback) return;
-    let cancelled = false;
-    const step = () => {
-      if (cancelled) return;
-      tickPreview();
-      v.requestVideoFrameCallback!(step);
-    };
-    v.requestVideoFrameCallback(step);
-    return () => { cancelled = true; };
-  }, [rtcLive]);
-
-  // Frame-stall watchdog. WebRTC sessions sometimes go quiet — a
-  // brief network blip causes MediaMTX to log "reader is too slow,
-  // discarding frames", the H.264/H.265 decoder loses I-frame
-  // reference, and the <video> freezes on the last good frame.
-  // Detection events keep flowing (different transport) so the user
-  // sees the bbox overlay continue while video is stuck. The
-  // existing retryTick effect only fires when `rtcLive=false`, so
-  // the frozen-but-connected state was self-perpetuating until a
-  // manual page refresh. Bump retryTick when we haven't received a
-  // frame in 4 s — the WHEP effect tears the session down and
-  // re-negotiates, which forces MediaMTX to send a fresh keyframe
-  // from the camera's current GOP.
-  useEffect(() => {
-    if (!rtcLive) return;
-    const h = setInterval(() => {
-      const arr = previewTicksRef.current;
-      const last = arr.length > 0 ? arr[arr.length - 1] : 0;
-      if (Date.now() - last > 4000) {
-        // No frames in 4 s — re-negotiate.
-        setRtcLive(false);
-        setStreamObj(null);
-        setRetryTick((v) => v + 1);
-      }
-    }, 2000);
-    return () => clearInterval(h);
-  }, [rtcLive]);
+    if (!imgOk) setImgOk(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [/* re-trigger on every WHEP retry */ rtcLive]);
 
   const latest = detections[0];
 
@@ -388,8 +264,18 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
       }`}
     >
       <div
-        className={`relative max-w-full max-h-full ${drawing ? "cursor-crosshair" : ""}`}
+        className={`relative max-w-full max-h-full ${drawing ? "cursor-crosshair" : "cursor-zoom-in"}`}
         style={{ aspectRatio: aspect, width: aspect >= 16 / 9 ? "100%" : "auto", height: aspect < 16 / 9 ? "100%" : "auto" }}
+        onClick={
+          // Click on the video region opens the enlarged modal.
+          // Suppressed while drawing a manual label, or when a popover
+          // is up (BBox onClick, FlagPopover and ManualLabelPopover
+          // wrappers all stopPropagation already, but the popover's
+          // backdrop catches the click before it reaches us).
+          drawing || pickedDetection || pendingManualRect
+            ? undefined
+            : () => onEnlarge()
+        }
         onMouseDown={
           drawing
             ? (e) => {
@@ -522,8 +408,25 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
         )}
       </div>
 
-      <div className="absolute bottom-2 left-2 text-xs bg-black/60 px-2 py-0.5 rounded">
-        {name}
+      <div className="absolute bottom-2 left-2 flex items-center gap-1">
+        <div className="text-xs bg-black/60 px-2 py-0.5 rounded">
+          {name}
+        </div>
+        <button
+          type="button"
+          onClick={(e) => {
+            // stopPropagation so the tile-body onClick doesn't also
+            // fire — that would just open and immediately re-fire,
+            // not visibly broken but redundant.
+            e.stopPropagation();
+            onEnlarge();
+          }}
+          className="text-xs bg-black/60 hover:bg-black/80 px-2 py-0.5 rounded leading-none"
+          title="Open in enlarged view"
+          aria-label={`Enlarge ${name}`}
+        >
+          ⛶
+        </button>
       </div>
       {isAdmin && (
         <div className="absolute top-2 left-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
