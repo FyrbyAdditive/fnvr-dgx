@@ -266,20 +266,22 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
 
     // Create a 1-frame pitch-linear RGBA destination we CAN CPU-map.
     // Jetson-correct: memType=NVBUF_MEM_SURFACE_ARRAY + PITCH layout.
-    NvBufSurfaceCreateParams cp{};
-    cp.gpuId        = in_surf->gpuId;
-    cp.width        = guint(CROP_OUT_W);
-    cp.height       = guint(CROP_OUT_H);
-    cp.size         = 0;
-    cp.isContiguous = true;
-    cp.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    cp.layout       = NVBUF_LAYOUT_PITCH;
-    cp.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    NvBufSurfaceAllocateParams ap{};
+    ap.params.gpuId        = in_surf->gpuId;
+    ap.params.width        = guint(CROP_OUT_W);
+    ap.params.height       = guint(CROP_OUT_H);
+    ap.params.size         = 0;
+    ap.params.isContiguous = true;
+    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    ap.params.layout       = NVBUF_LAYOUT_PITCH;
+    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
     NvBufSurface* dst = nullptr;
-    if (NvBufSurfaceCreate(&dst, 1, &cp) != 0 || !dst) {
+    if (NvBufSurfaceAllocate(&dst, 1, &ap) != 0 || !dst) {
         gst_buffer_unmap(gst_buf, &map);
         return;
     }
+    dst->numFilled = 1;
 
     // VIC-accelerated source crop + colour-format + resize in one pass.
     NvBufSurfTransformRect src_rect {
@@ -382,20 +384,22 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
         return 0;
     }
 
-    NvBufSurfaceCreateParams cp{};
-    cp.gpuId        = in_surf->gpuId;
-    cp.width        = guint(OBJ_CROP_OUT_W);
-    cp.height       = guint(OBJ_CROP_OUT_H);
-    cp.size         = 0;
-    cp.isContiguous = true;
-    cp.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    cp.layout       = NVBUF_LAYOUT_PITCH;
-    cp.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    NvBufSurfaceAllocateParams ap{};
+    ap.params.gpuId        = in_surf->gpuId;
+    ap.params.width        = guint(OBJ_CROP_OUT_W);
+    ap.params.height       = guint(OBJ_CROP_OUT_H);
+    ap.params.size         = 0;
+    ap.params.isContiguous = true;
+    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    ap.params.layout       = NVBUF_LAYOUT_PITCH;
+    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
     NvBufSurface* dst = nullptr;
-    if (NvBufSurfaceCreate(&dst, 1, &cp) != 0 || !dst) {
+    if (NvBufSurfaceAllocate(&dst, 1, &ap) != 0 || !dst) {
         gst_buffer_unmap(gst_buf, &map);
         return 0;
     }
+    dst->numFilled = 1;
 
     NvBufSurfTransformRect src_rect {
         guint(py), guint(px), guint(pw_px), guint(ph_px)

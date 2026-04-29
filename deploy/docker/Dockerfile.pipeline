@@ -277,6 +277,7 @@ WORKDIR /src/apps/pipeline-supervisor
 RUN set -eux; \
     printf '%s\n' \
       'int NvBufSurfaceCreate(void**a,unsigned b,void*c){(void)a;(void)b;(void)c;return -1;}' \
+      'int NvBufSurfaceAllocate(void**a,unsigned b,void*c){(void)a;(void)b;(void)c;return -1;}' \
       'int NvBufSurfaceDestroy(void*a){(void)a;return -1;}' \
       'int NvBufSurfaceMap(void*a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return -1;}' \
       'int NvBufSurfaceUnMap(void*a,int b,int c){(void)a;(void)b;(void)c;return -1;}' \

@@ -139,20 +139,22 @@ LetterboxMap computeLetterbox(int src_w, int src_h) {
 bool ensureDstSurface(HailoProbeCtx* ctx, NvBufSurface* in_surf) {
     if (ctx->dst_surf) return true;
 
-    NvBufSurfaceCreateParams cp{};
-    cp.gpuId        = in_surf->gpuId;
-    cp.width        = HailoInference::kInputWidth;
-    cp.height       = HailoInference::kInputHeight;
-    cp.size         = 0;
-    cp.isContiguous = true;
-    cp.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    cp.layout       = NVBUF_LAYOUT_PITCH;
-    cp.memType      = NVBUF_MEM_SURFACE_ARRAY;
-    if (NvBufSurfaceCreate(&ctx->dst_surf, 1, &cp) != 0 || !ctx->dst_surf) {
-        std::cerr << "hailo_probe: NvBufSurfaceCreate failed\n";
+    NvBufSurfaceAllocateParams ap{};
+    ap.params.gpuId        = in_surf->gpuId;
+    ap.params.width        = HailoInference::kInputWidth;
+    ap.params.height       = HailoInference::kInputHeight;
+    ap.params.size         = 0;
+    ap.params.isContiguous = true;
+    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    ap.params.layout       = NVBUF_LAYOUT_PITCH;
+    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
+    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
+    if (NvBufSurfaceAllocate(&ctx->dst_surf, 1, &ap) != 0 || !ctx->dst_surf) {
+        std::cerr << "hailo_probe: NvBufSurfaceAllocate failed\n";
         ctx->dst_surf = nullptr;
         return false;
     }
+    ctx->dst_surf->numFilled = 1;
     return true;
 }
 
