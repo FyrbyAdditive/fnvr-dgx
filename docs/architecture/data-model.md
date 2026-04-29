@@ -11,7 +11,7 @@ A condensed reference. The source of truth is [apps/api-server/internal/db/migra
 | `rules` | JSONB `definition` stores both single-camera + sequence rule shapes. | — |
 | `incidents` | Rule / hotlist / face / drift hits. `camera_id` and `rule_id` both nullable. | soft FK to `rules`, `cameras` (ON DELETE CASCADE) |
 | `detections` | Every per-frame hit; `kind ∈ object/anpr/face`. `attributes` JSONB carries plate/person/similarity/embedding. | `camera_id` → `cameras` |
-| `segments` | Hourly `rec.mp4` index with bytes/duration/protected/tier. | `camera_id` → `cameras` |
+| `segments` | Index of MediaMTX-recorded fMP4 chunks (path, bytes, duration, protected, tier). | `camera_id` → `cameras` |
 | `persons` | Enrolled face identities. | — |
 | `face_embeddings` | 512-d pgvector rows with `source` + optional `detection_id`. | `person_id` → `persons` |
 | `face_dismissals` | Flagged negatives; `reason ∈ not_a_face, duplicate, deleted, enrolled`. Only the first two feed the matcher's negative-penalty. | — |
@@ -24,6 +24,8 @@ A condensed reference. The source of truth is [apps/api-server/internal/db/migra
 | `fine_tune_jobs` | Reserved for the TAO training loop (not yet populated). | — |
 
 The migrations are append-only and numbered 0001–0023+. Never rewrite a committed migration.
+
+Server- and client-side postgres tuning (compose `command:` flags + per-service pgxpool sizing) is in [operations/postgres-tuning.md](../operations/postgres-tuning.md). The defaults shipped in `docker-compose.yml` target an Orin AGX-class host (32 GB RAM, NVMe).
 
 ## NATS subjects
 
@@ -39,7 +41,7 @@ Detections + incidents + system state move on NATS; jobs + heartbeats live in sp
 | `fnvr.state.pipeline` | pipeline-supervisor | api-server | `{state}` — parent-process level. |
 | `fnvr.alerts.drift` | ml-worker | event-processor | `{at, baseline, current, delta}`. |
 | `fnvr.models.faceid.reload` | ml-worker | pipeline | Empty; tells pipeline to re-read `arcface.onnx`. |
-| `fnvr.whep.registry` | pipeline | api-server | `{camera_id, port}` on WHEP server bind. |
+| `fnvr.system.pipeline.restart` | api-server | pipeline-supervisor | Empty payload; triggers a clean container restart on settings change. |
 
 ## Prometheus metrics
 

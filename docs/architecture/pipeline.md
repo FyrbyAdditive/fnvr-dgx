@@ -5,30 +5,31 @@ The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A 
 ## Per-camera GStreamer graph
 
 ```
-  uridecodebin (RTSP / MediaMTX-proxied USB)
-    → h264parse (or h265parse, codec-autodetected by ffprobe)
+  rtspsrc (camera RTSP)
+    → rtp{h264,h265}depay
+    → {h264,h265}parse  (codec auto-detected by an ffprobe preamble)
     → tee
-        ├─ nvv4l2decoder → nvstreammux (batch 1)
-        │                → nvinfer  pgie   (yolo26 detector)
-        │                → nvtracker  (NvDCF, IDs + bbox smoothing)
-        │                → nvinfer  lpdnet (plate detector SGIE, optional)
-        │                → nvinfer  lprnet (plate OCR SGIE, optional)
-        │                → nvinfer  scrfd  (face detector SGIE, optional)
-        │                → nvinfer  arcface (face embedder SGIE, optional)
-        │                → nvvideoconvert
-        │                → nvv4l2h264enc
-        │                → h264parse → qtmux
-        │                → filesink  (hourly-rotated rec.mp4)
-        ├─ videorate → jpegenc → multifilesink (low-fps JPEG preview ring)
-        └─ rtph264pay → tee + fakesink   (WHEP subscribers tap in here)
+        ├─ queue → nvv4l2decoder → nvstreammux (batch 1)
+        │                        → nvinfer  pgie   (yolo26 / hailo-broker detector)
+        │                        → nvtracker  (NvDCF, IDs + bbox smoothing)
+        │                        → nvinfer  lpdnet  (plate detector SGIE, optional)
+        │                        → nvinfer  lprnet  (plate OCR SGIE, optional)
+        │                        → nvinfer  scrfd   (face detector SGIE, optional)
+        │                        → nvinfer  arcface (face embedder SGIE, optional)
+        │                        → fakesink                                (probe taps here)
+        ├─ queue → h264parse → nvv4l2decoder → nvvideoconvert
+        │       → videoscale → videorate → jpegenc → multifilesink         (480×270 @ 1 fps preview ring)
+        └─ queue → {h264,h265}parse config-interval=-1
+                → rtspclientsink → rtsp://mediamtx:8554/live_<cam>          (RECORD + WebRTC)
 ```
 
-Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp). Codec auto-detection — so H.264 *and* H.265 sources both work — is in `pipeline.cpp`'s preamble via a small `ffprobe` run before the pipeline is built.
+Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp). The codec auto-detection runs once before the pipeline is built, so H.264 *and* H.265 sources both work without configuration.
 
 Per-camera choices baked into the graph:
-- **Codec.** Recording is always H.264 regardless of source, so the browser can play segments back natively (no decoded-via-WASM fallback). H.265 sources are transcoded once in the pipeline on the NVENC.
+- **Codec passthrough.** The recording branch pushes the source elementary stream into MediaMTX unchanged. We do **not** transcode H.265 → H.264 anymore — saves ~40% NVENC and lets MediaMTX hand the same elementary stream to both fMP4 recording and the WebRTC live view.
+- **MediaMTX as the media hub.** A single `mediamtx` sidecar terminates the supervisor's `rtspclientsink` push, persists fMP4 segments to disk via its built-in recorder, and serves WebRTC live (`:8889`) and chunked fMP4 playback (`:9996`) directly to the browser. The api-server is no longer in the media path — see [data-model.md](data-model.md) for the URL surface.
 - **Aspect ratio.** Preserved end-to-end; the live mosaic tiles letterbox non-16:9 cameras rather than stretching.
-- **USB cameras** come in via a `mediamtx` sidecar that re-publishes a V4L2 webcam as RTSP on the internal docker network, so the pipeline code path is the same for USB and IP cameras.
+- **USB cameras** come in via the same `mediamtx` sidecar (a `usb-bridge` profile re-publishes the V4L2 source as RTSP), so the pipeline code path is identical for USB and IP cameras.
 
 ## Detections → NATS
 
@@ -38,9 +39,16 @@ The probe does NOT query the DB. Person labels are resolved afterwards in [event
 
 A thumbnail JPEG is cropped directly on the GPU via `NvBufSurfTransform` for every face detection and written to `/var/lib/fnvr/thumbs/faces/<detection-event-id>.jpg`. Event-processor renames this on insert to `<pg-detection-id>.jpg` so the thumbnail URL is stable.
 
-## WHEP live view
+## Live view + playback (via MediaMTX)
 
-The RTP tee output feeds a small WHEP server bound to a random port per camera. The api-server's `whep.Registry` ([camera/state.go](../../apps/api-server/internal/whep/registry.go)) tracks port → camera and proxies the browser's SDP offer. No media flows through the api-server — it's pure signaling.
+The browser talks **directly** to MediaMTX, not through the api-server. Two endpoints on the docker host's LAN:
+
+- **Live (WebRTC).** `https://<host>:8889/live_<camera_id>/whep` — browser issues a WHEP `POST` with its SDP offer; MediaMTX answers, the camera stream flows over a peer connection. CORS is open to private LAN ranges; ICE candidates advertise the host's LAN IP via `webrtcAdditionalHosts` in [deploy/config/mediamtx.yml](../../deploy/config/mediamtx.yml).
+- **Timeline playback.** `https://<host>:9996/get?path=live_<camera>&start=<ts>&duration=<sec>` — chunked fMP4 streaming from the on-disk recordings MediaMTX persisted while the camera was live.
+
+There is **no WHEP server inside the supervisor anymore**. The dead bind-and-proxy code path was removed in commit `5eac780`; api-server's old `/api/v1/whep/*` routes and the C++ `whep_server.cpp` are gone.
+
+Per-browser playback loaders live in [apps/web/src/routes/timeline/Timeline.tsx](../../apps/web/src/routes/timeline/Timeline.tsx) — Chrome uses native `<video src>`, Firefox uses MSE (chunked-without-Range support is patchy), Safari fetches the whole window into a Blob (it refuses the streaming 200 responses MediaMTX returns without a `Range` header).
 
 ## Camera health heartbeat
 
@@ -75,6 +83,15 @@ The rotation is **silent** from the UI's perspective:
 Log trail: `docker logs fnvr-pipeline-1 | grep rotation` yields lines of the form `worker[<id>]: hourly rotation — rolled (silent; prior state retained) pid N`. If you see `hourly rotation — restarting pid N` instead, that's the pre-silent-rotation log format and the build is out of date.
 
 A genuine `Start()` failure during rotation still publishes `{"state":"failed"}` — a busted rotation flips the UI red as it should.
+
+## Detector backends: TRT vs Hailo
+
+The pgie can be either NVIDIA's `nvinfer` (TensorRT engine on GPU/DLA) or a Hailo-8 accelerator. The choice is per-camera (`cameras.detector_backend = trt | hailo`) and changes which probe is attached after the tracker:
+
+- **TRT path.** `nvinfer` runs the engine in-process. Detection metadata appears as `NvDsObjectMeta` and the standard probe walks it.
+- **Hailo path.** The pipeline reads decoded NV12 frames out of the buffer, hands them via VIC-accelerated NV12→RGBA transform (see [hailo_probe.cpp](../../apps/pipeline-supervisor/src/hailo_probe.cpp)) to `apps/hailo-broker/` over a unix socket at `/var/run/fnvr/hailo.sock`. The broker is a separate container that owns `/dev/hailo0` exclusively; the supervisor has zero hailort dependency. Compose overlay [docker-compose.hailo.yml](../../deploy/docker/docker-compose.hailo.yml) wires up the shared `fnvr-hailo-sock` named volume.
+
+The broker exists because `libhailort` 4.23's multi-process service (`run_async`) is unstable when several worker processes hammer the same `ConfiguredInferModel`. One broker, many supervisor children. See `apps/hailo-broker/wire.h` for the request/response framing and the in-broker batching policy (up to 4 frames per `hailort` call).
 
 ## First-run engine compilation
 
@@ -112,7 +129,7 @@ Three independent failure-detection paths in each worker. All converge on `std::
 
 1. **Startup PLAYING watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp) `stop_watcher` thread). Faults and publishes `failed` if the pipeline hasn't reached `GST_STATE_PLAYING` within 60 s of `Start()`. Catches `rtspsrc` SETUP hangs that `tcp-timeout=15s` doesn't catch.
 2. **Bus error** ([pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `BusHandler`). On any `GST_MESSAGE_ERROR` or `GST_MESSAGE_EOS`, publishes `failed` and hard-exits. Does **not** call `gst_element_set_state(NULL)` — that path blocked the process for 37 min once when an NvMedia element was wedged. Respawn is faster than graceful shutdown anyway, and a broken pipeline has nothing worth draining.
-3. **Data-flow watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp) `flow_watchdog` thread + [pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `AttachFlowCounter`). A pad probe on the record-branch `h264parse` (`recparse`) bumps an atomic counter on every buffer; the watchdog samples every 5 s and hard-exits if the counter hasn't advanced in 20 s while the pipeline is `PLAYING`. Catches silent stalls — the case where the bus never fires ERROR because the wedge is inside an NVIDIA library syscall.
+3. **Data-flow watchdog (currently disabled).** A pad-probe-driven flow counter (see `buffersPassed_` in [pipeline.h](../../apps/pipeline-supervisor/src/pipeline.h)) is preserved in the source. It used to bump on the record-branch `h264parse` and the [main.cpp](../../apps/pipeline-supervisor/src/main.cpp) flow-watchdog thread sampled it every 5 s, hard-exiting on a 20 s stall. The probe target element (`recparse`) was removed when the recording branch moved to `rtspclientsink → MediaMTX`. The counter is kept because it's the only path that catches silent stalls (the bus never fires ERROR when the wedge is inside an NVIDIA library syscall); it needs re-pointing at a still-flowing pad such as `tracker.src` or the rtspclientsink request pad before the watchdog thread can be re-enabled.
 
 Log trail (look for these in `docker logs fnvr-pipeline-1 | grep worker`):
 - `worker[X]: did not reach PLAYING within 60s — faulting` — startup watchdog

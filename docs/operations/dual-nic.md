@@ -88,7 +88,7 @@ What the override does:
 | `web`      | `0.0.0.0:8080:80`    | `FNVR_USER_NIC_IP:8080:80`          |
 | `api`      | `0.0.0.0:8081:8081`  | `FNVR_USER_NIC_IP:8081:8081`        |
 | `nats`     | `0.0.0.0:4222`, `0.0.0.0:8222` | `4222` withdrawn · `8222` on user NIC |
-| `mediamtx` | `0.0.0.0:8554`, `0.0.0.0:8889` | withdrawn (both) — usb-bridge + pipeline reach it via docker DNS |
+| `mediamtx` | `0.0.0.0:8554`, `0.0.0.0:8889`, `0.0.0.0:9996` | `8554` withdrawn (internal only); `8889` (WebRTC/WHEP) + `9996` (chunked fMP4 playback) bound to user NIC so the browser can reach them directly |
 
 `postgres`, `events`, `storage`, `notifications`, `pipeline`, and
 `usb-bridge` were never host-exposed; the override doesn't need to
@@ -144,16 +144,14 @@ sudo docker exec fnvr-pipeline-1 getent hosts postgres
 
 ## Known risks
 
-**WebRTC ICE on dual NICs.** `webrtcbin` inside the pipeline container
-advertises SDP candidates using the container's docker-bridge address
-(typically `172.x.x.x`). Browsers on the user LAN reach those via
-docker's NAT today, which works in single-NIC setups and should still
-work here since the docker bridge is the same. If ICE negotiation
-fails in your environment, fixing it properly means either exposing
-WHEP viewer ports through the api proxy (already the case) plus
-candidate rewriting, or running the pipeline with `network_mode: host`
-(heavier, see non-goals). File an issue with your topology if you hit
-it.
+**WebRTC ICE on dual NICs.** MediaMTX (not the pipeline) terminates
+WebRTC, and its `webrtcAdditionalHosts` env var (in
+[deploy/docker/docker-compose.yml](../../deploy/docker/docker-compose.yml))
+advertises the **host's user-NIC LAN IP** as an extra ICE candidate so
+browsers can reach the stream. If your user-NIC IP isn't in the value
+of `MTX_WEBRTCADDITIONALHOSTS`, ICE will fail; set it to the same value
+as `FNVR_USER_NIC_IP`. The pipeline-supervisor never advertises ICE
+candidates itself — it's a media producer, not a WebRTC peer.
 
 ## Non-goals
 

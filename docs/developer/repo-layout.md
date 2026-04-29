@@ -10,24 +10,27 @@ Monorepo. One Taskfile + one docker-compose, every service is its own directory.
 │   │   ├── internal/
 │   │   │   ├── auth/            # sessions, tokens, RBAC, middleware
 │   │   │   ├── calibration/     # INT8 frame sampler (see known-issues.md)
-│   │   │   ├── camera/          # CRUD + state tracker + whep registry
+│   │   │   ├── camera/          # CRUD + JetStream-backed state tracker
+│   │   │   ├── classes/         # editable detection-class taxonomy (YOLO 80 default)
 │   │   │   ├── config/          # envOr-based Config + DataDir
 │   │   │   ├── db/migrations/   # goose migrations — NEVER rewrite a landed migration
 │   │   │   ├── detections/      # detections store + SSE event bus
 │   │   │   ├── events/          # NATS subject bus + SSE fanout
+│   │   │   ├── flags/           # operator-flagged false-positive labels
+│   │   │   ├── health/          # /health + /readyz
 │   │   │   ├── metrics/         # Prometheus wrappers + middleware
 │   │   │   ├── mlworker/        # HTTP client for ml-worker sidecar
+│   │   │   ├── mtxproxy/        # MediaMTX path reconciler (re-mux toggle)
 │   │   │   ├── notifications/   # channels + subscriptions store
 │   │   │   ├── persons/         # face embeddings + clusters + erasure
 │   │   │   ├── pipeline/        # pipeline state + grpc-ish client
 │   │   │   ├── plates/          # plate hotlist + recent search
 │   │   │   ├── rules/           # rules + zones + incidents store
-│   │   │   ├── segments/        # segment index + range-streamed playback
+│   │   │   ├── segments/        # segment index from MediaMTX recordings
 │   │   │   ├── server/          # all HTTP handlers here; one file per concern
 │   │   │   ├── settings/        # key/value store + typed helpers
 │   │   │   ├── snapshot/        # live-JPEG snapshots + face thumbnails
-│   │   │   ├── system/          # /system/info, /system/storage, disk stats
-│   │   │   └── whep/            # WHEP offer proxy to pipeline
+│   │   │   └── system/          # /system/info, /system/storage, disk stats
 │   │   └── README.md
 │   │
 │   ├── event-processor/         # Go: rules engine, face matcher, drift subscriber
@@ -54,11 +57,23 @@ Monorepo. One Taskfile + one docker-compose, every service is its own directory.
 │   ├── pipeline-supervisor/     # C++ / DeepStream
 │   │   ├── CMakeLists.txt
 │   │   └── src/
-│   │       ├── main.cpp         # parent supervisor + per-worker launch
-│   │       ├── pipeline.cpp     # per-camera GStreamer graph
-│   │       ├── face_crop_jpeg.* # GPU crop + libjpeg-turbo encode (separate TU)
-│   │       ├── nats_publisher.* # hardened NATS wrapper (see pipeline.md)
-│   │       └── config.*         # YAML config
+│   │       ├── main.cpp           # parent supervisor + per-worker launch
+│   │       ├── pipeline.cpp       # per-camera GStreamer graph
+│   │       ├── face_crop_jpeg.*   # GPU crop + libjpeg-turbo encode (separate TU)
+│   │       ├── object_phash.*     # perceptual hash for detection dedup
+│   │       ├── hailo_probe.*      # tracker-output probe → hailo-broker socket
+│   │       ├── hailo_inference.*  # broker client (wire.h protocol)
+│   │       ├── rtsp_probe.*       # codec auto-detection preamble
+│   │       ├── db_reconciler.*    # libpq camera-config sync
+│   │       ├── nats_publisher.*   # hardened NATS wrapper (see pipeline.md)
+│   │       └── config.*           # YAML config
+│   │
+│   ├── hailo-broker/            # C++: owns /dev/hailo0, serves unix-socket inference RPC
+│   │   ├── CMakeLists.txt
+│   │   └── src/
+│   │       ├── main.cpp
+│   │       ├── hailo_inference.* # libhailort wrapper, batch-of-4 policy
+│   │       └── wire.h            # request/response framing
 │   │
 │   ├── storage-manager/         # Go: retention / quota / disk-pressure
 │   │   └── internal/lifecycle/lifecycle.go
@@ -87,14 +102,15 @@ Monorepo. One Taskfile + one docker-compose, every service is its own directory.
 │
 ├── deploy/
 │   ├── docker/
-│   │   ├── Dockerfile.{api,events,ml,notifications,pipeline,storage,web}
-│   │   ├── docker-compose.yml              # default single-NIC
-│   │   ├── docker-compose.dual-nic.yml     # optional overlay
+│   │   ├── Dockerfile.{api,events,ml,notifications,pipeline,hailo-broker,storage,web}
+│   │   ├── docker-compose.yml              # default stack (postgres tuning lives here)
+│   │   ├── docker-compose.hailo.yml        # adds hailo-broker + /var/run/fnvr socket mount
+│   │   ├── docker-compose.dual-nic.yml     # optional overlay for camera-LAN isolation
 │   │   ├── pipeline-entrypoint.sh          # TRT + libv4l shim + INT8 fallback
 │   │   ├── calibrate-yolo26.sh             # offline trtexec driver
-│   │   └── nginx.conf                      # web container's proxy
+│   │   └── nginx.conf                      # web container's proxy (api only — media is direct)
 │   └── config/
-│       ├── fnvr.sample.yaml
+│       ├── fnvr.sample.yaml                # MediaMTX config lives inline in docker-compose.yml as env vars
 │       └── nvinfer/                        # DeepStream nvinfer configs
 │           ├── yolo26.txt  arcface.txt  scrfd.txt  lpdnet.txt  lprnet.txt
 │           └── tracker_NvDCF.yml

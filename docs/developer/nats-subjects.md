@@ -97,12 +97,6 @@ Past the window, the tracker returns `unknown`, though `StateDetail()` still ret
 - **Consumer:** pipeline (when wired — currently a no-op since TAO training isn't shipped).
 - **Payload:** `{}`.
 
-## `fnvr.whep.registry`
-
-- **Producer:** pipeline worker when the WHEP server binds its port.
-- **Consumer:** api-server `whep.Registry`.
-- **Payload:** `{camera_id, port}` — the port is dynamic per worker.
-
 ## Connection naming
 
 Services set `nats.Name("fnvr-<service>[-<role>]")` so the NATS monitor (`http://nats:8222/connz`) clearly shows who's who. The pipeline's nats-c client doesn't set a name — those show as "(no name)" in connz. Not a bug, just a client-library gap.
@@ -110,5 +104,5 @@ Services set `nats.Name("fnvr-<service>[-<role>]")` so the NATS monitor (`http:/
 ## What's NOT on NATS
 
 - **HTTP requests from the web.** Go via api-server, Postgres + the event bus, not NATS.
-- **WHEP media.** The port + SDP negotiation are served direct from pipeline; api-server is pure SDP proxy.
-- **Recordings.** File writes only; no NATS event per written frame.
+- **WebRTC live + fMP4 playback.** Browser talks directly to MediaMTX on `:8889/whep` and `:9996/get`; api-server isn't in the media path at all.
+- **Recordings.** Written by MediaMTX's built-in recorder; no NATS event per written frame.

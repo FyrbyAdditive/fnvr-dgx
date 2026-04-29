@@ -13,7 +13,7 @@
 ### Architecture
 
 - [Overview](architecture/README.md) — services, data flow, who talks to whom.
-- [Pipeline](architecture/pipeline.md) — DeepStream graph, WHEP live view, detection publish.
+- [Pipeline](architecture/pipeline.md) — DeepStream graph, MediaMTX live + recording, Hailo broker, detection publish.
 - [Rules engine](architecture/rules-engine.md) — zones, tripwires, schedules, cooldowns, cross-camera sequence rules, incident threading.
 - [Storage](architecture/storage.md) — segment rotation, per-camera retention + quota, disk-pressure purge.
 - [Face-ID](architecture/face-id.md) — detector + embedder models, matcher algorithm, drift detection.
@@ -25,6 +25,7 @@
 - [Install on Jetson](operations/install.md) — host prep, compose up, adding the first camera.
 - [Settings reference](operations/settings.md) — every `settings` row, what it does, safe ranges.
 - [Storage management](operations/storage-management.md) — Storage page, retention, quota, disk-pressure floor.
+- [PostgreSQL tuning](operations/postgres-tuning.md) — server-side settings we override and why; per-service pgxpool sizing.
 - [Face-ID guide](operations/face-id.md) — enrol people, tune the matcher, read the drift pill, clean up an enrolment pool.
 - [Object false-positive flags](operations/false-positive-flags.md) — flag wrong detections on Live, tune suppression, curate the YOLO dataset for future training.
 - [Upgrades](operations/upgrade.md) — `docker compose pull`, what migrations do.

@@ -20,6 +20,35 @@ services:
       POSTGRES_DB: fnvr
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    # Tuning targets an Orin AGX-class host (32 GB RAM, NVMe). Numbers are
+    # conservative — the Orin has plenty of headroom and our workload is
+    # detection inserts + JSONB scans + segment housekeeping. Stock pg16
+    # defaults (shared_buffers=128MB, work_mem=4MB, NVMe-naive page costs)
+    # leave most of the box on the table. If you deploy on a smaller host,
+    # halve shared_buffers / effective_cache_size and drop work_mem to 16MB.
+    # See docs/operations/postgres-tuning.md.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "effective_cache_size=8GB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "default_statistics_target=200"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fnvr -d fnvr"]
       interval: 5s

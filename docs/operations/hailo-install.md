@@ -85,6 +85,16 @@ driver ABI and container userspace stay in lockstep: a driver-userspace
 version mismatch surfaces as silent `VDevice::create()` failures in the
 500-range status codes.
 
+> **Always pass `-f docker-compose.hailo.yml` to every `compose` invocation
+> that rebuilds or recreates the pipeline.** The overlay is what attaches
+> the `fnvr-hailo-sock` shared volume that holds `/var/run/fnvr/hailo.sock`.
+> If you `docker compose up -d pipeline` with only the base `docker-compose.yml`,
+> the new container has no socket mount, every Hailo-backed worker fails
+> inference setup, and the supervisor respawns each one every ~30 s.
+> Symptom: cameras keep restarting in the UI, dmesg quiet, pipeline logs
+> repeating `hailo-client: connect(/var/run/fnvr/hailo.sock): No such file
+> or directory`. Fix: re-up with both compose files.
+
 ## Flip a camera to Hailo
 
 Settings → Cameras → expand a camera row → "Backend" dropdown → select

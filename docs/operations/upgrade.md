@@ -8,8 +8,14 @@ Single command, zero downtime for the web / API layer; pipeline restarts once.
 cd ~/fnvr
 git pull                              # or git fetch && git checkout <tag>
 cd deploy/docker
+
+# Without Hailo:
 sudo docker compose pull
 sudo docker compose up -d
+
+# With Hailo: ALWAYS include the overlay or the pipeline loses /var/run/fnvr/hailo.sock.
+sudo docker compose -f docker-compose.yml -f docker-compose.hailo.yml pull
+sudo docker compose -f docker-compose.yml -f docker-compose.hailo.yml up -d
 ```
 
 What happens:
@@ -28,7 +34,16 @@ Migrations are additive and numbered. Recent ones:
 - **0022** — `storage.min_free_pct` seeded.
 - **0023** — `incidents.camera_id` dropped NOT NULL (system-scope incidents).
 
-Applying is automatic on api-server start. If one fails, api-server exits non-zero; compose will try to restart, fail again, and you'll see the error in the logs. Don't force it — look at the log, fix whatever the migration found (usually a data assumption that doesn't hold on that install), then retry.
+Applying is automatic on api-server start.
+
+## Postgres config changes
+
+When `docker-compose.yml` changes the `postgres` service's `command:`
+flags (tuning knobs documented in [postgres-tuning.md](postgres-tuning.md)),
+`docker compose up -d` recreates the container, which means a brief
+postgres restart. api-server / event-processor / storage-manager all
+reconnect automatically through their pgxpool. Plan for ~5 seconds of
+"db: connect failed" log noise; nothing else needs your attention. If one fails, api-server exits non-zero; compose will try to restart, fail again, and you'll see the error in the logs. Don't force it — look at the log, fix whatever the migration found (usually a data assumption that doesn't hold on that install), then retry.
 
 Rollback: goose can go down one step via `goose -dir … down`, but the rollbacks are only known-safe for clean data. The `Down` block in migration 0023, for instance, fails if any `incidents` row has a NULL `camera_id` — intentional, so we don't silently lose system-scope incidents on downgrade.
 

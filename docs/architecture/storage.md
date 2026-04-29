@@ -1,8 +1,10 @@
 # Storage
 
+**Recordings are written by MediaMTX, not by the supervisor.** Each pipeline worker pushes its source elementary stream (H.264 or H.265) into the `mediamtx` sidecar via `rtspclientsink`, and MediaMTX's built-in recorder fragments it into fMP4 chunks on disk. The supervisor never touches the recording filesystem.
+
 The storage-manager ([apps/storage-manager/internal/lifecycle/lifecycle.go](../../apps/storage-manager/internal/lifecycle/lifecycle.go)) is the only service that deletes recordings. It runs a 30 s tick with four passes:
 
-1. **Index new segments.** Walk `/var/lib/fnvr/recordings/YYYY/MM/DD/HH/<camera>/rec*.mp4` and upsert into `segments`. File size / mtime are refreshed on every tick so an open recording's row stays current.
+1. **Index new segments.** Walk `/var/lib/fnvr/recordings/<camera>/YYYY-MM-DD_HH-MM-SS-NNN.mp4` (MediaMTX's default `recordPath` template) and upsert into `segments`. File size / mtime are refreshed on every tick so an open recording's row stays current.
 2. **Apply retention.** Drop segments older than their camera's `retention_days`, unless `protected=TRUE`.
 3. **Apply quota.** For any camera whose `SUM(bytes) > quota_gb × 1 GB`, drop oldest unprotected segments until under.
 4. **Apply disk pressure.** If free disk falls below `settings.storage.min_free_pct` (default 10%), drop oldest unprotected segments across all cameras, 20 at a time, re-checking after each batch. Caps at 500 rows per tick.
@@ -13,15 +15,15 @@ Detection hot-table pruning also runs here — `settings.detections_hot_hours` (
 
 ```
 /var/lib/fnvr/recordings/
-  2026/04/21/08/                # YYYY/MM/DD/HH
-    house-back/rec.mp4          # hourly rotation; mp4mux + filesink
-    house-side/rec.mp4
-    makershop/rec.mp4
+  house-back/                              # one dir per MediaMTX path == per camera
+    2026-04-29_08-00-00-000.mp4            # fMP4, codec from source (h264 or h265)
+    2026-04-29_09-00-00-000.mp4            # rotated by recordSegmentDuration
+    ...
 ```
 
-One growing `rec.mp4` per camera per hour, H.264-encoded regardless of source codec, so the browser plays it back natively via `<video>` + Range requests. `mp4mux + filesink` writes the `moov` atom at ~1 s intervals so partial files are playable while the pipeline is still recording.
+fMP4 not progressive MP4 — the `moov` is at the front and segments are seekable mid-write, which is what makes timeline scrubbing work even on a still-recording file. Codec is whatever the camera sends; we no longer transcode H.265 → H.264, since MediaMTX's `/get` endpoint streams the elementary track to the browser directly and Chrome / Firefox / Safari all handle H.265 in fragmented MP4 (with per-browser loader quirks documented in [pipeline.md](pipeline.md)).
 
-Older layouts (`seg-NNNNN.mp4`) are also recognised by the segmenter's regex — pre-hourly-rotation recordings continue to work.
+Older layouts produced by the previous `mp4mux + filesink` path (`YYYY/MM/DD/HH/<camera>/rec.mp4`) are also recognised by the segmenter's regex — pre-MediaMTX recordings continue to be indexed and purged correctly until they age out.
 
 ## Schema
 

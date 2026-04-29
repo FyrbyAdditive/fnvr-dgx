@@ -36,7 +36,13 @@ type Dispatcher struct {
 }
 
 func New(ctx context.Context, cfg Config) (*Dispatcher, error) {
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	pcfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("pg parse: %w", err)
+	}
+	pcfg.MaxConns = 8
+	pcfg.MinConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		return nil, fmt.Errorf("pg: %w", err)
 	}
