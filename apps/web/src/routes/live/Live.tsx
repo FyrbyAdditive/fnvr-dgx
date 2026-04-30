@@ -6,7 +6,7 @@ import { useRecentDetections, DetectionEvent } from "@/lib/events";
 import { useMe } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
 import { CameraDetectorChips } from "@/components/CameraDetectorChips";
-import { useWhepStream } from "./useWhepStream";
+import { CameraContent } from "./CameraContent";
 import { EnlargedCameraModal } from "./EnlargedCameraModal";
 
 export function Live() {
@@ -156,6 +156,12 @@ export function Live() {
         <EnlargedCameraModal
           cameraId={enlargedCam.id}
           cameraName={enlargedCam.name}
+          enabled={enlargedCam.enabled}
+          enabledDetectors={enlargedCam.enabled_detectors ?? []}
+          state={enlargedCam.state}
+          lastHeartbeatAt={enlargedCam.last_heartbeat_at ?? null}
+          detections={boxesByCamera.get(enlargedCam.id) ?? []}
+          isAdmin={isAdmin}
           onClose={() => setEnlargedCamId(null)}
         />
       )}
@@ -177,31 +183,6 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
   isAdmin: boolean;
   onEnlarge: () => void;
 }) {
-  // Flag-popover state. `pickedDetection` is the detection the
-  // operator clicked on; `pickedFrozenBoxes` is the snapshot of boxes
-  // at the moment of click so the grid stops flickering behind the
-  // popover. Clicking outside or hitting escape resumes live.
-  const [pickedDetection, setPickedDetection] = useState<DetectionEvent | null>(null);
-  const [pickedFrozenBoxes, setPickedFrozenBoxes] = useState<DetectionEvent[] | null>(null);
-
-  // Manual-label drawer state. When `drawing` is true the tile is in
-  // "draw a box" mode: cursor=crosshair, mousedown→mousemove→mouseup
-  // tracks `drawnRect` in normalised tile coordinates. After mouseup
-  // a class picker pops over the box; on submission we POST to
-  // /api/v1/flags/manual to land a YOLO training row.
-  const [drawing, setDrawing] = useState(false);
-  const [drawnRect, setDrawnRect] = useState<
-    { x: number; y: number; w: number; h: number } | null
-  >(null);
-  const [drawingDragStart, setDrawingDragStart] = useState<
-    { x: number; y: number } | null
-  >(null);
-  // Once the user releases the mouse with a non-degenerate rect, the
-  // popover comes up to choose a class. Setting this back to null on
-  // submit / cancel returns the tile to live.
-  const [pendingManualRect, setPendingManualRect] = useState<
-    { x: number; y: number; w: number; h: number } | null
-  >(null);
   // When opened from Timeline's "now" click, scroll this tile into
   // view and run a short highlight animation so the user sees where
   // they landed without hunting the grid.
@@ -214,47 +195,16 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
     const t = setTimeout(() => setHighlight(false), 2500);
     return () => clearTimeout(t);
   }, [focus]);
-  // Snapshot fallback refresh — refreshes a 1-fps JPEG below the WebRTC
-  // <video> when the WHEP path isn't yet established.
-  const [t, setT] = useState(() => Date.now());
-  useEffect(() => {
-    const h = setInterval(() => setT(Date.now()), 1000);
-    return () => clearInterval(h);
-  }, []);
-  const src = `/api/v1/cameras/${encodeURIComponent(id)}/snapshot.jpg?t=${t}`;
 
-  const [imgOk, setImgOk] = useState(true);
-  useEffect(() => { setImgOk(true); }, [id]);
+  // Manual-label drawer toggle. The CameraContent below handles the
+  // mousedown→mouseup math; we just own the on/off button up here.
+  const [drawing, setDrawing] = useState(false);
 
-  // WHEP / WebRTC plumbing + frame-stall watchdog. See useWhepStream for
-  // the gory details. We pass imgOk so the hook's 10s retry only fires
-  // when neither path is producing.
-  const { videoRef, rtcLive, tickPreview, previewTicksRef } = useWhepStream(id, { imgOk });
-
-  // Preview FPS readout for the stats overlay. tickPreview already
-  // populates the rolling window; we just sample its size every 500ms.
+  // Stats overlay — CameraContent samples its own preview-FPS and
+  // pushes via the callback.
   const [previewFps, setPreviewFps] = useState(0);
-  useEffect(() => {
-    const h = setInterval(() => {
-      setPreviewFps(previewTicksRef.current.length / 5);
-    }, 500);
-    return () => clearInterval(h);
-  }, [previewTicksRef]);
-
-  // Reset the JPEG-failed flag when the WebRTC retry kicks — gives the
-  // <img> another chance alongside the renegotiated WHEP session.
-  useEffect(() => {
-    if (!imgOk) setImgOk(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [/* re-trigger on every WHEP retry */ rtcLive]);
 
   const latest = detections[0];
-
-  // Source aspect ratio — starts at 16:9 and refines once the media loads
-  // its real dimensions. The inner frame always matches this so non-16:9
-  // cameras letterbox inside the tile and bbox overlays stay aligned to
-  // the visible pixels (not to the empty letterbox area).
-  const [aspect, setAspect] = useState(16 / 9);
 
   return (
     <div
@@ -263,150 +213,17 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
         highlight ? "ring-2 ring-emerald-400 shadow-[0_0_24px_rgba(52,211,153,0.55)]" : ""
       }`}
     >
-      <div
-        className={`relative max-w-full max-h-full ${drawing ? "cursor-crosshair" : "cursor-zoom-in"}`}
-        style={{ aspectRatio: aspect, width: aspect >= 16 / 9 ? "100%" : "auto", height: aspect < 16 / 9 ? "100%" : "auto" }}
-        onClick={
-          // Click on the video region opens the enlarged modal.
-          // Suppressed while drawing a manual label, or when a popover
-          // is up (BBox onClick, FlagPopover and ManualLabelPopover
-          // wrappers all stopPropagation already, but the popover's
-          // backdrop catches the click before it reaches us).
-          drawing || pickedDetection || pendingManualRect
-            ? undefined
-            : () => onEnlarge()
-        }
-        onMouseDown={
-          drawing
-            ? (e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const x = (e.clientX - rect.left) / rect.width;
-                const y = (e.clientY - rect.top) / rect.height;
-                setDrawingDragStart({ x, y });
-                setDrawnRect({ x, y, w: 0, h: 0 });
-              }
-            : undefined
-        }
-        onMouseMove={
-          drawing && drawingDragStart
-            ? (e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-                setDrawnRect({
-                  x: Math.min(drawingDragStart.x, x),
-                  y: Math.min(drawingDragStart.y, y),
-                  w: Math.abs(x - drawingDragStart.x),
-                  h: Math.abs(y - drawingDragStart.y),
-                });
-              }
-            : undefined
-        }
-        onMouseUp={
-          drawing && drawingDragStart
-            ? () => {
-                setDrawingDragStart(null);
-                if (drawnRect && drawnRect.w > 0.01 && drawnRect.h > 0.01) {
-                  // Lock the rect, exit draw mode, open the picker.
-                  setPendingManualRect(drawnRect);
-                  setDrawing(false);
-                } else {
-                  // Click without drag (or microscopic rect): cancel.
-                  setDrawnRect(null);
-                }
-              }
-            : undefined
-        }
-      >
-        {rtcLive ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            muted
-            playsInline
-            onLoadedMetadata={(e) => {
-              const v = e.currentTarget;
-              if (v.videoWidth && v.videoHeight) setAspect(v.videoWidth / v.videoHeight);
-            }}
-            className="absolute inset-0 w-full h-full"
-          />
-        ) : imgOk ? (
-          <img
-            src={src}
-            alt={name}
-            onLoad={(e) => {
-              tickPreview();
-              const im = e.currentTarget;
-              if (im.naturalWidth && im.naturalHeight) setAspect(im.naturalWidth / im.naturalHeight);
-            }}
-            className="absolute inset-0 w-full h-full"
-            onError={() => setImgOk(false)}
-          />
-        ) : (
-          <div className="absolute inset-0 flex items-center justify-center text-neutral-600 text-sm">
-            No recording yet
-          </div>
-        )}
-
-        {/* bbox overlay — coords are normalised 0..1 of the source frame.
-            When the popover is open we render the frozen boxes so the
-            clicked one stays put while the operator confirms. */}
-        {(pickedFrozenBoxes ?? detections).map((d) => (
-          <BBox
-            key={d.id}
-            d={d}
-            highlighted={pickedDetection?.id === d.id}
-            onPick={
-              // Only `object` kind is flaggable; faces / plates have
-              // their own dedicated review surfaces. Admin-only.
-              isAdmin && (d.kind === undefined || d.kind === "object")
-                ? () => {
-                    setPickedDetection(d);
-                    setPickedFrozenBoxes(detections);
-                  }
-                : undefined
-            }
-          />
-        ))}
-        {pickedDetection && (
-          <FlagPopover
-            detection={pickedDetection}
-            onClose={() => {
-              setPickedDetection(null);
-              setPickedFrozenBoxes(null);
-            }}
-          />
-        )}
-
-        {/* In-progress drawing rect, shown while the operator is
-            dragging in draw mode. Switches to the locked
-            ManualLabelPopover once mouseup fires with a non-trivial
-            box. */}
-        {drawing && drawnRect && (
-          <div
-            className="absolute pointer-events-none border-2 border-emerald-400 bg-emerald-400/10"
-            style={{
-              left: `${drawnRect.x * 100}%`,
-              top: `${drawnRect.y * 100}%`,
-              width: `${drawnRect.w * 100}%`,
-              height: `${drawnRect.h * 100}%`,
-            }}
-          />
-        )}
-
-        {/* Manual-label popover: same chrome as FlagPopover but with
-            no underlying detection — the bbox came from the drawer. */}
-        {pendingManualRect && (
-          <ManualLabelPopover
-            cameraId={id}
-            bbox={pendingManualRect}
-            onClose={() => {
-              setPendingManualRect(null);
-              setDrawnRect(null);
-            }}
-          />
-        )}
-      </div>
+      <CameraContent
+        cameraId={id}
+        name={name}
+        detections={detections}
+        isAdmin={isAdmin}
+        drawing={drawing}
+        onDrawingChange={setDrawing}
+        onClickEmpty={onEnlarge}
+        fitTo="video"
+        onPreviewFps={setPreviewFps}
+      />
 
       <div className="absolute bottom-2 left-2 flex items-center gap-1">
         <div className="text-xs bg-black/60 px-2 py-0.5 rounded">
@@ -415,9 +232,6 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
         <button
           type="button"
           onClick={(e) => {
-            // stopPropagation so the tile-body onClick doesn't also
-            // fire — that would just open and immediately re-fire,
-            // not visibly broken but redundant.
             e.stopPropagation();
             onEnlarge();
           }}
@@ -447,8 +261,6 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
             onClick={(e) => {
               e.stopPropagation();
               setDrawing((d) => !d);
-              setDrawnRect(null);
-              setDrawingDragStart(null);
             }}
           >
             {drawing ? "cancel draw" : "+ label"}
@@ -516,7 +328,7 @@ function formatRelativeAge(d: Date): string {
   return `${Math.round(secs / 86400)}d ago`;
 }
 
-function BBox({
+export function BBox({
   d,
   highlighted,
   onPick,
@@ -611,7 +423,7 @@ function EmptyState() {
 // it. Either choice hits `POST /detections/{event_id}/flag` via the
 // api client; on success the popover closes and the caller's state
 // unfreezes the bbox overlay.
-function FlagPopover({
+export function FlagPopover({
   detection,
   onClose,
 }: {
@@ -751,7 +563,7 @@ function RelabelPicker({
 // ManualLabelPopover anchors below the user-drawn rect and asks for a
 // class. On submit it POSTs to /api/v1/flags/manual which captures the
 // camera's most recent live JPEG and writes a YOLO training row.
-function ManualLabelPopover({
+export function ManualLabelPopover({
   cameraId,
   bbox,
   onClose,
