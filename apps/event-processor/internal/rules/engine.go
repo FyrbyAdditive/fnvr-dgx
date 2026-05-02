@@ -147,6 +147,23 @@ type Detection struct {
 	BBox       BBox              `json:"bbox"`
 	TrackID    string            `json:"track_id,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
+	// PHash carries the 16-char lowercase hex perceptual-hash of the
+	// object crop for object detections. Top-level NATS field (Phase
+	// B+); older pipeline builds emit it inside Attributes["phash"]
+	// instead — phashHex() accepts both shapes for backwards-compat.
+	PHash      string            `json:"phash,omitempty"`
+}
+
+// phashHex returns the perceptual hash for an object detection as a
+// 16-char lowercase hex string, or "" if not set. Reads the top-level
+// PHash field first (current pipeline shape), falling back to the
+// older Attributes["phash"] form so a rolling pipeline restart doesn't
+// drop suppression coverage on workers that haven't restarted yet.
+func (d *Detection) phashHex() string {
+	if d.PHash != "" {
+		return d.PHash
+	}
+	return d.Attributes["phash"]
 }
 
 type BBox struct {
@@ -802,7 +819,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	//   - the pipeline emitted a `phash` attribute on the detection.
 	if len(objectFlagsByClass) > 0 {
 		if phashes, ok := objectFlagsByClass[d.ClassName]; ok && len(phashes) > 0 {
-			if hashStr := d.Attributes["phash"]; hashStr != "" {
+			if hashStr := d.phashHex(); hashStr != "" {
 				if probe, ok := parsePHash(hashStr); ok {
 					for _, flagHash := range phashes {
 						if bits.OnesCount64(probe^flagHash) <= phashHamming {
@@ -940,13 +957,32 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	if kind == "" {
 		kind = "object"
 	}
+
+	// Phase B: phash lives in its own typed BIGINT column. Parse it
+	// from whichever shape the upstream pipeline emitted (top-level
+	// PHash field, current; or Attributes["phash"], older builds we
+	// still tolerate during a rolling restart). Strip the
+	// attributes-side copy so it doesn't double-store; the parsed
+	// int64 goes into the new column.
+	var phashCol any
+	if hashStr := d.phashHex(); hashStr != "" {
+		if v, ok := parsePHash(hashStr); ok {
+			// parsePHash returns uint64; cast to int64 — postgres
+			// BIGINT is signed but the bit pattern is preserved.
+			phashCol = int64(v) // #nosec G115 -- bit-pattern preserving cast
+		}
+	}
+	if d.Attributes != nil {
+		delete(d.Attributes, "phash")
+	}
+
 	var pgID int64
 	if err := e.pool.QueryRow(ctx, `
-		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes, phash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id`,
 		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
-		mustJSON(d.BBox), nullIfEmpty(d.TrackID), jsonOrNull(d.Attributes),
+		mustJSON(d.BBox), nullIfEmpty(d.TrackID), jsonOrNull(d.Attributes), phashCol,
 	).Scan(&pgID); err != nil {
 		return err
 	}

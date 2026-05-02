@@ -600,10 +600,15 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 js << ",\"attributes\":{"
                    << "\"embedding\":\""     << embedding_b64       << "\""
                    << "}";
-            } else if (obj_phash != 0) {
-                js << ",\"attributes\":{"
-                   << "\"phash\":\""         << uint64ToHex16(obj_phash) << "\""
-                   << "}";
+            }
+            // pHash for object detections rides as a TOP-LEVEL field on
+            // the NATS payload, not inside attributes — event-processor
+            // unmarshals it directly into a typed column. Plain-object
+            // rows that aren't matched against a flag therefore land with
+            // attributes = NULL in postgres, saving the JSONB row +
+            // TOAST pointer.
+            if (!is_plate && !is_face && obj_phash != 0) {
+                js << ",\"phash\":\"" << uint64ToHex16(obj_phash) << "\"";
             }
             js << "}";
             std::string payload = js.str();
