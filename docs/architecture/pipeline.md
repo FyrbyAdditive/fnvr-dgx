@@ -17,8 +17,9 @@ The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A 
         │                        → nvinfer  scrfd   (face detector SGIE, optional)
         │                        → nvinfer  arcface (face embedder SGIE, optional)
         │                        → fakesink                                (probe taps here)
-        ├─ queue → h264parse → nvv4l2decoder → nvvideoconvert
-        │       → videoscale → videorate → jpegenc → multifilesink         (480×270 @ 1 fps preview ring)
+        │                        (a pad probe on pgie.src — see preview_probe.cpp — taps the in-flight
+        │                         decoded NVMM frame at 1 fps, scales to 480×270 via VIC and writes
+        │                         the JPEG ring at /var/lib/fnvr/live/<cam>.<n>.jpg. No second decode.)
         └─ queue → {h264,h265}parse config-interval=-1
                 → rtspclientsink → rtsp://mediamtx:8554/live_<cam>          (RECORD + WebRTC)
 ```

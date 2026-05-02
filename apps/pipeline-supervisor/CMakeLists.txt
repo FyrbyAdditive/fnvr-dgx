@@ -34,6 +34,7 @@ add_executable(pipeline-supervisor
   src/rtsp_probe.cpp
   src/hailo_inference.cpp
   src/hailo_probe.cpp
+  src/preview_probe.cpp
 )
 
 # DeepStream headers + libs on Jetson live under /opt/nvidia/deepstream.

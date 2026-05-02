@@ -14,6 +14,7 @@
 
 #include "face_crop_jpeg.h"
 #include "hailo_probe.h"
+#include "preview_probe.h"
 #include "object_phash.h"
 #include "rtsp_probe.h"
 
@@ -1038,33 +1039,16 @@ p << "rtspsrc location=" << url
         p << "fakesink sync=false ";
     }
 
-    // --- Live-thumbnail branch ---
-    // Decode → downsample to 1 fps → JPEG → ring of 4 indexed files. The
-    // snapshot endpoint reads the newest *fully-written* one. We use NVDEC
-    // (nvv4l2decoder) rather than avdec_h264 because (a) it's already in
-    // the image as part of DeepStream and (b) avdec_h264 in the gstreamer
-    // libav plugin requires libx265 which isn't reliably resolvable on
-    // this image. nvvideoconvert pulls the frame back into system memory
-    // for the software jpegenc.
-    // Explicit 480x270 output (16:9) because videoscale with a width-only
-    // caps filter doesn't reliably preserve aspect when the upstream
-    // reports a weird pixel-aspect-ratio or has no height in negotiation.
-    p << "t. ! queue max-size-buffers=10 leaky=downstream ! ";
-    // Codec-matched parser before nvv4l2decoder. The decoder itself
-    // auto-detects from input caps but the parser is codec-specific.
-    if (pipeline_codec_ == "h265") {
-        p << "h265parse ! ";
-    } else {
-        p << "h264parse ! ";
-    }
-    p << "nvv4l2decoder ! nvvideoconvert ! "
-         "video/x-raw,format=I420 ! videoscale add-borders=true ! "
-         "video/x-raw,width=480,height=270,pixel-aspect-ratio=1/1 ! "
-         "videorate ! video/x-raw,framerate=1/1 ! "
-         "jpegenc quality=75 ! "
-         "multifilesink location=/var/lib/fnvr/live/" << cam_.id << ".%d.jpg "
-         "  async=false sync=false post-messages=false max-files=4 index=0 ";
-
+    // --- Live-thumbnail branch removed ---
+    // The 480×270 1-fps preview JPEG ring at /var/lib/fnvr/live/<cam>.<n>.jpg
+    // used to be a separate decode + jpegenc tee branch. That doubled NVDEC
+    // load per camera — the inference branch above already decodes the
+    // exact same frames microseconds earlier. We now generate the ring via
+    // a pad probe on pgie.src that taps the in-flight NVMM surface, scales
+    // to 480×270 via VIC, and encodes a JPEG via the existing
+    // face_crop_jpeg helper. See preview_probe.{h,cpp} and the probe
+    // attachment block below ensureDstSurface() / Start().
+    //
     // (Face-crop branch removed — thumbnails now come from the probe
     // directly via NvBufSurfTransform on the inference buffer.)
 
@@ -1141,6 +1125,32 @@ p << "rtspsrc location=" << url
                     std::cerr << "pipeline[" << cam_.id
                               << "]: hailo-8 inference setup failed; "
                               << "pipeline runs without detections on this cam\n";
+                }
+                gst_object_unref(src);
+            }
+            gst_object_unref(pgie_elem);
+        }
+    }
+
+    // Live-thumbnail probe — taps the decoded NVMM frame already in
+    // flight on the inference branch and writes a 1 fps 480×270 JPEG
+    // ring at /var/lib/fnvr/live/<cam>.<n>.jpg. Replaces the earlier
+    // parallel decode branch that doubled NVDEC load per camera. See
+    // preview_probe.cpp for the rate-limit + transform + encode flow.
+    if (use_deepstream_ && !skip_inference_probe) {
+        GstElement* pgie_elem = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        if (pgie_elem) {
+            GstPad* src = gst_element_get_static_pad(pgie_elem, "src");
+            if (src) {
+                int sw = rec_width_  > 0 ? rec_width_  : 1920;
+                int sh = rec_height_ > 0 ? rec_height_ : 1080;
+                auto* pctx = fnvr::preview_probe_ctx_new(
+                    cam_.id, "/var/lib/fnvr/live", sw, sh);
+                if (pctx) {
+                    gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
+                                      &fnvr::PreviewSnapshotProbe, pctx, nullptr);
+                    std::cerr << "pipeline[" << cam_.id
+                              << "]: preview-thumbnail probe attached on pgie.src\n";
                 }
                 gst_object_unref(src);
             }
