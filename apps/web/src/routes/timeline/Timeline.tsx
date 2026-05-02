@@ -5,6 +5,8 @@ import { api, HistoricDetection, Segment } from "@/lib/api";
 import { useMe, isAdmin as isAdminFn } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
 import { CameraDetectorChips } from "@/components/CameraDetectorChips";
+import { BBox, FlagPopover } from "@/routes/live/Live";
+import { DetectionEvent } from "@/lib/events";
 
 // Timeline: one day (local time) for one camera. Segments render as solid
 // bars across the 24h ruler; detections as coloured pins underneath.
@@ -485,6 +487,7 @@ function Player({
           videoRef={ref}
           videoSize={videoSize}
           detections={active}
+          isAdmin={isAdmin}
         />
       )}
       <div className="absolute top-2 right-2 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -515,14 +518,39 @@ function Player({
   );
 }
 
+// Adapter: BBox / FlagPopover (lifted from Live.tsx) speak in
+// `DetectionEvent` shape. Timeline carries `HistoricDetection`. The
+// shapes overlap in everything except identity-keying — Live's `id`
+// is the event_id hex string and `pg_id` is the optional PG row id;
+// HistoricDetection swaps those (id is the PG row id, event_id is
+// the hex). `arrived_at_ms` is Live-only (drives bbox staleness on
+// the live mosaic) and unused here.
+function asDetectionEvent(d: HistoricDetection): DetectionEvent {
+  return {
+    id: d.event_id,
+    pg_id: d.id,
+    camera_id: d.camera_id,
+    ts: d.ts,
+    arrived_at_ms: Date.parse(d.ts),
+    class_name: d.class_name,
+    kind: d.kind,
+    confidence: d.confidence,
+    bbox: d.bbox,
+    track_id: d.track_id,
+    attributes: d.attributes,
+  };
+}
+
 function PlayerOverlay({
   videoRef,
   videoSize,
   detections,
+  isAdmin,
 }: {
   videoRef: React.RefObject<HTMLVideoElement>;
   videoSize: { w: number; h: number };
   detections: HistoricDetection[];
+  isAdmin: boolean;
 }) {
   // Compute the letterboxed content rect inside the video element,
   // matching object-contain. bbox coords are 0..1 of the source frame
@@ -558,57 +586,58 @@ function PlayerOverlay({
     return () => ro.disconnect();
   }, [videoRef, videoSize]);
 
+  // Click-to-flag plumbing (admin only, object-kind only). When a
+  // box is picked we freeze the rendered set on `pickedFrozen` so the
+  // box stays under the user's cursor while they confirm — same
+  // pattern as Live's CameraContent. We also pause the video so the
+  // active detection set doesn't slide out from under them.
+  const [pickedDetection, setPickedDetection] = useState<DetectionEvent | null>(null);
+  const [pickedFrozen, setPickedFrozen] = useState<HistoricDetection[] | null>(null);
+
+  const renderDetections = pickedFrozen ?? detections;
+
   if (!box) return null;
   return (
     <div
-      className="absolute pointer-events-none"
-      style={{ left: box.left, top: box.top, width: box.w, height: box.h }}
-    >
-      {detections.map((d) => (
-        <OverlayBox key={d.id} d={d} />
-      ))}
-    </div>
-  );
-}
-
-function OverlayBox({ d }: { d: HistoricDetection }) {
-  const isPlate = d.kind === "anpr";
-  const color = isPlate ? "#22c55e" : overlayColor(d.class_name);
-  const label = isPlate
-    ? d.attributes?.plate ?? "plate"
-    : `${d.class_name} ${(d.confidence * 100).toFixed(0)}%`;
-  return (
-    <div
       className="absolute"
+      // Pointer events are managed by the children: BBox sets
+      // pointerEvents:auto only when onPick is provided (admin +
+      // object). Plates / faces / non-admin views stay click-through.
       style={{
-        left: `${d.bbox.x * 100}%`,
-        top: `${d.bbox.y * 100}%`,
-        width: `${d.bbox.w * 100}%`,
-        height: `${d.bbox.h * 100}%`,
-        border: `2px solid ${color}`,
-        boxShadow: `0 0 0 1px rgba(0,0,0,0.5)`,
+        left: box.left,
+        top: box.top,
+        width: box.w,
+        height: box.h,
+        pointerEvents: "none",
       }}
     >
-      <div
-        className="absolute top-0 left-0 text-[10px] px-1 font-medium leading-tight tabular-nums"
-        style={{
-          background: color,
-          color: "#000",
-          transform: "translateY(-100%)",
-        }}
-      >
-        {label}
-      </div>
+      {renderDetections.map((d) => (
+        <BBox
+          key={d.id}
+          d={asDetectionEvent(d)}
+          highlighted={pickedDetection?.pg_id === d.id}
+          onPick={
+            isAdmin && (d.kind === undefined || d.kind === "object")
+              ? () => {
+                  setPickedDetection(asDetectionEvent(d));
+                  setPickedFrozen(detections);
+                  videoRef.current?.pause();
+                }
+              : undefined
+          }
+        />
+      ))}
+      {pickedDetection && (
+        <FlagPopover
+          detection={pickedDetection}
+          onClose={() => {
+            setPickedDetection(null);
+            setPickedFrozen(null);
+          }}
+        />
+      )}
     </div>
   );
-}
-
-// Stable per-class colour hash — same scheme as Live tiles so a "car"
-// is the same colour in live and in Timeline playback.
-function overlayColor(cls: string): string {
-  let h = 0;
-  for (let i = 0; i < cls.length; i++) h = (h * 31 + cls.charCodeAt(i)) & 0xffffff;
-  return `hsl(${h % 360}, 85%, 55%)`;
 }
 
 function TimelineRuler({
