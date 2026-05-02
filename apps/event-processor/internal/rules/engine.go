@@ -946,7 +946,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		RETURNING id`,
 		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
-		mustJSON(d.BBox), nullIfEmpty(d.TrackID), mustJSON(d.Attributes),
+		mustJSON(d.BBox), nullIfEmpty(d.TrackID), jsonOrNull(d.Attributes),
 	).Scan(&pgID); err != nil {
 		return err
 	}
@@ -2235,4 +2235,21 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// jsonOrNull marshals m to JSON for an INSERT, returning nil for empty
+// maps so the column lands as SQL NULL rather than the literal '{}'.
+// In practice the pipeline already always populates `phash` on object
+// detections so the empty case is rare today (~0.02% of rows), but
+// keeping the column NULL-when-empty is the right shape — face-erasure
+// UPDATEs can leave a row with `attributes = {}` after stripping
+// person/embedding keys, and a future change to the pipeline that
+// stops emitting phash on a class would otherwise quietly bloat the
+// JSONB index. Cheap correctness, no behavioural change.
+func jsonOrNull(m map[string]string) any {
+	if len(m) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(m)
+	return b
 }
