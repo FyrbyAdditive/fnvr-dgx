@@ -19,6 +19,17 @@ export function Events() {
     queryFn: () => api.listIncidents(50),
     refetchInterval: 5_000,
   });
+  // Resolve camera_id → human name for display. Falls back to the id
+  // string when the camera has been deleted, so historical incidents
+  // for removed cameras still render something readable.
+  const { data: cameras = [] } = useQuery({
+    queryKey: ["cameras"],
+    queryFn: api.listCameras,
+    refetchInterval: 30_000,
+  });
+  const cameraNameById = new Map(cameras.map((c) => [c.id, c.name]));
+  const cameraLabel = (id: string | null | undefined) =>
+    id ? (cameraNameById.get(id) ?? id) : "system";
   const ack = useMutation({
     mutationFn: api.ackIncident,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["incidents"] }),
@@ -66,7 +77,7 @@ export function Events() {
                   <span className="text-neutral-500 tabular-nums">
                     {formatIncidentTimestamp(i.started_at)}
                   </span>
-                  <IncidentSummary i={i} />
+                  <IncidentSummary i={i} cameraLabel={cameraLabel} />
                 </button>
                 {isAdmin ? (
                   <div className="flex items-center justify-end gap-3 pr-2 text-xs">
@@ -142,7 +153,7 @@ export function Events() {
                         {" "}({Math.round(Number(similarity) * 100)}%)
                       </span>
                     )}
-                    <span className="text-neutral-500"> · {e.camera_id}</span>
+                    <span className="text-neutral-500"> · {cameraLabel(e.camera_id)}</span>
                   </span>
                   <span className="text-right tabular-nums text-neutral-400">
                     {(e.confidence * 100).toFixed(0)}%
@@ -168,9 +179,12 @@ function severityColor(s: string) {
 // label ("person + car at house-side"); line 2 is the duration +
 // detection count ("4m32s · ×14") so the operator can see at a
 // glance how busy / sustained the event was.
-function IncidentSummary({ i }: { i: Incident }) {
+function IncidentSummary({ i, cameraLabel }: {
+  i: Incident;
+  cameraLabel: (id: string | null | undefined) => string;
+}) {
   const classes = i.classes && i.classes.length > 0 ? i.classes : null;
-  const camera = i.camera_id ?? "system";
+  const camera = cameraLabel(i.camera_id);
   const headline = classes
     ? `${classes.join(" + ")} at ${camera}`
     : i.summary; // fall back to legacy single-class summary
