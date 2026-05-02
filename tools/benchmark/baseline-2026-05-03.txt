@@ -1,0 +1,148 @@
+fnvr system baseline — 2026-05-03 01:36 Europe/Stockholm (2026-05-02T23:36 UTC)
+Captured before the `batched-mux` branch is opened. Used as the
+comparison target for the multi-camera batched-nvstreammux project.
+
+Pre-project commit on main: 4dc4021
+(`timeline: clickable bboxes — admin can flag false positives from playback`)
+
+================================================================================
+SECTION 1 — Hardware engine load (60s sample, 1Hz)
+
+Each engine's actmon `usage` value is in the range 0..1000, where 1000 ~ 100%.
+Sample collected via /sys/kernel/debug/tegra-host1x/actmon/<unit>/module0/usage.
+GR3D_FREQ from a parallel `tegrastats --interval 1000` run over the same window.
+
+Per-engine summary (60-sample mean / max from the actmon poll):
+
+  NVDEC mean ~510   max  878   (h.265 decode, 5 cameras incl. 2× 4K)
+  VIC   mean ~430   max  733   (NV12→RGBA crops + colour conversions)
+  NVENC mean    0   max    0   (codec passthrough, no transcode in flight)
+  NVJPG mean    0   max    0   (JPEG encode is software via face_crop_jpeg)
+  OFA   mean    0   max    0   (no consumer)
+
+GR3D_FREQ (from tegrastats over the same 60s window — 60 samples):
+  mean ~55%   p95 ~99%   median ~57%
+  spread: 0% (DVFS pause), 91%, 40%, 0%, 41%, 73%, 0%, 0%, 12%, 51%, 98%, 98%,
+  98%, 72%, 33%, ... heavy bimodal — quiet GPU when nvinfer is between
+  batches, saturating during a batch.
+
+GPU power (VDD_GPU_SOC) min/max/mean (W):
+  10.4 / 17.9 / ~11.7
+
+CPU power (VDD_CPU_CV) min/max/mean (W):
+  2.0  /  3.6 /  ~2.5
+
+System rail (VIN_SYS_5V0) min/max/mean (W):
+  7.4  /  8.5 /  ~7.7
+
+Temperatures (°C):
+  CPU 58.8 - 59.6 mean ~59.1
+  GPU 53.2 - 56.2 mean ~54.0
+  Tj  58.8 - 59.6 mean ~59.1   (well under thermal envelope)
+
+================================================================================
+SECTION 2 — RAM / SWAP
+
+  RAM   8.13 GB / 62.83 GB used (13%)
+  SWAP  71 MB / 31 GB used     (idle)
+
+================================================================================
+SECTION 3 — Pipeline buffer rate per camera
+
+Latest probe heartbeat lines from the 5-minute window. Values are cumulative
+buffer counters (250 buffers per heartbeat ≈ 10s wall-clock at 25 fps).
+
+  probe[house-back]:       buffers=38500    (TRT)
+  probe[house-side]:       buffers=46000    (TRT)
+  probe[house-side-wide]:  buffers=19000    (Hailo)
+  probe[house-side-zoom]:  buffers=38750    (TRT)
+  probe[makershop]:        buffers=19000    (Hailo)
+
+The TRT cameras (house-back, house-side, house-side-zoom) are the
+candidates for grouping. The Hailo cameras are excluded by design.
+
+================================================================================
+SECTION 4 — Detection processing (event-processor)
+
+  fnvr_detections_processed_total{camera_id="house-side-wide",kind="object"} 3
+  fnvr_detections_processed_total{camera_id="makershop",kind="object"} 18856
+
+  fnvr_detections_suppressed_total{camera_id="makershop",class="dog"}   242
+  fnvr_detections_suppressed_total{camera_id="makershop",class="person"}  4
+
+  fnvr_enrolled_embeddings  30
+
+(Counters reset on each event-processor restart; the last restart was a few
+hours ago when we did the Phase B deploy.)
+
+================================================================================
+SECTION 5 — Postgres detection insert rate
+
+  detections_5min  per_sec
+        2300        7.7
+
+(7.7/sec = the steady-state INSERT rate at this moment. Up to ~500/sec
+peak under busy conditions per the audit.)
+
+================================================================================
+SECTION 6 — Camera config snapshot
+
+  id                name              backend  enabled_detectors  rotation
+  house-back        House Back Wide   trt      {object}           0
+  house-side        House Back        trt      {object,anpr}      0
+  house-side-wide   House Side Wide   hailo    {object}           0
+  house-side-zoom   House Side Zoom   trt      {object}           0
+  makershop         Makershop         hailo    {object}           0
+
+Group eligibility analysis under the planned grouping policy:
+  - house-back + house-side-zoom: SAME (trt + {object} + rotation=0).
+    These two CAN co-group → Group "trt-object" with N=2.
+  - house-side: trt + {object,anpr} — different SGIE chain. Solo.
+  - house-side-wide: hailo. Solo (Hailo path stays per-process).
+  - makershop: hailo. Solo.
+
+  Expected post-project layout:
+    Group trt-object: house-back, house-side-zoom    (batched, GR3D win)
+    Solo TRT: house-side                              (kept per-process)
+    Solo Hailo: house-side-wide, makershop            (kept per-process)
+
+  → 3 processes instead of 5. Inference graph dispatched to GR3D 4×/sec
+  instead of 5×/sec for the same coverage. Roughly +20% headroom on
+  the GR3D portion of the workload, which is the primary bottleneck per
+  this morning's analysis.
+
+================================================================================
+SECTION 7 — Detections table size (post Phase B prune-down in flight)
+
+  total  heap   rows    null_attrs
+  89 MB  63 MB  254333  40950
+
+40,950 rows already have NULL attributes (16% of rows), trending up as
+Phase B (commit 0b0fff5) lets new object detections land with
+attributes=NULL instead of `{"phash":"…"}`. The remaining old-shape
+rows age out via the 168h hot-retention window.
+
+================================================================================
+Comparison guidance
+
+When the post-project benchmark is run from the `batched-mux` branch:
+
+1. Re-collect Section 1 (engine load) over a similar 60s window during
+   normal traffic. Compare GR3D mean and NVDEC mean. Expected outcome:
+   GR3D mean drops materially (not p95 — peak is determined by single-
+   frame latency which doesn't change). NVDEC unchanged (decode is
+   still per-source).
+
+2. Compare power draw. GR3D doing less integrated work should show as
+   a few-watt drop on VDD_GPU_SOC mean.
+
+3. Compare pipeline buffer rates per camera. Should be ~unchanged —
+   batching changes how the GPU processes frames, not how many it
+   ingests.
+
+4. Compare detection-processed counters. Should be ~unchanged —
+   the same detections go through, the GPU just computes them in
+   batches.
+
+5. Sanity: confirm the camera config snapshot is the same (or note
+   any drift the user has applied since baseline).
