@@ -10,7 +10,7 @@ A condensed reference. The source of truth is [apps/api-server/internal/db/migra
 | `zones` | Per-camera polygon / line / tripwire geometry + per-zone class/kind mutes. | `camera_id` → `cameras` |
 | `rules` | JSONB `definition` stores both single-camera + sequence rule shapes. | — |
 | `incidents` | Rule / hotlist / face / drift hits. `camera_id` and `rule_id` both nullable. | soft FK to `rules`, `cameras` (ON DELETE CASCADE) |
-| `detections` | Every per-frame hit; `kind ∈ object/anpr/face`. `attributes` JSONB carries plate/person/similarity/embedding. | `camera_id` → `cameras` |
+| `detections` | Every per-frame hit; `kind ∈ object/anpr/face`. `attributes` JSONB carries person/similarity/embedding (face) or extra ANPR metadata. Two derived stored columns: `plate` (normalised, generated from `attributes->>'plate'`) and `phash` (BIGINT, generated from `attributes->>'phash'`) for typed lookups without JSONB parsing. | `camera_id` → `cameras` |
 | `segments` | Index of MediaMTX-recorded fMP4 chunks (path, bytes, duration, protected, tier). | `camera_id` → `cameras` |
 | `persons` | Enrolled face identities. | — |
 | `face_embeddings` | 512-d pgvector rows with `source` + optional `detection_id`. | `person_id` → `persons` |

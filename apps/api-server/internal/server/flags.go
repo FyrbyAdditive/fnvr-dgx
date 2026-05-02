@@ -2,10 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,10 +20,11 @@ import (
 
 // handleFlagDetection records a false-positive / relabel flag for a
 // detection already in Postgres. The detection row is expected to
-// carry `phash` in its `attributes` JSON (emitted by the pipeline
-// probe); without it we can't populate the suppression library, so
-// we 422 rather than silently creating a flag that won't do
-// anything.
+// have a non-NULL `phash` column (a generated stored column derived
+// from `attributes->>'phash'`, populated for every object detection
+// the pipeline probe hashes); without it we can't populate the
+// suppression library, so we 422 rather than silently creating a
+// flag that won't do anything.
 //
 // Path `:id` is the detection's **event_id** (short hex string, the
 // one that lands in the SSE stream) — not the PG row id. We resolve
@@ -82,20 +81,21 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 	var detID int64
 	var cameraID, className, detEventID string
 	var ts time.Time
-	var bboxJSON, attrJSON []byte
+	var bboxJSON []byte
+	var detPHash *int64
 	var err error
 	if pg, convErr := strconv.ParseInt(eventID, 10, 64); convErr == nil && pg > 0 {
 		err = s.pool.QueryRow(r.Context(),
-			`SELECT id, event_id, camera_id, ts, class_name, bbox, attributes
+			`SELECT id, event_id, camera_id, ts, class_name, bbox, phash
 			 FROM detections WHERE id = $1`, pg).
-			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &detPHash)
 	} else {
 		err = s.pool.QueryRow(r.Context(),
-			`SELECT id, event_id, camera_id, ts, class_name, bbox, attributes
+			`SELECT id, event_id, camera_id, ts, class_name, bbox, phash
 			 FROM detections
 			 WHERE event_id = $1
 			 ORDER BY ts DESC LIMIT 1`, eventID).
-			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &attrJSON)
+			Scan(&detID, &detEventID, &cameraID, &ts, &className, &bboxJSON, &detPHash)
 	}
 	if err != nil {
 		// Most likely: the detection is already being suppressed by an
@@ -120,16 +120,16 @@ func (s *Server) handleFlagDetection(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad bbox in detection row", http.StatusInternalServerError)
 		return
 	}
-	phash, err := extractPHash(attrJSON)
-	if err != nil {
+	if detPHash == nil {
 		// Missing phash = the pipeline didn't emit one (likely an older
-		// detection predating this slice). Refuse to flag; the UI can
-		// message this.
-		http.Error(w, "detection has no phash attribute — cannot flag. "+
+		// detection predating the phash slice). Refuse to flag; the UI
+		// can message this.
+		http.Error(w, "detection has no phash — cannot flag. "+
 			"Wait for a fresh detection of the same scene.",
 			http.StatusUnprocessableEntity)
 		return
 	}
+	phash := uint64(*detPHash)
 
 	// Capture the current live-preview JPEG for this camera as the
 	// dataset frame. The pipeline writes these at 1 fps so timing
@@ -485,39 +485,6 @@ func (s *Server) handleObjectThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
-
-// extractPHash pulls the 64-bit pHash from a detection row's
-// attributes JSONB. Pipeline emits it as 16-char lowercase hex under
-// attributes.phash. Missing / malformed → error.
-func extractPHash(attrJSON []byte) (uint64, error) {
-	if len(attrJSON) == 0 {
-		return 0, errors.New("no attributes")
-	}
-	var attr map[string]json.RawMessage
-	if err := json.Unmarshal(attrJSON, &attr); err != nil {
-		return 0, err
-	}
-	raw, ok := attr["phash"]
-	if !ok {
-		return 0, errors.New("no phash in attributes")
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, err
-	}
-	if len(s) != 16 {
-		return 0, fmt.Errorf("phash wrong length: %d", len(s))
-	}
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return 0, err
-	}
-	var p uint64
-	for _, v := range b {
-		p = (p << 8) | uint64(v)
-	}
-	return p, nil
-}
 
 // latestLiveJPEG returns the absolute path of the most recent live
 // preview frame for the camera. The pipeline writes a 4-file ring
