@@ -58,26 +58,7 @@ export function Storage() {
         {data.cameras.length === 0 ? (
           <div className="text-neutral-500 text-sm">No cameras configured.</div>
         ) : (
-          <div className="rounded border border-neutral-800 overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-neutral-900 text-xs text-neutral-400">
-                <tr>
-                  <th className="text-left px-3 py-2">Camera</th>
-                  <th className="text-right px-3 py-2">Used</th>
-                  <th className="text-right px-3 py-2">GB / day</th>
-                  <th className="text-right px-3 py-2">Headroom</th>
-                  <th className="text-right px-3 py-2">Quota (GB)</th>
-                  <th className="text-right px-3 py-2">Retention (days)</th>
-                  {isAdmin && <th className="w-20" />}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-neutral-800">
-                {data.cameras.map((c) => (
-                  <CameraRow key={c.id} camera={c} isAdmin={isAdmin} />
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <PerCameraTable cameras={data.cameras} isAdmin={isAdmin} />
         )}
       </section>
     </div>
@@ -119,6 +100,124 @@ function DiskGauge({
         />
       </div>
     </div>
+  );
+}
+
+// Sortable column keys map to value extractors so the sort logic
+// stays declarative — each column knows how to surface the value to
+// compare. Camera and id are strings; everything else is numeric. For
+// "retained" we recompute (newest - oldest) the same way the
+// RetainedSpan cell does, so the sort matches what the user sees.
+type SortKey =
+  | "name"
+  | "bytes_used"
+  | "gb_per_day"
+  | "headroom"
+  | "retained"
+  | "quota_gb"
+  | "retention_days";
+
+type Cam = SystemStorage["cameras"][number];
+
+const SORT_VALUE: Record<SortKey, (c: Cam) => number | string> = {
+  name: (c) => c.name.toLowerCase(),
+  bytes_used: (c) => c.bytes_used,
+  gb_per_day: (c) => c.gb_per_day,
+  // null headroom sorts last regardless of direction — it means "no
+  // segments yet, can't project". Same convention for retained.
+  headroom: (c) =>
+    c.days_of_headroom == null ? Number.POSITIVE_INFINITY : c.days_of_headroom,
+  retained: (c) => {
+    if (!c.oldest_segment || !c.newest_segment) return Number.POSITIVE_INFINITY;
+    const start = new Date(c.oldest_segment).getTime();
+    const end = new Date(c.newest_segment).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return (end - start) / (1000 * 60 * 60 * 24);
+  },
+  quota_gb: (c) => c.quota_gb,
+  retention_days: (c) => c.retention_days,
+};
+
+function PerCameraTable({ cameras, isAdmin }: {
+  cameras: Cam[];
+  isAdmin: boolean;
+}) {
+  const [sortKey, setSortKey] = useState<SortKey>("name");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+
+  const onSort = (k: SortKey) => {
+    if (sortKey === k) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(k);
+      // Numeric columns default to descending (biggest first usually
+      // most interesting), name defaults to ascending.
+      setSortDir(k === "name" ? "asc" : "desc");
+    }
+  };
+
+  const sorted = [...cameras].sort((a, b) => {
+    const av = SORT_VALUE[sortKey](a);
+    const bv = SORT_VALUE[sortKey](b);
+    let cmp: number;
+    if (typeof av === "number" && typeof bv === "number") {
+      cmp = av - bv;
+    } else {
+      cmp = String(av).localeCompare(String(bv));
+    }
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+
+  return (
+    <div className="rounded border border-neutral-800 overflow-hidden">
+      <table className="w-full text-sm">
+        <thead className="bg-neutral-900 text-xs text-neutral-400">
+          <tr>
+            <SortableTh k="name" label="Camera" align="left" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="bytes_used" label="Used" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="gb_per_day" label="GB / day" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="headroom" label="Headroom" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="retained" label="Retained" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="quota_gb" label="Quota (GB)" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            <SortableTh k="retention_days" label="Retention (days)" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+            {isAdmin && <th className="w-20" />}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-neutral-800">
+          {sorted.map((c) => (
+            <CameraRow key={c.id} camera={c} isAdmin={isAdmin} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SortableTh({ k, label, align = "right", sortKey, sortDir, onSort }: {
+  k: SortKey;
+  label: string;
+  align?: "left" | "right";
+  sortKey: SortKey;
+  sortDir: "asc" | "desc";
+  onSort: (k: SortKey) => void;
+}) {
+  const active = sortKey === k;
+  const arrow = active ? (sortDir === "asc" ? "▲" : "▼") : "";
+  return (
+    <th
+      className={`px-3 py-2 select-none cursor-pointer hover:text-neutral-200 ${
+        align === "left" ? "text-left" : "text-right"
+      } ${active ? "text-neutral-200" : ""}`}
+      onClick={() => onSort(k)}
+      title={`Sort by ${label}`}
+    >
+      <span className="inline-flex items-center gap-1">
+        {label}
+        <span className="text-[10px] w-2 inline-block">{arrow}</span>
+      </span>
+    </th>
   );
 }
 
@@ -184,6 +283,9 @@ function CameraRow({
           ) : (
             <>{c.days_of_headroom.toFixed(1)}d</>
           )}
+        </td>
+        <td className="px-3 py-2 text-right tabular-nums">
+          <RetainedSpan oldest={c.oldest_segment} newest={c.newest_segment} />
         </td>
         <td className="px-3 py-2 text-right tabular-nums">{c.quota_gb}</td>
         <td className="px-3 py-2 text-right tabular-nums">{c.retention_days}</td>
@@ -269,4 +371,27 @@ function formatBytes(n: number): string {
 
 function bytesToGB(n: number): number {
   return n / (1024 * 1024 * 1024);
+}
+
+// RetainedSpan shows how much wall-clock history actually exists for
+// the camera right now, from the oldest still-on-disk segment to the
+// newest. This is distinct from the configured `retention_days`
+// (target) and from `days_of_headroom` (projection). When quota or
+// disk-pressure has truncated the window, this number drops below
+// the retention target — the operator's tell that they're running
+// hotter than expected.
+function RetainedSpan({ oldest, newest }: {
+  oldest: string | null;
+  newest: string | null;
+}) {
+  if (!oldest || !newest) {
+    return <span className="text-neutral-600">—</span>;
+  }
+  const start = new Date(oldest).getTime();
+  const end = new Date(newest).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return <span className="text-neutral-600">—</span>;
+  }
+  const days = (end - start) / (1000 * 60 * 60 * 24);
+  return <>{days >= 1 ? `${days.toFixed(1)}d` : `${(days * 24).toFixed(1)}h`}</>;
 }
