@@ -1,5 +1,5 @@
 #include "preview_probe.h"
-#include "face_crop_jpeg.h"
+#include "gpu_jpeg.h"
 #include "surface_alloc.h"
 
 #include <atomic>
@@ -84,61 +84,6 @@ void preview_probe_ctx_free(PreviewProbeCtx* ctx) {
 
 namespace {
 
-// Lazily allocate the reusable RGBA destination at the gpuId of the
-// first observed input surface. memType decision (CUDA_UNIFIED on
-// GB10) lives in surface_alloc.cpp.
-bool ensureDstSurface(PreviewProbeCtx* ctx, NvBufSurface* in_surf) {
-    if (ctx->dst_surf) return true;
-    if (!AllocCpuReadableRGBA(&ctx->dst_surf, kOutW, kOutH, in_surf->gpuId)) {
-        std::cerr << "preview_probe: AllocCpuReadableRGBA failed\n";
-        ctx->dst_surf = nullptr;
-        return false;
-    }
-    return true;
-}
-
-// Encode dst_surf into the member's next ring slot (tmp + rename so a
-// partial JPEG is never observable).
-bool writeRingEntry(PreviewProbeCtx* ctx, PreviewSource& src) {
-    NvBufSurfaceParams& dp = ctx->dst_surf->surfaceList[0];
-    if (NvBufSurfaceMap(ctx->dst_surf, 0, 0, NVBUF_MAP_READ) != 0) {
-        std::cerr << "preview_probe[" << src.camera_id
-                  << "]: NvBufSurfaceMap failed\n";
-        return false;
-    }
-    NvBufSurfaceSyncForCpu(ctx->dst_surf, 0, 0);
-
-    const std::uint8_t* rgba =
-        static_cast<const std::uint8_t*>(dp.mappedAddr.addr[0]);
-    const int stride = static_cast<int>(dp.pitch);
-
-    char tmp_path[512];
-    char out_path[512];
-    std::snprintf(tmp_path, sizeof(tmp_path), "%s/%s.%d.jpg.tmp",
-                  ctx->live_dir.c_str(), src.camera_id.c_str(), src.ring_idx);
-    std::snprintf(out_path, sizeof(out_path), "%s/%s.%d.jpg",
-                  ctx->live_dir.c_str(), src.camera_id.c_str(), src.ring_idx);
-
-    bool ok = encodeJpegRGBA(rgba, stride, 0, 0, kOutW, kOutH, kQuality,
-                             tmp_path);
-    NvBufSurfaceUnMap(ctx->dst_surf, 0, 0);
-
-    if (!ok) {
-        std::cerr << "preview_probe[" << src.camera_id
-                  << "]: encodeJpegRGBA failed\n";
-        std::remove(tmp_path);
-        return false;
-    }
-    if (std::rename(tmp_path, out_path) != 0) {
-        std::cerr << "preview_probe[" << src.camera_id
-                  << "]: rename failed: " << std::strerror(errno) << "\n";
-        std::remove(tmp_path);
-        return false;
-    }
-    src.ring_idx = (src.ring_idx + 1) % kRingSize;
-    return true;
-}
-
 }  // namespace
 
 #endif  // FNVR_HAS_DEEPSTREAM
@@ -182,10 +127,6 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
     }
 
     std::lock_guard<std::mutex> lock(ctx->ctx_mu);
-    if (!ensureDstSurface(ctx, in_surf)) {
-        gst_buffer_unmap(buf, &map);
-        return GST_PAD_PROBE_OK;
-    }
 
     for (NvDsMetaList* fl = batch->frame_meta_list; fl; fl = fl->next) {
         auto* frame = static_cast<NvDsFrameMeta*>(fl->data);
@@ -204,37 +145,24 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
         if (frame->batch_id >= in_surf->numFilled) continue;
         NvBufSurfaceParams& in_p = in_surf->surfaceList[frame->batch_id];
 
+        // GPU crop + JPEG via gpu_jpeg.cpp (nvjpeg, CPU-libjpeg
+        // fallback). Atomic tmp+rename lives inside the helper.
         NvBufSurfTransformRect src_rect {
             0, 0, guint(in_p.width), guint(in_p.height)
         };
-        NvBufSurfTransformRect dst_rect {
-            0, 0, guint(kOutW), guint(kOutH)
-        };
-        NvBufSurfTransformParams tp{};
-        tp.src_rect = &src_rect;
-        tp.dst_rect = &dst_rect;
-        tp.transform_flag =
-            NVBUFSURF_TRANSFORM_FILTER |
-            NVBUFSURF_TRANSFORM_CROP_SRC |
-            NVBUFSURF_TRANSFORM_CROP_DST;
-        tp.transform_filter = NvBufSurfTransformInter_Default;
-
-        NvBufSurface tmp_in = *in_surf;
-        tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
-        tmp_in.numFilled   = 1;
-        tmp_in.batchSize   = 1;
-
-        if (NvBufSurfTransform(&tmp_in, ctx->dst_surf, &tp)
-            != NvBufSurfTransformError_Success) {
+        char out_path[512];
+        std::snprintf(out_path, sizeof(out_path), "%s/%s.%d.jpg",
+                      ctx->live_dir.c_str(), src.camera_id.c_str(),
+                      src.ring_idx);
+        const bool ok = SaveNv12RegionJpeg(in_surf, frame->batch_id,
+                                           src_rect, kOutW, kOutH, kQuality,
+                                           out_path, nullptr);
+        if (ok) {
+            src.ring_idx = (src.ring_idx + 1) % kRingSize;
+        } else {
             std::cerr << "preview_probe[" << src.camera_id
-                      << "]: NvBufSurfTransform failed\n";
-            continue;
+                      << "]: jpeg write failed\n";
         }
-        // Drain this thread's transform stream before writeRingEntry
-        // maps the destination for CPU reads.
-        SyncGpuTransformStream();
-
-        bool ok = writeRingEntry(ctx, src);
         static std::atomic<int> first_ok{0};
         if (ok && first_ok.exchange(1) == 0) {
             std::cerr << "preview_probe[" << src.camera_id

@@ -63,6 +63,28 @@ std::uint64_t computeAverageHash64(const std::uint8_t* luma8x8) {
     return h;
 }
 
+void downsampleLuma8x8FromGray(const std::uint8_t* y,
+                               int src_w, int src_h, int src_stride,
+                               std::uint8_t* out_luma) {
+    if (src_w <= 0 || src_h <= 0 || !y || !out_luma) return;
+    for (int cy = 0; cy < 8; cy++) {
+        const int y0 = (cy * src_h) / 8;
+        const int y1 = ((cy + 1) * src_h) / 8;
+        for (int cx = 0; cx < 8; cx++) {
+            const int x0 = (cx * src_w) / 8;
+            const int x1 = ((cx + 1) * src_w) / 8;
+            const int xw = (x1 > x0) ? (x1 - x0) : 1;
+            std::uint64_t sum = 0, count = 0;
+            for (int yy = y0; yy < (y1 > y0 ? y1 : y0 + 1); yy++) {
+                const std::uint8_t* row = y + std::size_t(yy) * src_stride + x0;
+                for (int xx = 0; xx < xw; xx++) { sum += row[xx]; count++; }
+            }
+            out_luma[cy * 8 + cx] =
+                count ? std::uint8_t(sum / count) : 0;
+        }
+    }
+}
+
 std::string uint64ToHex16(std::uint64_t v) {
     char buf[17];
     // snprintf with "%016lx" on 64-bit platforms; use explicit llx for

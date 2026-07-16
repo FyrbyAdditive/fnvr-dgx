@@ -26,6 +26,7 @@
 #if __has_include(<nvbufsurface.h>)
 
 #include <nvbufsurface.h>
+#include <cuda_runtime_api.h>
 
 namespace fnvr {
 
@@ -34,6 +35,16 @@ namespace fnvr {
 // *out is only written on success. numFilled is pre-set to 1.
 bool AllocCpuReadableRGBA(NvBufSurface** out, int width, int height,
                           unsigned gpu_id);
+
+// Same allocation policy, caller-chosen colour format (the GPU-JPEG
+// path wants I420 so nvjpeg can encode straight from device memory).
+bool AllocCpuReadableSurface(NvBufSurface** out, int width, int height,
+                             unsigned gpu_id, NvBufSurfaceColorFormat fmt);
+
+// The per-thread transform stream (nullptr when session setup fell
+// back to the default stream). nvjpeg enqueues on the SAME stream so
+// encode naturally serialises after the transform without a sync.
+cudaStream_t GetGpuTransformStream();
 
 // Idempotently configure this thread's NvBufSurfTransform session for
 // GPU compute (gpu_id 0) on a dedicated non-blocking CUDA stream.

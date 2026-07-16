@@ -25,15 +25,15 @@ thread_local bool         t_session_ready    = false;
 
 }  // namespace
 
-bool AllocCpuReadableRGBA(NvBufSurface** out, int width, int height,
-                          unsigned gpu_id) {
+bool AllocCpuReadableSurface(NvBufSurface** out, int width, int height,
+                             unsigned gpu_id, NvBufSurfaceColorFormat fmt) {
     NvBufSurfaceAllocateParams ap{};
     ap.params.gpuId        = gpu_id;
     ap.params.width        = static_cast<unsigned>(width);
     ap.params.height       = static_cast<unsigned>(height);
     ap.params.size         = 0;
     ap.params.isContiguous = true;
-    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
+    ap.params.colorFormat  = fmt;
     ap.params.layout       = NVBUF_LAYOUT_PITCH;
     ap.params.memType      = kCpuReadableMemType;
     ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
@@ -46,6 +46,14 @@ bool AllocCpuReadableRGBA(NvBufSurface** out, int width, int height,
     *out = dst;
     return true;
 }
+
+bool AllocCpuReadableRGBA(NvBufSurface** out, int width, int height,
+                          unsigned gpu_id) {
+    return AllocCpuReadableSurface(out, width, height, gpu_id,
+                                   NVBUF_COLOR_FORMAT_RGBA);
+}
+
+cudaStream_t GetGpuTransformStream() { return t_transform_stream; }
 
 void EnsureGpuTransformSession() {
     if (t_session_ready) return;

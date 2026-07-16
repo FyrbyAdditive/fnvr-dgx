@@ -17,6 +17,7 @@
 
 #include "face_crop_jpeg.h"
 #include "preview_probe.h"
+#include "gpu_jpeg.h"
 #include "object_phash.h"
 #include "rtsp_probe.h"
 #include "surface_alloc.h"
@@ -293,61 +294,14 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
         return;
     }
 
-    // Create a 1-frame pitch-linear RGBA destination we CAN CPU-map.
-    // memType choice (CUDA_UNIFIED on GB10) lives in surface_alloc.cpp.
-    NvBufSurface* dst = nullptr;
-    if (!AllocCpuReadableRGBA(&dst, CROP_OUT_W, CROP_OUT_H, in_surf->gpuId)) {
-        gst_buffer_unmap(gst_buf, &map);
-        return;
-    }
-
-    // GPU-accelerated source crop + colour-format + resize in one pass.
+    // GPU crop + resize + JPEG (nvjpeg) — the streaming thread no
+    // longer syncs + CPU-maps per detection; see gpu_jpeg.cpp.
     NvBufSurfTransformRect src_rect {
-        guint(py), guint(px), guint(pw_px), guint(ph_px)  // top, left, width, height
+        guint(py), guint(px), guint(pw_px), guint(ph_px)  // top, left, w, h
     };
-    NvBufSurfTransformRect dst_rect {
-        0, 0, guint(CROP_OUT_W), guint(CROP_OUT_H)
-    };
-    NvBufSurfTransformParams tp{};
-    tp.src_rect = &src_rect;
-    tp.dst_rect = &dst_rect;
-    tp.transform_flag =
-        NVBUFSURF_TRANSFORM_FILTER |
-        NVBUFSURF_TRANSFORM_CROP_SRC |
-        NVBUFSURF_TRANSFORM_CROP_DST;
-    tp.transform_filter = NvBufSurfTransformInter_Default;
-
-    // Narrow the source surface to just our batch slot.
-    NvBufSurface tmp_in = *in_surf;
-    tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
-    tmp_in.numFilled   = 1;
-    tmp_in.batchSize   = 1;
-
-    if (NvBufSurfTransform(&tmp_in, dst, &tp) != NvBufSurfTransformError_Success) {
-        NvBufSurfaceDestroy(dst);
-        gst_buffer_unmap(gst_buf, &map);
-        return;
-    }
-    // The transform ran on this thread's non-blocking CUDA stream —
-    // drain it before the CPU touches the pixels.
-    SyncGpuTransformStream();
-
-    if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
-        NvBufSurfaceDestroy(dst);
-        gst_buffer_unmap(gst_buf, &map);
-        return;
-    }
-    NvBufSurfaceSyncForCpu(dst, 0, 0);
-
-    NvBufSurfaceParams& dp = dst->surfaceList[0];
-    const auto* rgba = static_cast<const uint8_t*>(dp.mappedAddr.addr[0]);
-    const int pitch = int(dp.planeParams.pitch[0]);
-
     std::string out_path = ctx.thumbs_dir + "/" + short_id + ".jpg";
-    (void)encodeJpegRGBA(rgba, pitch, 0, 0, CROP_OUT_W, CROP_OUT_H, 85, out_path);
-
-    NvBufSurfaceUnMap(dst, 0, 0);
-    NvBufSurfaceDestroy(dst);
+    (void)SaveNv12RegionJpeg(in_surf, frame->batch_id, src_rect,
+                             CROP_OUT_W, CROP_OUT_H, 85, out_path, nullptr);
     gst_buffer_unmap(gst_buf, &map);
 }
 
@@ -394,65 +348,17 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
         return 0;
     }
 
-    // CPU-mappable RGBA destination — memType decision lives in
-    // surface_alloc.cpp (CUDA_UNIFIED on GB10).
-    NvBufSurface* dst = nullptr;
-    if (!AllocCpuReadableRGBA(&dst, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H,
-                              in_surf->gpuId)) {
-        gst_buffer_unmap(gst_buf, &map);
-        return 0;
-    }
-
     NvBufSurfTransformRect src_rect {
         guint(py), guint(px), guint(pw_px), guint(ph_px)
     };
-    NvBufSurfTransformRect dst_rect {
-        0, 0, guint(OBJ_CROP_OUT_W), guint(OBJ_CROP_OUT_H)
-    };
-    NvBufSurfTransformParams tp{};
-    tp.src_rect = &src_rect;
-    tp.dst_rect = &dst_rect;
-    tp.transform_flag =
-        NVBUFSURF_TRANSFORM_FILTER |
-        NVBUFSURF_TRANSFORM_CROP_SRC |
-        NVBUFSURF_TRANSFORM_CROP_DST;
-    tp.transform_filter = NvBufSurfTransformInter_Default;
-
-    NvBufSurface tmp_in = *in_surf;
-    tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
-    tmp_in.numFilled   = 1;
-    tmp_in.batchSize   = 1;
-
-    if (NvBufSurfTransform(&tmp_in, dst, &tp) != NvBufSurfTransformError_Success) {
-        NvBufSurfaceDestroy(dst);
-        gst_buffer_unmap(gst_buf, &map);
-        return 0;
-    }
-    // Drain this thread's transform stream before the CPU reads.
-    SyncGpuTransformStream();
-
-    if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
-        NvBufSurfaceDestroy(dst);
-        gst_buffer_unmap(gst_buf, &map);
-        return 0;
-    }
-    NvBufSurfaceSyncForCpu(dst, 0, 0);
-
-    NvBufSurfaceParams& dp = dst->surfaceList[0];
-    const auto* rgba = static_cast<const std::uint8_t*>(dp.mappedAddr.addr[0]);
-    const int pitch = int(dp.planeParams.pitch[0]);
-
-    std::uint8_t luma[64];
-    downsampleToLuma8x8(rgba, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H, pitch, luma);
-    std::uint64_t hash = computeAverageHash64(luma);
-
+    std::string out_path;
     if (!ctx.thumbs_dir_objects.empty()) {
-        std::string out_path = ctx.thumbs_dir_objects + "/" + short_id + ".jpg";
-        (void)encodeJpegRGBA(rgba, pitch, 0, 0, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H, 75, out_path);
+        out_path = ctx.thumbs_dir_objects + "/" + short_id + ".jpg";
     }
-
-    NvBufSurfaceUnMap(dst, 0, 0);
-    NvBufSurfaceDestroy(dst);
+    std::uint64_t hash = 0;
+    (void)SaveNv12RegionJpeg(in_surf, frame->batch_id, src_rect,
+                             OBJ_CROP_OUT_W, OBJ_CROP_OUT_H, 75, out_path,
+                             &hash);
     gst_buffer_unmap(gst_buf, &map);
     return hash;
 }

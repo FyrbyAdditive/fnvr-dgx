@@ -26,6 +26,7 @@ add_executable(pipeline-supervisor
   src/main.cpp
   src/pipeline.cpp
   src/face_crop_jpeg.cpp
+  src/gpu_jpeg.cpp
   src/object_phash.cpp
   src/supervisor.cpp
   src/nats_publisher.cpp
@@ -53,6 +54,10 @@ endif()
 # NvBufSurfTransform GPU session stream. Only relevant when DeepStream
 # is present (the fallback build never touches NvBufSurface).
 if (DEEPSTREAM_FOUND)
+  find_library(NVJPEG_LIB nvjpeg HINTS
+    /usr/local/cuda/lib64
+    /usr/local/cuda/targets/sbsa-linux/lib
+    /usr/local/cuda/targets/aarch64-linux/lib)
   find_library(CUDART_LIB cudart HINTS
     /usr/local/cuda/lib64
     /usr/local/cuda/targets/sbsa-linux/lib
@@ -104,6 +109,7 @@ target_link_libraries(pipeline-supervisor PRIVATE
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurface>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurftransform>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:${CUDART_LIB}>
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:${NVJPEG_LIB}>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:${CUDA_DRIVER_STUB}>
   # libjpeg-turbo for in-probe face-crop JPEG encoding. System
   # package `libjpeg-turbo8-dev` provides both header and library.

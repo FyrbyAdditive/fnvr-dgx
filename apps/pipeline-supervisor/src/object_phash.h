@@ -34,6 +34,12 @@ void downsampleToLuma8x8(const std::uint8_t* rgba,
                          int src_w, int src_h, int src_stride,
                          std::uint8_t* out_luma);
 
+// Grayscale-source variant: box-average an 8-bit luma plane (e.g. the
+// Y plane of an I420 crop) straight to 8×8 — no colour conversion.
+void downsampleLuma8x8FromGray(const std::uint8_t* y,
+                               int src_w, int src_h, int src_stride,
+                               std::uint8_t* out_luma);
+
 // uint64ToHex16 writes a 64-bit value as 16 lowercase hex chars into
 // `out` (caller guarantees ≥17 bytes). No trailing NUL in the
 // 16-byte write position; caller writes the NUL if the buffer is
