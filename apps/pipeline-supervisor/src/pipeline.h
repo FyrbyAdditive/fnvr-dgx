@@ -19,6 +19,14 @@ namespace fnvr {
 // process at startup with the value from settings.pipeline.startup_grace_sec.
 void SetWorkerStartupGraceSec(int sec);
 
+// Retro-analytics: replay one recording file through the detection
+// stack at max speed. Detections carry base_epoch_ms + buffer PTS as
+// their timestamp and publish on fnvr.events.retro_detection.<cam>.
+// Returns 0 on EOS, 1 on pipeline error, 2 on setup failure.
+int RunReplayFile(const std::string& camera_id, const std::string& file,
+                  std::int64_t base_epoch_ms, bool use_anpr, bool use_face,
+                  const std::string& infer_config, NatsPublisher* nats);
+
 // Per-member runtime state inside a group pipeline. Owned by
 // GroupPipeline; referenced (never owned) by the pad probes.
 struct SourceRuntime {

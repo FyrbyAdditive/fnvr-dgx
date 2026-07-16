@@ -340,6 +340,8 @@ WORKDIR /src
 # image with a different entrypoint — same GStreamer/NVDEC/NVENC
 # stack, zero extra image builds).
 COPY tools/transcoder/transcoder.py /usr/local/bin/fnvr-transcoder.py
+# Retro-analytics runner (docker exec … bash /usr/local/bin/retro-replay.sh).
+COPY tools/retro/retro-replay.sh /usr/local/bin/retro-replay.sh
 
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs

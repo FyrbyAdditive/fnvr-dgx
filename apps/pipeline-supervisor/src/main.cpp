@@ -369,6 +369,27 @@ int main(int argc, char** argv) {
     }
 
     // Group-worker mode: one subprocess per camera GROUP.
+    // Retro-analytics: --worker-replay <camera_id> <file> <base_epoch_ms>
+    // Runs one recording through the detector stack at max speed and
+    // exits. FNVR_USE_ANPR / FNVR_USE_FACEID / FNVR_INFER_CONFIG env
+    // select the chains (the retro runner sets them).
+    if (argc >= 5 && std::string(argv[1]) == "--worker-replay") {
+        gst_init(&argc, &argv);
+        const char* nurl = std::getenv("FNVR_NATS_URL");
+        NatsPublisher nats(nurl ? nurl : "nats://nats:4222");
+        const char* cfg = std::getenv("FNVR_INFER_CONFIG");
+        const bool use_anpr =
+            [] { const char* e = std::getenv("FNVR_USE_ANPR");
+                 return e && std::string(e) == "1"; }();
+        const bool use_face =
+            [] { const char* e = std::getenv("FNVR_USE_FACEID");
+                 return e && std::string(e) == "1"; }();
+        return fnvr::RunReplayFile(
+            argv[2], argv[3], std::atoll(argv[4]), use_anpr, use_face,
+            cfg ? cfg : "/var/lib/fnvr/models/rfdetr/rfdetr.effective.txt",
+            &nats);
+    }
+
     // Invoked as: pipeline-supervisor --worker-group <group_id> <cam1,cam2,...>
     if (argc >= 4 && std::string(argv[1]) == "--worker-group") {
         return runWorkerGroup(argv[2], splitCsv(argv[3]));

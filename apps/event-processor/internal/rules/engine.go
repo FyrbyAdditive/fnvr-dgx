@@ -461,6 +461,37 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Retro-analytics detections: historical footage replayed through
+	// the detector stack. Store them (rows + search surfaces) but do
+	// NOT evaluate alarm/notification rules — nobody wants a siren for
+	// last Tuesday. Same envelope shapes as the live subject.
+	_, err = e.nc.Subscribe("fnvr.events.retro_detection.>", func(msg *nats.Msg) {
+		var envelope struct {
+			Batch []json.RawMessage `json:"batch"`
+		}
+		handleOne := func(raw []byte) {
+			var d Detection
+			if err := json.Unmarshal(raw, &d); err != nil {
+				slog.Warn("bad retro detection", "err", err)
+				return
+			}
+			if err := e.insertDetectionOnly(ctx, d); err != nil {
+				slog.Warn("retro insert", "err", err, "cam", d.CameraID)
+			}
+		}
+		if err := json.Unmarshal(msg.Data, &envelope); err == nil &&
+			len(envelope.Batch) > 0 {
+			for _, raw := range envelope.Batch {
+				handleOne(raw)
+			}
+			return
+		}
+		handleOne(msg.Data)
+	})
+	if err != nil {
+		return err
+	}
+
 	// Live alarm-state updates from api-server. reload() also reads
 	// the same key so a missed NATS message on startup can't leave the
 	// engine stuck on a stale state.
@@ -786,6 +817,39 @@ func (e *Engine) reload(ctx context.Context) error {
 	return nil
 }
 
+const insertDetectionSQL = `
+		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes, phash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		RETURNING id`
+
+// insertDetectionOnly stores a retro-analytics detection: row insert
+// only — no zone/mute evaluation, no accepted-republish (nothing
+// should light up the Live view or HA for historical footage), no
+// alarm/notification rules, no sidecar (its segment is long closed).
+// The timeline and search surfaces read straight from the table, so
+// backfilled detections appear there with their historical ts.
+func (e *Engine) insertDetectionOnly(ctx context.Context, d Detection) error {
+	kind := d.Kind
+	if kind == "" {
+		kind = "object"
+	}
+	var phashCol any
+	if hashStr := d.phashHex(); hashStr != "" {
+		if v, ok := parsePHash(hashStr); ok {
+			phashCol = int64(v) // #nosec G115 -- bit-pattern preserving cast
+		}
+	}
+	if d.Attributes != nil {
+		delete(d.Attributes, "phash")
+	}
+	var pgID int64
+	return e.pool.QueryRow(ctx, insertDetectionSQL,
+		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
+		mustJSON(d.BBox), nullIfEmpty(d.TrackID), jsonOrNull(d.Attributes),
+		phashCol,
+	).Scan(&pgID)
+}
+
 func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	kindLabel := d.Kind
 	if kindLabel == "" {
@@ -1003,10 +1067,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	}
 
 	var pgID int64
-	if err := e.pool.QueryRow(ctx, `
-		INSERT INTO detections (event_id, camera_id, ts, class_name, kind, confidence, bbox, track_id, attributes, phash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		RETURNING id`,
+	if err := e.pool.QueryRow(ctx, insertDetectionSQL,
 		d.ID, d.CameraID, d.TS, d.ClassName, kind, d.Confidence,
 		mustJSON(d.BBox), nullIfEmpty(d.TrackID), jsonOrNull(d.Attributes), phashCol,
 	).Scan(&pgID); err != nil {

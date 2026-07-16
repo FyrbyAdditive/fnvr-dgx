@@ -118,6 +118,13 @@ struct ProbeCtx {
     std::string             thumbs_dir;
     // Output directory for per-detection OBJECT crop JPEGs.
     std::string             thumbs_dir_objects;
+    // Replay mode: detections carry HISTORICAL timestamps derived
+    // from the recording's start + buffer PTS, and publish on the
+    // retro subject so event-processor stores them without firing
+    // alarm/notification rules for footage from the past.
+    // 0 = live mode (wall clock, normal subject).
+    std::int64_t            replay_base_epoch_ms = 0;
+    std::string             subject_prefix = "fnvr.events.detection.";
     // Heartbeat counters, logged every ~250 buffers.
     std::uint64_t hb_buffers    = 0;
     std::uint64_t hb_batch_null = 0;
@@ -386,6 +393,13 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     }
 
     gint64 ts_ns = g_get_real_time() * 1000;  // µs → ns
+    if (ctx->replay_base_epoch_ms > 0) {
+        // Historical footage: recording start + this buffer's PTS.
+        const GstClockTime pts = GST_BUFFER_PTS(buf);
+        const std::int64_t pts_ms =
+            GST_CLOCK_TIME_IS_VALID(pts) ? std::int64_t(pts / 1'000'000) : 0;
+        ts_ns = (ctx->replay_base_epoch_ms + pts_ms) * 1'000'000;
+    }
     // Millisecond-resolution ISO 8601 (Live overlay age-out needs
     // sub-second resolution).
     auto iso = [ts_ns]{
@@ -535,8 +549,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                                   "\",\"ts\":\"" + iso +
                                   "\",\"batch\":[" + frame_batch.str() +
                                   "]}";
-            std::string subj =
-                std::string("fnvr.events.detection.") + sv.camera_id;
+            std::string subj = ctx->subject_prefix + sv.camera_id;
             if (!ctx->nats->Publish(subj, payload)) {
                 ctx->hb_published -= frame_batch_n;
             }
@@ -1265,6 +1278,149 @@ void GroupPipeline::Stop() {
         g_source_remove(bus_watch_id_);
         bus_watch_id_ = 0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retro-analytics replay: run ONE recording file through the same
+// detection stack at max speed, publishing detections with HISTORICAL
+// timestamps on fnvr.events.retro_detection.<cam>. Invoked by the
+// retro runner (tools/retro/) when the GPU is idle — event-processor
+// stores these rows without evaluating alarm/notification rules.
+// ---------------------------------------------------------------------------
+int RunReplayFile(const std::string& camera_id, const std::string& file,
+                  std::int64_t base_epoch_ms, bool use_anpr, bool use_face,
+                  const std::string& infer_config, NatsPublisher* nats) {
+#if !FNVR_HAS_DEEPSTREAM
+    (void)camera_id; (void)file; (void)base_epoch_ms; (void)use_anpr;
+    (void)use_face; (void)infer_config; (void)nats;
+    std::cerr << "replay: built without DeepStream\n";
+    return 2;
+#else
+    std::ostringstream p;
+    std::string anpr_chain, face_chain;
+    if (use_anpr) {
+        anpr_chain =
+            "nvinfer name=platedet config-file-path=/var/lib/fnvr/nvinfer/platedet.txt ! "
+            "nvinfer name=plateocr config-file-path=/etc/fnvr/nvinfer/plateocr.txt ! ";
+    }
+    if (use_face) {
+        face_chain =
+            "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! "
+            "nvinfer name=embedder config-file-path=/etc/fnvr/nvinfer/adaface.txt ! ";
+    }
+    p << "filesrc location=" << file << " ! qtdemux ! parsebin ! "
+      << "nvv4l2decoder ! queue max-size-buffers=8 ! mux.sink_0 "
+      << "nvstreammux name=mux batch-size=1 width=1920 height=1080 "
+      << "live-source=0 batched-push-timeout=40000 enable-padding=1 ! "
+      << "nvinfer name=pgie config-file-path=" << infer_config << " ! "
+      << "nvtracker name=tracker "
+         "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
+         "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "
+         "  tracker-width=960 tracker-height=544 ! "
+      << anpr_chain << face_chain << "fakesink sync=false";
+
+    GError* err = nullptr;
+    GstElement* pipeline = gst_parse_launch(p.str().c_str(), &err);
+    if (!pipeline) {
+        std::cerr << "replay: parse failed: "
+                  << (err ? err->message : "?") << "\n";
+        if (err) g_error_free(err);
+        return 2;
+    }
+
+    // Same rect-clamp guard as live (tracker-predicted off-canvas
+    // rects are group-fatal for SGIE crops).
+    if (GstElement* trk = gst_bin_get_by_name(GST_BIN(pipeline), "tracker")) {
+        if (GstPad* src = gst_element_get_static_pad(trk, "src")) {
+            auto* dims = new std::pair<int, int>(1920, 1080);
+            gst_pad_add_probe(
+                src, GST_PAD_PROBE_TYPE_BUFFER,
+                [](GstPad*, GstPadProbeInfo* info,
+                   gpointer u) -> GstPadProbeReturn {
+                    auto* d = static_cast<std::pair<int, int>*>(u);
+                    const float W = float(d->first), H = float(d->second);
+                    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+                    NvDsBatchMeta* batch = gst_buffer_get_nvds_batch_meta(buf);
+                    if (!batch) return GST_PAD_PROBE_OK;
+                    for (NvDsMetaList* fl = batch->frame_meta_list; fl;
+                         fl = fl->next) {
+                        auto* frame = static_cast<NvDsFrameMeta*>(fl->data);
+                        for (NvDsMetaList* ol = frame->obj_meta_list; ol;
+                             ol = ol->next) {
+                            auto* obj = static_cast<NvDsObjectMeta*>(ol->data);
+                            auto& r = obj->rect_params;
+                            float x1 = std::max(0.f, float(r.left));
+                            float y1 = std::max(0.f, float(r.top));
+                            float x2 = std::min(W, float(r.left) + float(r.width));
+                            float y2 = std::min(H, float(r.top) + float(r.height));
+                            if (x2 - x1 < 1.f) x2 = std::min(W, x1 + 1.f);
+                            if (y2 - y1 < 1.f) y2 = std::min(H, y1 + 1.f);
+                            x1 = std::min(x1, W - 1.f);
+                            y1 = std::min(y1, H - 1.f);
+                            r.left = x1; r.top = y1;
+                            r.width = x2 - x1; r.height = y2 - y1;
+                        }
+                    }
+                    return GST_PAD_PROBE_OK;
+                },
+                dims, nullptr);
+            gst_object_unref(src);
+        }
+        gst_object_unref(trk);
+    }
+
+    // Detection probe on the last element of the active chain.
+    GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "embedder");
+    if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "plateocr");
+    if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
+    if (attach) {
+        if (GstPad* src = gst_element_get_static_pad(attach, "src")) {
+            auto* ctx = new ProbeCtx{};
+            ctx->group_id = "replay-" + camera_id;
+            ctx->nats = nats;
+            ctx->canvas_w = 1920;
+            ctx->canvas_h = 1080;
+            ctx->replay_base_epoch_ms = base_epoch_ms;
+            ctx->subject_prefix = "fnvr.events.retro_detection.";
+            SourceView sv;
+            sv.camera_id = camera_id;
+            ctx->sources.push_back(std::move(sv));
+            if (use_face) {
+                ctx->thumbs_dir = "/var/lib/fnvr/thumbs/faces";
+                std::error_code _ec;
+                fs::create_directories(ctx->thumbs_dir, _ec);
+            }
+            ctx->thumbs_dir_objects = "/var/lib/fnvr/thumbs/objects";
+            std::error_code ec2;
+            fs::create_directories(ctx->thumbs_dir_objects, ec2);
+            gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &InferSrcProbe,
+                              ctx, nullptr);
+            gst_object_unref(src);
+        }
+        gst_object_unref(attach);
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    GstBus* bus = gst_element_get_bus(pipeline);
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, GST_CLOCK_TIME_NONE,
+        GstMessageType(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    int rc = 0;
+    if (msg && GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError* e = nullptr; gchar* dbg = nullptr;
+        gst_message_parse_error(msg, &e, &dbg);
+        std::cerr << "replay[" << camera_id << "]: "
+                  << (e ? e->message : "?") << "\n";
+        if (e) g_error_free(e);
+        g_free(dbg);
+        rc = 1;
+    }
+    if (msg) gst_message_unref(msg);
+    gst_object_unref(bus);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    return rc;
+#endif
 }
 
 }  // namespace fnvr
