@@ -115,7 +115,7 @@ type Detector struct {
 // key is missing (e.g. after a fresh install before the migration's seed
 // row runs — belt-and-braces).
 func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
-	d := Detector{ModelFamily: "yolo26", RFDETRVariant: "base",
+	d := Detector{ModelFamily: "rfdetr", RFDETRVariant: "base",
 		YoloVariant: "yolo26x", YoloPrecision: "fp16"}
 	if raw, err := s.Get(ctx, "detector.model_family"); err == nil {
 		_ = json.Unmarshal(raw, &d.ModelFamily)

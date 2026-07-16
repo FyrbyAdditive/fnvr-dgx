@@ -118,10 +118,10 @@ fi
 
 VARIANT="${FNVR_YOLO_VARIANT:-yolo26x}"
 PRECISION="${FNVR_YOLO_PRECISION:-fp16}"
-# Primary detector family: "yolo26" (DeepStream-Yolo parser) or
-# "rfdetr" (Roboflow RF-DETR, our custom parser). Default stays yolo26
-# until the RF-DETR A/B validates on this deployment.
-MODEL_FAMILY="${FNVR_MODEL_FAMILY:-yolo26}"
+# Primary detector family: "rfdetr" (Roboflow RF-DETR, our custom
+# parser; DEFAULT since the 2026-07-16 fleet A/B — 3x lower SM util,
+# higher recall) or "yolo26" (DeepStream-Yolo parser, kept as fallback).
+MODEL_FAMILY="${FNVR_MODEL_FAMILY:-rfdetr}"
 RFDETR_VARIANT="${FNVR_RFDETR_VARIANT:-base}"
 # Max nvinfer batch = max batched-mux group size. The supervisor chunks
 # camera groups at FNVR_GROUP_MAX members; the (dynamic-batch) engine is

@@ -45,5 +45,7 @@ parse-bbox-func-name=NvDsInferParseCustomRFDETR
 custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_rfdetr.so
 
 [class-attrs-all]
-pre-cluster-threshold=0.4
+# 0.5: RF-DETR's recall is high enough that 0.4 floods the event bus
+# with threshold-hugging static scene objects (fleet A/B 2026-07-16).
+pre-cluster-threshold=0.5
 topk=300
