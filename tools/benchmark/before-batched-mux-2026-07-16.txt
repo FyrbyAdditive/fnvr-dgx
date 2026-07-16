@@ -1,0 +1,74 @@
+fnvr-dgx capture — label=before-batched-mux — 2026-07-16T13:56:05Z
+host=shodan kernel=6.17.0-1026-nvidia driver=580.159.03
+
+================================================================================
+SECTION 1 — GPU engine load (nvidia-smi dmon, 60s @ 1Hz)
+columns: gpu sm mem enc dec jpg ofa (percent)
+  SM   mean 65.1%  max 90%
+  MEM  mean 0.0%
+  ENC  mean 1.3%
+  DEC  mean 18.8%  max 25%
+
+  power/temp snapshot:
+    49.74 W, 77, 2392 MHz
+
+================================================================================
+SECTION 2 — system memory + pipeline processes
+                 total        used        free      shared  buff/cache   available
+  Mem:             121          11          42           0          69         110
+  Swap:             15           0          15
+
+  pipeline worker processes:
+        352 1088552 /usr/local/bin/pipeline-supervisor --worker cam-house-side-wide rtsp://admin:timbobulous9@cam-house-side.fyrby.internal:554/h265Preview_01_main continuous
+        235 1080740 /usr/local/bin/pipeline-supervisor --worker cam-house-back rtsp://fnvr:Rtn743Sdsda2@cam-house-back.fyrby.internal:554/h265Preview_01_main continuous
+        294 1078828 /usr/local/bin/pipeline-supervisor --worker cam-house-back-wide rtsp://normal:rh1mp0p2@cam-house-back-wide.fyrby.internal:554/ continuous
+        555 1066960 /usr/local/bin/pipeline-supervisor --worker cam-makershop rtsp://admin:timbobulous9@cam-makershop.fyrby.internal:554/h265Preview_01_main continuous
+        407 1039792 /usr/local/bin/pipeline-supervisor --worker cam-house-side rtsp://admin:timbobulous9@cam-house-side.fyrby.internal:554/h265Preview_02_main continuous
+        442 387020 /usr/local/bin/pipeline-supervisor --worker cam-makershop-prusa-xl rtsp://cam-makershop-prusa-xl.fyrby.internal/live continuous
+        492 37020 /usr/local/bin/pipeline-supervisor --worker cam-office-prusa-indx rtsp://cam-office-prusa-indx.fyrby.internal/live continuous
+          1 28824 /usr/local/bin/pipeline-supervisor
+
+================================================================================
+SECTION 3 — per-camera pipeline buffer rate (latest probe heartbeats)
+  probe[cam-house-side-wide]: buffers=14500 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-makershop]: buffers=14250 batch_null=0 frames_with_obj=13520 objects=27181 published=27181
+  probe[cam-house-side]: buffers=14500 batch_null=0 frames_with_obj=115 objects=115 published=115
+  probe[cam-house-back]: buffers=14750 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-back-wide]: buffers=14750 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-side-wide]: buffers=14750 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-makershop]: buffers=14500 batch_null=0 frames_with_obj=13770 objects=27818 published=27818
+  probe[cam-house-side]: buffers=14750 batch_null=0 frames_with_obj=153 objects=153 published=153
+  probe[cam-house-back]: buffers=15000 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-back-wide]: buffers=15000 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-side-wide]: buffers=15000 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-makershop]: buffers=14750 batch_null=0 frames_with_obj=14020 objects=28480 published=28480
+  probe[cam-house-side]: buffers=15000 batch_null=0 frames_with_obj=153 objects=153 published=153
+  probe[cam-house-back]: buffers=15250 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-back-wide]: buffers=15250 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-side-wide]: buffers=15250 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-makershop]: buffers=15000 batch_null=0 frames_with_obj=14247 objects=28920 published=28920
+  probe[cam-house-side]: buffers=15250 batch_null=0 frames_with_obj=153 objects=153 published=153
+  probe[cam-house-back]: buffers=15500 batch_null=0 frames_with_obj=0 objects=0 published=0
+  probe[cam-house-back-wide]: buffers=15500 batch_null=0 frames_with_obj=0 objects=0 published=0
+
+================================================================================
+SECTION 4 — detection throughput
+  detections rows by camera, last 10 min:
+    cam-makershop|23295
+    cam-house-side|153
+  insert rate (rows/sec over last 5 min):
+    40.1
+
+================================================================================
+SECTION 5 — camera config snapshot
+  cam-house-back|t||0|f
+  cam-house-back-wide|t||0|f
+  cam-house-side|t|object+face|0|f
+  cam-house-side-wide|t|object+face|0|f
+  cam-makershop|t|object+face|0|f
+  cam-makershop-prusa-xl|t|none|180|f
+  cam-office-prusa-indx|t|none|0|f
+
+================================================================================
+SECTION 6 — engine cache
+  -rw-r--r-- 1 root root 114357524 Jul 16 11:04 yolo26x.onnx_b1_gpu0_fp16.engine
