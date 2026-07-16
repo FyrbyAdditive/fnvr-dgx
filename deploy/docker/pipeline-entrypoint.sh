@@ -1,39 +1,23 @@
 #!/bin/sh
-# Runs at container start, after nvidia-container-toolkit has bound the host
-# Tegra libs into /usr/lib/aarch64-linux-gnu/tegra/.
+# Runs at container start on DGX Spark (DS 9.1 SBSA container).
 #
-# Two JetPack-6-on-DeepStream-L4T quirks we fix here:
-#
-# 1. Force ld.so to prefer tegra over nvidia/ so the Tegra libcuda wins.
-#
-# 2. The DeepStream-L4T image ships both Tegra AND dGPU variants of the
-#    libv4l2 NVENC/NVDEC plugin. libv4l scans /usr/lib/.../libv4l/plugins/nv/
-#    alphabetically and binds the first plugin that claims the device —
-#    libv4l2_nvcuvidvideocodec.so (dGPU NVENC) sorts before
-#    libv4l2_nvvideocodec.so (Tegra). The dGPU plugin fails with
-#    "S_EXT_CTRLS for CUDA_GPU_ID failed" on Jetson because the dGPU NVENC
-#    driver isn't there. Shadow the dGPU plugin so only the Tegra plugin
-#    is visible.
+# The Orin-era Tegra quirk-fixes (tegra ld.so priority, libv4l dGPU
+# plugin shadowing) are gone — SBSA is a straight dGPU-style platform.
 
 set -e
 
-if [ -d /usr/lib/aarch64-linux-gnu/tegra ]; then
-    cat >/etc/ld.so.conf.d/000-fnvr-tegra-first.conf <<'EOF'
-/usr/lib/aarch64-linux-gnu/tegra
-/usr/lib/aarch64-linux-gnu/tegra-egl
-EOF
-    ldconfig
-fi
+# Pin the LEGACY nvstreammux. Our pipeline graph uses legacy-only
+# properties (width/height/enable-padding/live-source/
+# batched-push-timeout) and the probes' bbox normalisation assumes the
+# legacy mux's scaling+letterbox behaviour. DS 9.x nudges toward the
+# new mux on some platforms; migrating is a deliberate future change,
+# not something to discover mid-incident.
+export USE_NEW_NVSTREAMMUX=no
 
-# Only touch the plugin-dir symlink — the target file may be a bind-mount and
-# unmovable. The symlink in /libv4l/plugins/nv/ is what libv4l actually scans.
-# Ignore errors so a stricter mount layout doesn't kill the container.
-rm -f /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvcuvidvideocodec.so 2>/dev/null || true
-
-# Wipe GStreamer's cached plugin registry. The DeepStream-L4T image ships
-# with a registry built against the image's initial lib layout; when we
-# later installed libx264/libavcodec/libpq/etc., the registry still
-# remembered those plugins as "failed to load".
+# Wipe GStreamer's cached plugin registry. The base image ships with a
+# registry built against the image's initial lib layout; our apt
+# installs (libpq, gst plugin sets, ...) can leave stale "failed to
+# load" entries behind otherwise.
 rm -rf /root/.cache/gstreamer-1.0 /tmp/gst-* 2>/dev/null || true
 
 # Seed the persistent model dir with the DeepStream samples on first boot.
@@ -197,12 +181,12 @@ report_calibration() {
 }
 
 # INT8 path: produce the calibration table + engine offline with
-# trtexec (see calibrate-yolo26.sh). The in-process TRT calibrator
-# crashes on this ONNX with TRT 10.3 ("Assertion item.second != nullptr")
-# so we bypass it entirely. On success, nvinfer on first worker start
-# just deserialises the pre-built engine. On any failure we fall
+# trtexec (see calibrate-yolo26.sh). Kept for parity with the Orin
+# build; on Blackwell the FP8/NVFP4 quantisation path (tools/quant-onnx,
+# Phase 3) supersedes INT8 calibration entirely. On any failure we fall
 # back to FP16 so the container never crash-loops.
 if [ "$PRECISION" = "int8" ]; then
+    echo "entrypoint: note — INT8 calibration is legacy; prefer FP8/NVFP4 via tools/quant-onnx on Blackwell"
     CALIB_TABLE="$YOLO_DEST/${VARIANT}.calib.table"
     ENGINE_INT8="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_int8.engine"
 

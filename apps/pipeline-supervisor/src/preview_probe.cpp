@@ -1,5 +1,6 @@
 #include "preview_probe.h"
 #include "face_crop_jpeg.h"
+#include "surface_alloc.h"
 
 #include <atomic>
 #include <chrono>
@@ -86,29 +87,18 @@ void preview_probe_ctx_free(PreviewProbeCtx* ctx) {
 namespace {
 
 // Lazily allocate the reusable RGBA destination at the gpuId of the
-// first observed input surface. Same pattern as hailo_probe's
-// ensureDstSurface — the surface is reused across every encode, so the
-// cost is paid once per worker.
+// first observed input surface. The surface is reused across every
+// encode, so the cost is paid once per worker. memType decision
+// (CUDA_UNIFIED on GB10) lives in surface_alloc.cpp.
 bool ensureDstSurface(PreviewProbeCtx* ctx, NvBufSurface* in_surf) {
     if (ctx->dst_surf) return true;
 
-    NvBufSurfaceAllocateParams ap{};
-    ap.params.gpuId        = in_surf->gpuId;
-    ap.params.width        = static_cast<unsigned>(kOutW);
-    ap.params.height       = static_cast<unsigned>(kOutH);
-    ap.params.size         = 0;
-    ap.params.isContiguous = true;
-    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    ap.params.layout       = NVBUF_LAYOUT_PITCH;
-    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
-    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
-    if (NvBufSurfaceAllocate(&ctx->dst_surf, 1, &ap) != 0 || !ctx->dst_surf) {
+    if (!AllocCpuReadableRGBA(&ctx->dst_surf, kOutW, kOutH, in_surf->gpuId)) {
         std::cerr << "preview_probe[" << ctx->camera_id
-                  << "]: NvBufSurfaceAllocate failed\n";
+                  << "]: AllocCpuReadableRGBA failed\n";
         ctx->dst_surf = nullptr;
         return false;
     }
-    ctx->dst_surf->numFilled = 1;
     return true;
 }
 
@@ -189,6 +179,9 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
     GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
     if (!buf) return GST_PAD_PROBE_OK;
 
+    // GPU transform session for this streaming thread (no VIC on GB10).
+    EnsureGpuTransformSession();
+
     GstMapInfo map{};
     if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
     auto* in_surf = reinterpret_cast<NvBufSurface*>(map.data);
@@ -239,6 +232,9 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
         gst_buffer_unmap(buf, &map);
         return GST_PAD_PROBE_OK;
     }
+    // Drain this thread's transform stream before writeRingEntry maps
+    // the destination for CPU reads.
+    SyncGpuTransformStream();
 
     bool ok = writeRingEntry(ctx);
     gst_buffer_unmap(buf, &map);

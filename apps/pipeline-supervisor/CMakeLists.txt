@@ -32,13 +32,13 @@ add_executable(pipeline-supervisor
   src/config.cpp
   src/db_reconciler.cpp
   src/rtsp_probe.cpp
-  src/hailo_inference.cpp
-  src/hailo_probe.cpp
+  src/surface_alloc.cpp
   src/preview_probe.cpp
 )
 
-# DeepStream headers + libs on Jetson live under /opt/nvidia/deepstream.
-# Detect and link so the nvds metadata probe compiles in.
+# DeepStream headers + libs live under /opt/nvidia/deepstream (SBSA
+# container on DGX Spark). Detect and link so the nvds metadata probe
+# compiles in.
 set(DEEPSTREAM_ROOT "/opt/nvidia/deepstream/deepstream" CACHE PATH "DeepStream install root")
 if (EXISTS "${DEEPSTREAM_ROOT}/sources/includes/gstnvdsmeta.h")
   set(DEEPSTREAM_FOUND TRUE)
@@ -48,12 +48,30 @@ else()
   message(STATUS "DeepStream: NOT found — building fallback pipeline only")
 endif()
 
-# HailoRT used to be linked directly here for the direct-VDevice path, but
-# the pipeline-supervisor now talks to apps/hailo-broker over a unix socket
-# (see src/hailo_inference.cpp). The broker owns libhailort exclusively; the
-# supervisor has zero hailort dependency. Keeping the variable for the
-# ${HAILO_FOUND} generator-expression below, but it's always FALSE now.
-set(HAILO_FOUND FALSE)
+# CUDA runtime — needed by surface_alloc.cpp for the per-thread
+# NvBufSurfTransform GPU session stream. Only relevant when DeepStream
+# is present (the fallback build never touches NvBufSurface).
+if (DEEPSTREAM_FOUND)
+  find_library(CUDART_LIB cudart HINTS
+    /usr/local/cuda/lib64
+    /usr/local/cuda/targets/sbsa-linux/lib
+    /usr/local/cuda/targets/aarch64-linux/lib)
+  find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h HINTS
+    /usr/local/cuda/include
+    /usr/local/cuda/targets/sbsa-linux/include
+    /usr/local/cuda/targets/aarch64-linux/include)
+  # CUDA driver API stub — the SBSA libnvbufsurface.so has undefined
+  # driver-API symbols (cuCtxGetCurrent, ...). The real libcuda.so is
+  # injected by nvidia-container-toolkit at runtime; at build time we
+  # satisfy the linker with the toolkit's stub.
+  find_library(CUDA_DRIVER_STUB cuda HINTS
+    /usr/local/cuda/lib64/stubs
+    /usr/local/cuda/targets/sbsa-linux/lib/stubs
+    /usr/local/cuda/targets/aarch64-linux/lib/stubs)
+  if (NOT CUDART_LIB OR NOT CUDA_INCLUDE_DIR OR NOT CUDA_DRIVER_STUB)
+    message(FATAL_ERROR "DeepStream found but CUDA runtime/stub not located")
+  endif()
+endif()
 
 target_include_directories(pipeline-supervisor PRIVATE
   ${GST_INCLUDE_DIRS}
@@ -61,6 +79,7 @@ target_include_directories(pipeline-supervisor PRIVATE
   ${PQ_INCLUDE_DIRS}
   src
   $<$<BOOL:${DEEPSTREAM_FOUND}>:${DEEPSTREAM_ROOT}/sources/includes>
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:${CUDA_INCLUDE_DIR}>
 )
 
 target_link_directories(pipeline-supervisor PRIVATE
@@ -78,11 +97,13 @@ target_link_libraries(pipeline-supervisor PRIVATE
   $<$<NOT:$<BOOL:${NATS_FOUND}>>:nats>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvdsgst_meta>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvds_meta>
-  # Jetson NVMM buffer ops used by the in-probe face cropper:
+  # NvBufSurface buffer ops used by the in-probe face cropper:
   # NvBufSurface*  — map/sync/destroy of the host-mappable RGBA dst
-  # NvBufSurfTransform* — VIC-accelerated NV12→RGBA + resize
+  # NvBufSurfTransform* — GPU-accelerated NV12→RGBA + resize
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurface>
   $<$<BOOL:${DEEPSTREAM_FOUND}>:nvbufsurftransform>
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:${CUDART_LIB}>
+  $<$<BOOL:${DEEPSTREAM_FOUND}>:${CUDA_DRIVER_STUB}>
   # libjpeg-turbo for in-probe face-crop JPEG encoding. System
   # package `libjpeg-turbo8-dev` provides both header and library.
   jpeg

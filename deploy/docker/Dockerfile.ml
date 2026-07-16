@@ -12,7 +12,7 @@
 # Models (face_detector.onnx + arcface.onnx) are bind-mounted from
 # the fnvr-data volume; they land there via the pipeline container's
 # first-boot seeding so this image doesn't need to ship them.
-FROM python:3.11-slim AS build
+FROM python:3.13-slim AS build
 
 # hdbscan builds a C extension; opencv-python-headless + onnxruntime
 # only need runtime libs. Install build toolchain for the compile
@@ -36,7 +36,7 @@ RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir .
 
 # --- runtime stage ---------------------------------------------------
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \

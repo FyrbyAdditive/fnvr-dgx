@@ -1,6 +1,6 @@
 # Pipeline
 
-The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A supervisor parent launches, watches, and restarts children. Each camera is isolated: a single bad RTSP feed cannot take the stack down.
+The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX Spark), one child per camera. A supervisor parent launches, watches, and restarts children. Each camera is isolated: a single bad RTSP feed cannot take the stack down.
 
 ## Per-camera GStreamer graph
 
@@ -10,7 +10,7 @@ The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A 
     → {h264,h265}parse  (codec auto-detected by an ffprobe preamble)
     → tee
         ├─ queue → nvv4l2decoder → nvstreammux (batch 1)
-        │                        → nvinfer  pgie   (yolo26 / hailo-broker detector)
+        │                        → nvinfer  pgie   (yolo26 detector)
         │                        → nvtracker  (NvDCF, IDs + bbox smoothing)
         │                        → nvinfer  lpdnet  (plate detector SGIE, optional)
         │                        → nvinfer  lprnet  (plate OCR SGIE, optional)
@@ -18,7 +18,7 @@ The pipeline is a C++ / DeepStream 7 GStreamer process, one child per camera. A 
         │                        → nvinfer  arcface (face embedder SGIE, optional)
         │                        → fakesink                                (probe taps here)
         │                        (a pad probe on pgie.src — see preview_probe.cpp — taps the in-flight
-        │                         decoded NVMM frame at 1 fps, scales to 480×270 via VIC and writes
+        │                         decoded NVMM frame at 1 fps, scales to 480×270 on the GPU and writes
         │                         the JPEG ring at /var/lib/fnvr/live/<cam>.<n>.jpg. No second decode.)
         └─ queue → {h264,h265}parse config-interval=-1
                 → rtspclientsink → rtsp://mediamtx:8554/live_<cam>          (RECORD + WebRTC)
@@ -71,9 +71,9 @@ The pipeline uses the `nats-c` library. The default reconnect behaviour gives up
 
 Without this, the detection *and* heartbeat publish paths can silently die without the process noticing — we've hit that in production and spent hours diagnosing it.
 
-## Hourly segment rotation
+## Hourly segment rotation (legacy — scheduled for removal)
 
-Each worker is restarted at the top of every hour so recordings land in the new `YYYY/MM/DD/HH/<camera>/rec.mp4` directory. Without this, a worker that's up for 24 h writes a 100+ GB `rec.mp4` into its birth hour's folder and timeline scrubbing breaks.
+Each worker is restarted at the top of every hour. This predates the move to MediaMTX-side recording (which segments on its own `MTX_RECORDSEGMENTDURATION=1h` clock) — the original rationale, per-hour `rec.mp4` directories written by the supervisor, no longer exists. The restart churn is pure downside now and is slated for deletion with the batched-mux rework.
 
 The rotation is **silent** from the UI's perspective:
 
@@ -85,18 +85,15 @@ Log trail: `docker logs fnvr-pipeline-1 | grep rotation` yields lines of the for
 
 A genuine `Start()` failure during rotation still publishes `{"state":"failed"}` — a busted rotation flips the UI red as it should.
 
-## Detector backends: TRT vs Hailo
+## Detector backend
 
-The pgie can be either NVIDIA's `nvinfer` (TensorRT engine on GPU/DLA) or a Hailo-8 accelerator. The choice is per-camera (`cameras.detector_backend = trt | hailo`) and changes which probe is attached after the tracker:
+The pgie is always NVIDIA's `nvinfer` running a TensorRT engine on the GPU. Detection metadata appears as `NvDsObjectMeta` and the standard probe walks it.
 
-- **TRT path.** `nvinfer` runs the engine in-process. Detection metadata appears as `NvDsObjectMeta` and the standard probe walks it.
-- **Hailo path.** The pipeline reads decoded NV12 frames out of the buffer, hands them via VIC-accelerated NV12→RGBA transform (see [hailo_probe.cpp](../../apps/pipeline-supervisor/src/hailo_probe.cpp)) to `apps/hailo-broker/` over a unix socket at `/var/run/fnvr/hailo.sock`. The broker is a separate container that owns `/dev/hailo0` exclusively; the supervisor has zero hailort dependency. Compose overlay [docker-compose.hailo.yml](../../deploy/docker/docker-compose.hailo.yml) wires up the shared `fnvr-hailo-sock` named volume.
-
-The broker exists because `libhailort` 4.23's multi-process service (`run_async`) is unstable when several worker processes hammer the same `ConfiguredInferModel`. One broker, many supervisor children. See `apps/hailo-broker/wire.h` for the request/response framing and the in-broker batching policy (up to 4 frames per `hailort` call).
+(The Orin build carried a parallel Hailo-8 PCIe accelerator path because the Orin GPU ran out of headroom; on DGX Spark the Blackwell GPU vastly outclasses it, so that path — hailo-broker container, in-pipeline probe, HEF compile toolchain, per-camera `detector_backend` — was removed.)
 
 ## First-run engine compilation
 
-DeepStream `nvinfer` elements lazy-compile their TensorRT engines on first use. For yolo26x on Orin AGX this takes ~30 s per worker (cached thereafter under `/var/lib/fnvr/models/yolo26/*.engine`). The container entrypoint publishes `{"state":"starting"}` heartbeats during compile, and the UI's 15-min "starting" freshness window covers that.
+DeepStream `nvinfer` elements lazy-compile their TensorRT engines on first use (cached thereafter under `/var/lib/fnvr/models/yolo26/*.engine`; the Orin took ~30 s per worker for yolo26x — re-measure on the Spark). The container entrypoint publishes `{"state":"starting"}` heartbeats during compile, and the UI's 15-min "starting" freshness window covers that.
 
 Pre-bake path: a `trtexec` invocation in [deploy/docker/calibrate-yolo26.sh](../../deploy/docker/calibrate-yolo26.sh) can produce the engine ahead of time.
 

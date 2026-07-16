@@ -1,0 +1,68 @@
+fnvr-dgx Phase-1 verification — 2026-07-16, DGX Spark "shodan" (GB10)
+Captured after the platform port (DS 9.1 SBSA container, Hailo removed,
+GPU-compute transforms) with the fully-updated stack. Per-camera
+workers, nvstreammux batch-size=1 — pre-batched-mux, comparable in
+spirit to the Orin baseline of 2026-05-03.
+
+Host: DGX OS (Ubuntu 24.04 base), kernel 6.17.0-1021-nvidia, driver
+580.159.03, full apt upgrade + reboot same day. Docker CDI (no nvidia
+runtime); GPU via compose device reservations.
+
+Image: nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark
+  DeepStream 9.1 · CUDA 13.2 (V13.2.78) · TensorRT 10.16.1 · GStreamer 1.24.2
+  + OpenCV 4.12.0 (source-built, core/imgproc/imgcodecs) · nats.c v3.13.0
+
+Stack: pgvector:pg18, nats:2-alpine, MediaMTX latest, golang:1.26 /
+node:24 / nginx:1.29 / python:3.13 service images, Go deps go-get -u'd.
+
+================================================================================
+SECTION 1 — Engine build + startup
+
+  yolo26x FP16 TRT engine (b1, sm_121): built from ONNX in ~19 s
+    (Orin AGX: multiple minutes for the same model)
+  Worker cold start to PLAYING with cached engine: ~4 s
+
+================================================================================
+SECTION 2 — GPU load (nvidia-smi dmon -s u, 5×1 s, steady state)
+
+  Cameras: 2 (street-sample 1080p30 H.264 looping DS sample; test-pattern
+  1080p30 synthetic). yolo26x FP16, interval=0, batch-size=1 per worker,
+  no ANPR/face.
+
+    SM  ~34 %      (two per-frame yolo26x streams, unbatched)
+    DEC ~3 %       (two 1080p30 H.264 sessions)
+    ENC 0 %        (recording is stream-copy via MediaMTX)
+
+  Read: at batch-1 per-camera, SM extrapolates to saturation well before
+  16 cameras — the Phase-2 batched-mux + (optionally) interval/FP8 work
+  is the capacity lever. NVDEC at 3 % for 2 streams says the single
+  decode engine can carry 16+ 1080p streams with big margin.
+
+================================================================================
+SECTION 3 — End-to-end functional
+
+  detections table:        29,789 rows in ~25 min (cars 6.4k, persons
+                           3.5k, trucks, buses, ... from the DS sample)
+  object thumbnails:       10,647 JPEGs via GPU crop (CUDA_UNIFIED map)
+  preview ring:            4-entry ring per camera on tmpfs, 1 fps
+  recordings:              fMP4 per camera via MediaMTX; segments table
+                           indexing (4 rows @ first storage-manager tick)
+  camera heartbeats:       running + last_heartbeat_at fresh for both
+
+================================================================================
+SECTION 4 — Fault drills
+
+  kill -9 worker:          supervisor logged signal, respawned in ~10 s,
+                           sibling camera unaffected, state recovered
+  source loss:             state flipped running→failed in ≤20 s;
+                           recovered to running on source return
+
+================================================================================
+Comparison guidance for the Phase-2 (batched-mux) benchmark
+
+1. Re-capture Section 2 at equal camera count/fps. Expect SM mean to
+   drop materially with batched inference; DEC unchanged.
+2. Re-run Section 3 counts over a fixed window — detection rate should
+   be ~unchanged (batching changes how, not what, the GPU computes).
+3. Keep yolo26x FP16 interval=0 for the first comparison; only then
+   layer interval/FP8 variations.

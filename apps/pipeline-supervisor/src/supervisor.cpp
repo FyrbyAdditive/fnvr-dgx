@@ -129,14 +129,6 @@ void Supervisor::reconcileOnce() {
             it->second->stop = true;
             if (it->second->thread.joinable()) it->second->thread.join();
             it = workers_.erase(it);
-        } else if (wi->second->detector_backend != it->second->cam.detector_backend) {
-            std::cerr << "supervisor: stopping [" << it->first
-                      << "] (detector_backend changed "
-                      << it->second->cam.detector_backend << " -> "
-                      << wi->second->detector_backend << ")\n";
-            it->second->stop = true;
-            if (it->second->thread.joinable()) it->second->thread.join();
-            it = workers_.erase(it);
         } else {
             ++it;
         }
@@ -297,6 +289,16 @@ void Supervisor::workerMain(Worker* w) {
     // keeps retrying; the state clears on the next successful PLAYING
     // publish.
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
+
+    // Chronic crash-loop detector: number of consecutive child exits
+    // that happened before reaching grace_sec of uptime. Once this
+    // passes the threshold, the startup-grace suppression below is
+    // overridden and `failed` is published — a camera with a broken
+    // config (wrong codec graph, dead URL) must not sit at "starting"
+    // forever. With exponential backoff capped at 30 s, 10 fast exits
+    // means the camera has been broken for at least ~2-4 minutes.
+    int consecutive_fast_exits = 0;
+    constexpr int kChronicFlapThreshold = 10;
 
     // Startup grace: suppress the `failed` publish for a worker that
     // has *never* run long enough to reach PLAYING. A child process
@@ -471,16 +473,30 @@ void Supervisor::workerMain(Worker* w) {
             std::chrono::steady_clock::now() - child_spawn_at).count();
         if (grace_sec > 0 && child_uptime >= grace_sec) {
             has_been_healthy = true;
+            consecutive_fast_exits = 0;
+        } else {
+            consecutive_fast_exits++;
         }
         if (recent_exits.size() >= 3 && nats_) {
-            if (grace_sec > 0 && !has_been_healthy) {
+            // Startup grace exists so a slow-to-warm source doesn't
+            // flash "failed" during its first honest connect attempts.
+            // It must NOT hide a chronic crash-loop (wrong codec graph,
+            // bad URL, missing model): if the child has died young many
+            // times in a row without ever reaching a healthy run, the
+            // operator needs to see "failed", not eternal "starting".
+            const bool chronic = consecutive_fast_exits >= kChronicFlapThreshold;
+            if (grace_sec > 0 && !has_been_healthy && !chronic) {
                 std::cerr << "worker[" << w->cam.id << "]: flapping ("
                           << recent_exits.size() << " exits in 60s) — in "
                           << grace_sec << "s startup grace (no healthy run yet), "
                           << "not publishing failed\n";
             } else {
                 std::cerr << "worker[" << w->cam.id << "]: flapping ("
-                          << recent_exits.size() << " exits in 60s) — publishing failed\n";
+                          << recent_exits.size() << " exits in 60s"
+                          << (chronic && !has_been_healthy
+                                  ? ", chronic — grace overridden"
+                                  : "")
+                          << ") — publishing failed\n";
                 std::string subj = "fnvr.state.camera." + w->cam.id;
                 std::string payload = "{\"camera_id\":\"" + w->cam.id +
                     "\",\"state\":\"failed\"}";

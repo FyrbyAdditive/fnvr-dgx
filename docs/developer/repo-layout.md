@@ -61,19 +61,11 @@ Monorepo. One Taskfile + one docker-compose, every service is its own directory.
 │   │       ├── pipeline.cpp       # per-camera GStreamer graph
 │   │       ├── face_crop_jpeg.*   # GPU crop + libjpeg-turbo encode (separate TU)
 │   │       ├── object_phash.*     # perceptual hash for detection dedup
-│   │       ├── hailo_probe.*      # tracker-output probe → hailo-broker socket
-│   │       ├── hailo_inference.*  # broker client (wire.h protocol)
+│   │       ├── surface_alloc.*    # CPU-readable surface alloc + GPU transform session
 │   │       ├── rtsp_probe.*       # codec auto-detection preamble
 │   │       ├── db_reconciler.*    # libpq camera-config sync
 │   │       ├── nats_publisher.*   # hardened NATS wrapper (see pipeline.md)
 │   │       └── config.*           # YAML config
-│   │
-│   ├── hailo-broker/            # C++: owns /dev/hailo0, serves unix-socket inference RPC
-│   │   ├── CMakeLists.txt
-│   │   └── src/
-│   │       ├── main.cpp
-│   │       ├── hailo_inference.* # libhailort wrapper, batch-of-4 policy
-│   │       └── wire.h            # request/response framing
 │   │
 │   ├── storage-manager/         # Go: retention / quota / disk-pressure
 │   │   └── internal/lifecycle/lifecycle.go
@@ -102,11 +94,10 @@ Monorepo. One Taskfile + one docker-compose, every service is its own directory.
 │
 ├── deploy/
 │   ├── docker/
-│   │   ├── Dockerfile.{api,events,ml,notifications,pipeline,hailo-broker,storage,web}
+│   │   ├── Dockerfile.{api,events,ml,notifications,pipeline,storage,web}
 │   │   ├── docker-compose.yml              # default stack (postgres tuning lives here)
-│   │   ├── docker-compose.hailo.yml        # adds hailo-broker + /var/run/fnvr socket mount
 │   │   ├── docker-compose.dual-nic.yml     # optional overlay for camera-LAN isolation
-│   │   ├── pipeline-entrypoint.sh          # TRT + libv4l shim + INT8 fallback
+│   │   ├── pipeline-entrypoint.sh          # model seed + config render + INT8 fallback
 │   │   ├── calibrate-yolo26.sh             # offline trtexec driver
 │   │   └── nginx.conf                      # web container's proxy (api only — media is direct)
 │   └── config/

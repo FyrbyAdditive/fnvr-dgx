@@ -49,8 +49,8 @@ if [ "$NUM_IMAGES" -lt 100 ]; then
 fi
 echo "calibrate: building INT8 engine + calib table for $VARIANT using $NUM_IMAGES images"
 
-# trtexec is shipped inside the tensorrt package that ships with the
-# DeepStream-L4T base image. Paths vary with JetPack; probe both.
+# trtexec ships with the TensorRT package inside the DeepStream base
+# image. Install paths vary across releases; probe both.
 if command -v /usr/src/tensorrt/bin/trtexec >/dev/null 2>&1; then
     TRTEXEC=/usr/src/tensorrt/bin/trtexec
 elif command -v trtexec >/dev/null 2>&1; then

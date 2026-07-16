@@ -13,8 +13,9 @@
 
 namespace fnvr {
 
-// Shell out to ffprobe. gst_discoverer returns MISSING_PLUGINS on Jetson
-// for H.265 RTSP; ffprobe handles both codecs plus gives us dimensions.
+// Shell out to ffprobe. gst_discoverer returns MISSING_PLUGINS for
+// H.265 RTSP on some platforms; ffprobe handles both codecs plus gives
+// us dimensions.
 static RtspProbeResult ProbeRtspViaFfprobe(const std::string& url) {
     RtspProbeResult r;
     std::string esc;
@@ -23,11 +24,23 @@ static RtspProbeResult ProbeRtspViaFfprobe(const std::string& url) {
                       "-show_entries stream=codec_name,width,height "
                       "-of default=nw=1 "
                       "'" + esc + "' 2>/dev/null";
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) return r;
+    FILE* fp = popen(cmd.c_str(), "r");
+    if (!fp) return r;
     std::array<char, 128> buf;
     std::string out;
-    while (fgets(buf.data(), buf.size(), pipe.get())) out += buf.data();
+    while (fgets(buf.data(), buf.size(), fp)) out += buf.data();
+    // A non-zero exit with no output means ffprobe itself is broken
+    // (missing shared libs, not installed) or the URL is unreachable.
+    // This MUST be loud: a silent probe failure defaults the codec to
+    // h264 downstream, which builds a crash-looping graph for H.265
+    // cameras — exactly the failure we hit on the stripped DS image.
+    int rc = pclose(fp);
+    if (out.empty()) {
+        std::cerr << "probe: ffprobe produced no output (exit status "
+                  << rc << ") for " << url
+                  << " — broken ffprobe install or unreachable source; "
+                  << "codec detection will fall back and may be WRONG\n";
+    }
     // Output format: key=value per line.
     std::istringstream iss(out);
     std::string line;

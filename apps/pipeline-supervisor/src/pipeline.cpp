@@ -13,22 +13,22 @@
 #include <vector>
 
 #include "face_crop_jpeg.h"
-#include "hailo_probe.h"
 #include "preview_probe.h"
 #include "object_phash.h"
 #include "rtsp_probe.h"
+#include "surface_alloc.h"
 
-// DeepStream metadata. Only include when building for Jetson — these headers
-// come from the deepstream-l4t base image.
+// DeepStream metadata. Only include when building against DeepStream —
+// these headers come from the DeepStream SBSA base image.
 #if __has_include(<gstnvdsmeta.h>)
 #  define FNVR_HAS_DEEPSTREAM 1
 #  include <gstnvdsmeta.h>
 #  include <nvdsmeta.h>
-// NvDsInferTensorMeta + NVDSINFER_TENSOR_OUTPUT_META for ArcFace
-// output-tensor-meta extraction.
+// NvDsInferTensorMeta + NVDSINFER_TENSOR_OUTPUT_META for the face
+// embedder's output-tensor-meta extraction.
 #  include <gstnvdsinfer.h>
 // NvBufSurface + NvBufSurfTransform for in-probe face cropping:
-// we VIC-convert the batched NVMM buffer into a small pitch-linear
+// we GPU-convert the batched NVMM buffer into a small pitch-linear
 // RGBA surface that libjpeg can read synchronously.
 #  include <nvbufsurface.h>
 #  include <nvbufsurftransform.h>
@@ -210,7 +210,7 @@ std::string parentVehicleClass(NvDsObjectMeta* obj) {
 
 // saveFaceCrop extracts a crop of the current probe buffer's frame at
 // the given normalised bbox, converts it to a small RGBA host buffer
-// via VIC-accelerated NvBufSurfTransform (handles NV12 block-linear
+// via GPU-accelerated NvBufSurfTransform (handles NV12 block-linear
 // → RGBA pitch-linear + resize in one pass), JPEG-encodes and writes.
 // Zero PTS drift — the buffer pixels are literally the ones the face
 // detection was produced from. short_id becomes {thumbs_dir}/{id}.jpg;
@@ -227,6 +227,10 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
                   float nx, float ny, float nw, float nh,
                   const std::string& short_id) {
     if (ctx.thumbs_dir.empty() || !gst_buf || !frame) return;
+
+    // Pin this streaming thread's transform session to GPU compute
+    // (no VIC on GB10) with its own CUDA stream. Idempotent.
+    EnsureGpuTransformSession();
 
     // Expand bbox 1.4x around centre, clip to [0,1].
     float pad = 1.4f;
@@ -266,25 +270,14 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
     }
 
     // Create a 1-frame pitch-linear RGBA destination we CAN CPU-map.
-    // Jetson-correct: memType=NVBUF_MEM_SURFACE_ARRAY + PITCH layout.
-    NvBufSurfaceAllocateParams ap{};
-    ap.params.gpuId        = in_surf->gpuId;
-    ap.params.width        = guint(CROP_OUT_W);
-    ap.params.height       = guint(CROP_OUT_H);
-    ap.params.size         = 0;
-    ap.params.isContiguous = true;
-    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    ap.params.layout       = NVBUF_LAYOUT_PITCH;
-    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
-    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
+    // memType choice (CUDA_UNIFIED on GB10) lives in surface_alloc.cpp.
     NvBufSurface* dst = nullptr;
-    if (NvBufSurfaceAllocate(&dst, 1, &ap) != 0 || !dst) {
+    if (!AllocCpuReadableRGBA(&dst, CROP_OUT_W, CROP_OUT_H, in_surf->gpuId)) {
         gst_buffer_unmap(gst_buf, &map);
         return;
     }
-    dst->numFilled = 1;
 
-    // VIC-accelerated source crop + colour-format + resize in one pass.
+    // GPU-accelerated source crop + colour-format + resize in one pass.
     NvBufSurfTransformRect src_rect {
         guint(py), guint(px), guint(pw_px), guint(ph_px)  // top, left, width, height
     };
@@ -312,6 +305,9 @@ void saveFaceCrop(const ProbeCtx& ctx, GstBuffer* gst_buf,
         gst_buffer_unmap(gst_buf, &map);
         return;
     }
+    // The transform ran on this thread's non-blocking CUDA stream —
+    // drain it before the CPU touches the pixels.
+    SyncGpuTransformStream();
 
     // CPU-map the destination, sync, read pixels.
     if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
@@ -344,7 +340,7 @@ constexpr int OBJ_CROP_OUT_H = 128;
 // crop so the probe can attach it to the NATS payload. Writes a
 // 128×128 JPEG thumbnail to {thumbs_dir_objects}/{short_id}.jpg.
 //
-// Returns 0 on any failure (missing thumbs dir, bbox too small, VIC
+// Returns 0 on any failure (missing thumbs dir, bbox too small, GPU
 // transform error). Caller can still emit the detection without a
 // phash — suppression just doesn't apply.
 //
@@ -356,6 +352,9 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
                                     float nx, float ny, float nw, float nh,
                                     const std::string& short_id) {
     if (!gst_buf || !frame) return 0;
+
+    // GPU transform session for this streaming thread (idempotent).
+    EnsureGpuTransformSession();
 
     float x0 = nx, y0 = ny, x1 = nx + nw, y1 = ny + nh;
     if (x0 < 0) x0 = 0;
@@ -385,22 +384,14 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
         return 0;
     }
 
-    NvBufSurfaceAllocateParams ap{};
-    ap.params.gpuId        = in_surf->gpuId;
-    ap.params.width        = guint(OBJ_CROP_OUT_W);
-    ap.params.height       = guint(OBJ_CROP_OUT_H);
-    ap.params.size         = 0;
-    ap.params.isContiguous = true;
-    ap.params.colorFormat  = NVBUF_COLOR_FORMAT_RGBA;
-    ap.params.layout       = NVBUF_LAYOUT_PITCH;
-    ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
-    ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
+    // CPU-mappable RGBA destination — memType decision lives in
+    // surface_alloc.cpp (CUDA_UNIFIED on GB10).
     NvBufSurface* dst = nullptr;
-    if (NvBufSurfaceAllocate(&dst, 1, &ap) != 0 || !dst) {
+    if (!AllocCpuReadableRGBA(&dst, OBJ_CROP_OUT_W, OBJ_CROP_OUT_H,
+                              in_surf->gpuId)) {
         gst_buffer_unmap(gst_buf, &map);
         return 0;
     }
-    dst->numFilled = 1;
 
     NvBufSurfTransformRect src_rect {
         guint(py), guint(px), guint(pw_px), guint(ph_px)
@@ -427,6 +418,8 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
         gst_buffer_unmap(gst_buf, &map);
         return 0;
     }
+    // Drain this thread's transform stream before the CPU reads.
+    SyncGpuTransformStream();
 
     if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) {
         NvBufSurfaceDestroy(dst);
@@ -748,11 +741,11 @@ GstElement* SingleCameraPipeline::BuildPipeline() {
     // the live-JPEG branch taps. Common structure for both DeepStream and
     // fallback paths.
     if (is_v4l2) {
-        // Direct v4l2 pipelines (v4l2src → nvv4l2 → tee) SIGSEGV after
-        // NVENC init on Jetson in our container. Users should instead run
-        // USB cams through MediaMTX (rtsp://mediamtx:8554/fnvr-usb0 — see
-        // deploy/docker/docker-compose.yml). We still recognise v4l2://
-        // here to fail-fast with a clear message rather than hang.
+        // Direct v4l2 pipelines are not supported — USB cams run through
+        // MediaMTX (rtsp://mediamtx:8554/fnvr-usb0 — see
+        // deploy/docker/docker-compose.yml), which keeps every camera on
+        // the proven RTSP code path. We still recognise v4l2:// here to
+        // fail-fast with a clear message rather than hang.
         std::cerr << "pipeline[" << cam_.id
                   << "]: v4l2:// URLs aren't supported — point the camera at "
                      "rtsp://mediamtx:8554/usb0 instead (usb-bridge service).\n";
@@ -975,29 +968,11 @@ p << "rtspsrc location=" << url
             "nvinfer name=arcface config-file-path=/etc/fnvr/nvinfer/arcface.txt ! ";
     }
 
-    // Primary-detector element. "trt" = DeepStream nvinfer running on
-    // the Orin GPU; "hailo" = in-process libhailort inference attached
-    // as a src-pad probe on a no-op `queue name=pgie` (see
-    // hailo_probe.cpp). The probe walks the batch, downscales each
-    // frame's NVMM surface to 640x640 RGB via NvBufSurfTransform, runs
-    // yolov11l on the Hailo-8, decodes the NMS output, and attaches
-    // NvDsObjectMeta directly to the frame meta. Downstream nvtracker
-    // + SGIEs + InferSrcProbe see the same shape regardless of backend
-    // — they all bind to the element named "pgie" and read
-    // NvDsObjectMeta from the buffer.
-    //
-    // We deliberately avoid the `hailonet` + `hailofilter` GStreamer
-    // plugins: hailonet re-emits a fresh GstBuffer rather than
-    // forwarding the input, which drops NvDsBatchMeta and breaks
-    // DeepStream's metadata flow. Going direct to libhailort keeps
-    // the DeepStream graph single-pipeline.
-    std::string pgie_element;
-    if (cam_.detector_backend == "hailo") {
-        pgie_element = "queue name=pgie max-size-buffers=4 leaky=no ! ";
-    } else {
-        pgie_element = std::string(
-            "nvinfer name=pgie config-file-path=") + infer_config_ + " ! ";
-    }
+    // Primary-detector element: DeepStream nvinfer running on the GPU.
+    // Downstream nvtracker + SGIEs + InferSrcProbe bind to the element
+    // named "pgie" and read NvDsObjectMeta from the buffer.
+    std::string pgie_element = std::string(
+        "nvinfer name=pgie config-file-path=") + infer_config_ + " ! ";
 
     // Recording is now MediaMTX's job — it subscribes to the same
     // RTSP stream the WHEP/WebRTC live tile uses, writes fragmented
@@ -1050,7 +1025,7 @@ p << "rtspsrc location=" << url
     // load per camera — the inference branch above already decodes the
     // exact same frames microseconds earlier. We now generate the ring via
     // a pad probe on pgie.src that taps the in-flight NVMM surface, scales
-    // to 480×270 via VIC, and encodes a JPEG via the existing
+    // to 480×270 on the GPU, and encodes a JPEG via the existing
     // face_crop_jpeg helper. See preview_probe.{h,cpp} and the probe
     // attachment block below ensureDstSurface() / Start().
     //
@@ -1103,40 +1078,6 @@ p << "rtspsrc location=" << url
     const bool skip_inference_probe = cam_.enabled_detectors.size() == 1 &&
                                        cam_.enabled_detectors[0] == "none";
 
-    // For the hailo backend the `pgie` element is a no-op queue. Install
-    // the Hailo inference probe on its src pad so libhailort runs between
-    // nvstreammux and nvtracker, injecting NvDsObjectMeta into the frame
-    // meta exactly as nvinfer would have. This keeps the rest of the
-    // DeepStream chain (tracker + SGIEs + InferSrcProbe) unchanged.
-    if (use_deepstream_ && !skip_inference_probe &&
-        cam_.detector_backend == "hailo") {
-        GstElement* pgie_elem = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
-        if (pgie_elem) {
-            GstPad* src = gst_element_get_static_pad(pgie_elem, "src");
-            if (src) {
-                // Source dimensions come from the probed recording dims —
-                // same values we set on nvstreammux width/height.
-                int hsrc_w = rec_width_  > 0 ? rec_width_  : 1920;
-                int hsrc_h = rec_height_ > 0 ? rec_height_ : 1080;
-                auto* hctx = fnvr::hailo_probe_ctx_new(
-                    "/var/lib/fnvr/models/hailo/yolov11l.hef",
-                    hsrc_w, hsrc_h);
-                if (hctx) {
-                    gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
-                                      &fnvr::HailoInferProbe, hctx, nullptr);
-                    std::cerr << "pipeline[" << cam_.id
-                              << "]: hailo-8 inference probe attached on pgie.src\n";
-                } else {
-                    std::cerr << "pipeline[" << cam_.id
-                              << "]: hailo-8 inference setup failed; "
-                              << "pipeline runs without detections on this cam\n";
-                }
-                gst_object_unref(src);
-            }
-            gst_object_unref(pgie_elem);
-        }
-    }
-
     // Live-thumbnail probe — taps the decoded NVMM frame already in
     // flight on the inference branch and writes a 1 fps 480×270 JPEG
     // ring at /var/lib/fnvr/live/<cam>.<n>.jpg. Replaces the earlier
@@ -1168,28 +1109,11 @@ p << "rtspsrc location=" << url
         // active chain. SGIE-produced obj_meta + user_meta only
         // appears on buffers downstream of the SGIE, so a probe on
         // e.g. tracker.src never sees face or plate objects.
-        //
-        // For the Hailo backend (detector_backend == "hailo") the detector
-        // probe injects NvDsObjectMeta on the pgie (queue) src pad, BEFORE
-        // nvtracker. nvtracker apparently drops NvDsObjectMeta it didn't
-        // produce (even with detector_bbox_info populated), so for hailo
-        // cameras we prefer attaching the InferSrcProbe on the same pad as
-        // the hailo injector (pgie.src) — objects observed there survive
-        // the tee that feeds them both. Tradeoff: no track_ids on hailo
-        // cameras until we figure out how to make nvtracker accept our
-        // injected objects.
-        GstElement* attach = nullptr;
-        const char* attach_name = nullptr;
-        if (cam_.detector_backend == "hailo") {
-            attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
-            attach_name = "pgie";
-        } else {
-            attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
-            attach_name = "arcface";
-            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet"); attach_name = "lprnet"; }
-            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker"); attach_name = "tracker"; }
-            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie"); attach_name = "pgie"; }
-        }
+        GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
+        const char* attach_name = "arcface";
+        if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet"); attach_name = "lprnet"; }
+        if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker"); attach_name = "tracker"; }
+        if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie"); attach_name = "pgie"; }
         if (attach) {
             GstPad* src = gst_element_get_static_pad(attach, "src");
             if (src) {

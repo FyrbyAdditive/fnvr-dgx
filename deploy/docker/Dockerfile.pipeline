@@ -1,14 +1,42 @@
 # syntax=docker/dockerfile:1.7
 #
-# pipeline-supervisor — GStreamer + DeepStream on Jetson.
-# Base image tracks the JetPack release on the host. JetPack 6.2 -> DeepStream 7.1.
-
-# Triton variant ships TensorRT dev headers (NvInfer.h et al.) which we
-# need to compile the DeepStream-Yolo custom nvinfer parser. The samples
-# variant only has runtime libs.
-ARG DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream-l4t:7.1-triton-multiarch
+# pipeline-supervisor — GStreamer + DeepStream on DGX Spark (GB10).
+#
+# DeepStream on DGX Spark is CONTAINER-ONLY (no native install). The
+# supported image is the dedicated DGX Spark SBSA Triton container
+# (Ubuntu 24.04). Do NOT use 9.1-triton-multiarch — its arm64 slice is
+# the JETSON build whose libnvbufsurface symlinks dangle into
+# /usr/lib/aarch64-linux-gnu/tegra/ (verified the hard way).
+#
+# Platform notes from the DS 9.1 docs: only nv3dsink for display (we
+# use fakesink — unaffected); no VIC — tiler/convert must use GPU
+# (compute-hw=1). A "Detected NVIDIA GB10 GPU, which is not yet
+# supported" warning at container start is documented-harmless.
+ARG DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark
 FROM ${DEEPSTREAM_IMAGE}
 
+# CUDA version for the custom-parser builds below (DeepStream-Yolo, TAO
+# parsers, RetinaFace parser). The DS 9.1 triton image ships CUDA 13.2
+# (verified: /usr/local/cuda-13.2, nvcc V13.2.78); override if the base
+# image moves.
+ARG CUDA_VER=13.2
+
+# The DS 9.1 triton image ships with NVIDIA's Jetson apt repo enabled in
+# /etc/apt/sources.list (r39.x). Its packages shadow Ubuntu's with higher
+# versions — notably an opencv 4.8 -dev package whose /usr/lib symlinks
+# dangle (runtime libs never land) and whose opencv4.pc advertises a gapi
+# module Ubuntu doesn't build. Disable it up front so every apt install
+# in this Dockerfile resolves from Ubuntu; DeepStream itself is already
+# baked into the image and needs nothing from that repo.
+RUN sed -i 's|^deb.*repo.download.nvidia.com|# &|' /etc/apt/sources.list
+
+# Ubuntu 24.04 base: install the GStreamer plugin sets unpinned and let
+# apt resolve sonames (the Orin-era Dockerfile pinned 22.04 sonames like
+# libx264-163/libavcodec58, all renamed on 24.04).
+#
+# gstreamer1.0-rtsp is REQUIRED: it ships rtspclientsink, which every
+# camera's MediaMTX push branch uses — without it gst_parse_launch fails
+# for every camera.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config git ca-certificates curl gettext-base wget \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -20,34 +48,64 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsrtp2-1 \
     libglib2.0-dev \
     libpq-dev \
-    libx264-163 libavcodec58 libvpx7 libmp3lame0 \
+    ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 # nats.c — header + static lib.
-ARG NATS_C_VERSION=v3.9.1
+ARG NATS_C_VERSION=v3.13.0
 RUN git clone --depth 1 --branch ${NATS_C_VERSION} https://github.com/nats-io/nats.c.git /tmp/nats.c \
   && cmake -S /tmp/nats.c -B /tmp/nats.c/build -DNATS_BUILD_STREAMING=OFF -DNATS_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release \
   && cmake --build /tmp/nats.c/build --parallel --target install \
   && ldconfig \
   && rm -rf /tmp/nats.c
 
+# OpenCV from source into /usr/local. Both packaged options in this
+# image are compromised: NVIDIA's jetson-repo 4.8 -dev package ships
+# dangling /usr/lib symlinks (runtime libs never land), and Ubuntu's
+# 4.6 is old and built without several modules. A source build into
+# /usr/local is also exactly the layout DeepStream-Yolo's Makefile
+# hardcodes (-I/usr/local/include/opencv4, -L/usr/local/lib).
+#
+# Minimal module set — the INT8 calibrator only needs core/imgproc/
+# imgcodecs (cv::imread + resize of calibration images).
+ARG OPENCV_VERSION=4.12.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libjpeg-turbo8-dev libpng-dev zlib1g-dev \
+  && rm -rf /var/lib/apt/lists/* \
+  && git clone --depth 1 --branch ${OPENCV_VERSION} https://github.com/opencv/opencv.git /tmp/opencv \
+  && cmake -S /tmp/opencv -B /tmp/opencv/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_LIST=core,imgproc,imgcodecs \
+      -DBUILD_SHARED_LIBS=ON \
+      -DOPENCV_GENERATE_PKGCONFIG=ON \
+      -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+      -DBUILD_opencv_apps=OFF \
+      -DWITH_CUDA=OFF -DWITH_V4L=OFF -DWITH_GTK=OFF -DWITH_QT=OFF \
+      -DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF \
+  && cmake --build /tmp/opencv/build --parallel \
+  && cmake --install /tmp/opencv/build \
+  && ldconfig \
+  && rm -rf /tmp/opencv
+
 # DeepStream-Yolo — custom nvinfer parser for YOLO26 (and other YOLO
 # families). YOLO26 is NMS-free and its output layout isn't compatible
 # with the stock nvinfer parser; this .so is what makes it work.
-# (TensorRT dev headers ship with the triton-multiarch base image.)
+# (TensorRT dev headers ship with the triton base image.)
+#
+# TODO(pin): after the first successful build+run on the Spark, pin
+# DS_YOLO_COMMIT to that validated commit instead of master.
 ARG DS_YOLO_COMMIT=master
 # OPENCV=1 compiles the INT8 calibrator into the custom parser .so.
-# Without it, the operator can't do on-device INT8 calibration and
-# must stay on FP16. OpenCV dev headers required for the build;
-# libde265-0 is a runtime dep dragged in by libopencv (HEVC decoding
-# inside OpenCV's imgcodecs) — we already have it for ffmpeg/gst but
-# install explicitly to pin the presence.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopencv-dev libde265-0 \
-  && rm -rf /var/lib/apt/lists/*
+# Kept for parity with the Orin build; the FP8/NVFP4 path (Phase 3)
+# supersedes on-device INT8 calibration. PKG_CONFIG_PATH pins the lib
+# list to our /usr/local source build, not the base image's leftovers.
 RUN git clone --depth 1 --branch ${DS_YOLO_COMMIT} https://github.com/marcoslucianops/DeepStream-Yolo.git /tmp/ds-yolo \
   && cd /tmp/ds-yolo/nvdsinfer_custom_impl_Yolo \
-  && CUDA_VER=12.6 OPENCV=1 make \
+  # calibrator.h uses std::cout without #include <iostream>; OpenCV 4.6's
+  # headers used to smuggle it in transitively, our 4.12 build doesn't.
+  && sed -i '1i #include <iostream>' calibrator.h \
+  && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig CUDA_VER=${CUDA_VER} OPENCV=1 make \
   && install -Dm755 libnvdsinfer_custom_impl_Yolo.so /usr/local/lib/fnvr/libnvdsinfer_custom_impl_Yolo.so \
   && cp /tmp/ds-yolo/utils/export_yolo26.py /usr/local/bin/export_yolo26.py \
   && chmod +x /usr/local/bin/export_yolo26.py \
@@ -59,9 +117,13 @@ RUN git clone --depth 1 --branch ${DS_YOLO_COMMIT} https://github.com/marcosluci
 # (~500 MB of weights, but runtime needs zero network access for the
 # primary detector). If this becomes a maintenance burden we can split the
 # variants into a separate model image and mount on demand.
+#
+# --break-system-packages: PEP 668 on Ubuntu 24.04 marks the system
+# Python env externally-managed; this container has no venv and we own
+# the image, so overriding is the pragmatic choice.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
-  && python3 -m pip install --no-cache-dir \
+  && python3 -m pip install --no-cache-dir --break-system-packages \
       "ultralytics==8.3.*" "onnx>=1.16" "onnxslim>=0.1.34" "onnxruntime>=1.18" \
       "onnxscript>=0.1" \
   && rm -rf /var/lib/apt/lists/*
@@ -115,16 +177,13 @@ RUN set -eux; \
     done
 
 # ANPR: NVIDIA TAO LPDNet (plate detector) + LPRNet (OCR).
+# Kept for Phase-1 parity with the Orin build; Phase 3 replaces this
+# stack with open-image-models + fast-plate-ocr (global coverage, no
+# NVIDIA model licence). If the TAO parser builds break against DS 9.1,
+# set FNVR_USE_ANPR=0 and move on — this chain is scheduled for removal.
 # - Weights are pulled from NGC archived-model URLs (no auth required).
 # - The custom LPRNet classifier parser lives in deepstream_tao_apps;
 #   compile its .so so nvinfer can pull plate text via CTC decode.
-# LPDNet/LPRNet use the NVIDIA model licence ("ready for commercial
-# use", locked to NVIDIA hardware/runtimes) — NOT OSI-open; we ship
-# only a downloader step so the shipped image includes the weights
-# but the repo doesn't.
-# LPDNet pruned_v2.3 is the current stable version (2.3.1 was withdrawn).
-# LPRNet deployable_onnx_v1.1 is the ONNX release — avoids needing
-# tlt-model-key and the .etlt → .onnx conversion at runtime.
 ARG LPDNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lpdnet/versions/pruned_v2.3/files/LPDNet_usa_pruned_tao5.onnx
 ARG LPRNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lprnet/versions/deployable_onnx_v1.1/files/us_lprnet_baseline18_deployable.onnx
 ARG LPRNET_LABELS_URL=https://raw.githubusercontent.com/NVIDIA-AI-IOT/deepstream_tao_apps/release/tao_ds7.1ga/configs/lpr_tao5/labels_us.txt
@@ -144,19 +203,18 @@ ARG DS_TAO_COMMIT=release/tao_ds7.1ga
 # - nvinfer_custom_lpr_parser: CTC decoder for LPRNet plate text,
 #   exports NvDsInferParseCustomNVPlate
 # Both Makefiles derive DS_VERSION by running `deepstream-app -v`
-# which fails on the triton-multiarch build image (missing libnvdla);
-# patch both to hard-code 7.1.
+# which can fail on build images; patch both to hard-code 9.1.
 RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
         https://github.com/NVIDIA-AI-IOT/deepstream_tao_apps.git /tmp/ds-tao \
   && for dir in post_processor apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser; do \
-        sed -i 's|^DS_VER = .*|DS_VER = 7.1|' /tmp/ds-tao/$dir/Makefile || true; \
+        sed -i 's|^DS_VER = .*|DS_VER = 9.1|' /tmp/ds-tao/$dir/Makefile || true; \
      done \
   && cd /tmp/ds-tao/post_processor \
-  && CUDA_VER=12.6 make \
+  && CUDA_VER=${CUDA_VER} make \
   && install -Dm755 libnvds_infercustomparser_tao.so \
         /opt/nvidia/deepstream/deepstream/lib/libnvds_infercustomparser_tao.so \
   && cd /tmp/ds-tao/apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser \
-  && CUDA_VER=12.6 make \
+  && CUDA_VER=${CUDA_VER} make \
   && install -Dm755 libnvdsinfer_custom_impl_lpr.so \
         /opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_lpr.so \
   && ldconfig
@@ -175,6 +233,7 @@ RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
 #   NMS IoU from 0.1 to 0.45.
 # - Embedder: ArcFace R100 ONNX from insightface's buffalo_l pack,
 #   mirrored on immich-app's HuggingFace space. Apache 2.0.
+#   (Phase 3 swaps this for AdaFace IR-101.)
 ARG RETINAFACE_REPO=https://github.com/biubug6/Pytorch_Retinaface.git
 ARG RETINAFACE_WEIGHTS_URL=https://huggingface.co/LPX55/retinaface/resolve/main/model.pth
 ARG ARCFACE_URL=https://huggingface.co/immich-app/buffalo_l/resolve/main/recognition/model.onnx
@@ -182,10 +241,11 @@ RUN set -eux; \
     mkdir -p /opt/fnvr/faceid; \
     wget -q "${ARCFACE_URL}" -O /opt/fnvr/faceid/arcface.onnx; \
     apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*; \
-    # arm64 PyPI has plain torch 2.3.0 (CPU-only on arm64 by default). \
-    # The dedicated +cpu index only hosts x86_64 arm wheels from 2.6+. \
+    # torch 2.7 is the newest line whose torch.onnx.export still
+    # defaults to the legacy TorchScript exporter (2.8+ default to
+    # dynamo=True, which breaks biubug6's monkey-patched forward).
     pip3 install --no-cache-dir --break-system-packages \
-        'torch==2.3.0' 'torchvision==0.18.0' 'onnx==1.16.0' numpy; \
+        'torch==2.7.1' 'torchvision==0.22.1' 'onnx>=1.17,<2' numpy; \
     git clone --depth 1 "${RETINAFACE_REPO}" /tmp/rf; \
     mkdir -p /tmp/rf/weights; \
     wget -q "${RETINAFACE_WEIGHTS_URL}" -O /tmp/rf/weights/mobilenet0.25_Final.pth; \
@@ -197,6 +257,9 @@ RUN set -eux; \
     # type=int so CLI values are strings and break torch.randn). \
     sed -i "s/opset_version=[0-9]\\+/opset_version=13/g" /tmp/rf/convert_to_onnx.py; \
     sed -i "s/--long_side', default=640/--long_side', type=int, default=640/g" /tmp/rf/convert_to_onnx.py; \
+    # Patch: torch.onnx._export (private API) was removed in torch 2.5+; \
+    # the public torch.onnx.export takes the same arguments here. \
+    sed -i "s/torch\\.onnx\\._export/torch.onnx.export/g" /tmp/rf/convert_to_onnx.py; \
     cd /tmp/rf && python3 convert_to_onnx.py --trained_model weights/mobilenet0.25_Final.pth --network mobile0.25; \
     python3 - <<'PY'
 import onnx
@@ -226,7 +289,7 @@ RUN set -eux; \
     pip3 uninstall -y --break-system-packages torch torchvision onnx numpy || true
 
 # Retinaface custom parser — clone zhouyuchong's parser, patch it to
-# compile cleanly against stock DS 7.1 (drop landmark fields that only
+# compile cleanly against stock DS 9.x (drop landmark fields that only
 # exist on the zhouyuchong gst-nvinfer fork) and soften NMS.
 ARG RF_PARSER_COMMIT=main
 RUN set -eux; \
@@ -237,103 +300,65 @@ RUN set -eux; \
     # drops half the valid faces). \
     sed -i 's/nms_threshold = 0\.1/nms_threshold = 0.45/g' nvdsparse_retinaface.cpp; \
     # Strip landmark writes — NvDsInferObjectDetectionInfo on stock \
-    # DS 7.1 has no numLmks / landmark members. We don't need \
-    # landmarks because ArcFace does its own implicit alignment. \
+    # DS has no numLmks / landmark members. We don't need landmarks \
+    # because ArcFace does its own implicit alignment. \
     sed -i '/result\.numLmks/d; /result\.landmark\[/d' nvdsparse_retinaface.cpp; \
     # Makefile's NVDS_VERSION uses `:=` so an env-var prefix won't \
     # override it. Pass it as a make variable instead (command-line \
     # vars win over `:=`). Also drop -lnvparsers — the library was \
-    # removed in TensorRT 10.x that ships with DS 7.1. \
+    # removed in TensorRT 10.x. \
     sed -i 's/-lnvparsers//g' Makefile; \
-    make CUDA_VER=12.6 NVDS_VERSION=7.1; \
+    make CUDA_VER=${CUDA_VER} NVDS_VERSION=9.1; \
     install -Dm755 libnvdsinfer_custom_impl_retinaface.so \
         /usr/local/lib/fnvr/libnvdsinfer_custom_impl_retinaface.so; \
     rm -rf /tmp/rf-parser; \
     ldconfig
-
-# No libhailort in this image. The pipeline-supervisor talks to the Hailo
-# via a unix socket to fnvr-hailo-broker (apps/hailo-broker/), which is a
-# separate container that owns libhailort and /dev/hailo0. Supervisor-side
-# code is at apps/pipeline-supervisor/src/hailo_inference.cpp — pure
-# socket client, no hailort linkage.
 
 WORKDIR /src
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs
 
 WORKDIR /src/apps/pipeline-supervisor
-# libnvbufsurface.so and libnvbufsurftransform.so on Jetson ship as
-# dangling symlinks at image-build time (they point into
-# /usr/lib/aarch64-linux-gnu/tegra/, bind-mounted only at container
-# start). The pipeline-supervisor link step needs these libs to
-# resolve NvBufSurface* / NvBufSurfTransform* symbols used by the
-# in-probe face cropper. Replace the dangling symlinks with tiny
-# stub .so files that export the exact symbols we call — ld is
-# satisfied at build time and the runtime ldconfig (driven by the
-# tegra ld-path written in pipeline-entrypoint.sh) resolves the
-# symbol calls into the real Tegra libs. All stub bodies return 0
-# so a mis-deployed image without tegra libs fails loud rather
-# than segfaulting.
-RUN set -eux; \
-    printf '%s\n' \
-      'int NvBufSurfaceCreate(void**a,unsigned b,void*c){(void)a;(void)b;(void)c;return -1;}' \
-      'int NvBufSurfaceAllocate(void**a,unsigned b,void*c){(void)a;(void)b;(void)c;return -1;}' \
-      'int NvBufSurfaceDestroy(void*a){(void)a;return -1;}' \
-      'int NvBufSurfaceMap(void*a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return -1;}' \
-      'int NvBufSurfaceUnMap(void*a,int b,int c){(void)a;(void)b;(void)c;return -1;}' \
-      'int NvBufSurfaceSyncForCpu(void*a,int b,int c){(void)a;(void)b;(void)c;return -1;}' \
-      > /tmp/libnvbufsurface_stub.c; \
-    rm -f /opt/nvidia/deepstream/deepstream/lib/libnvbufsurface.so; \
-    gcc -shared -fPIC -o /opt/nvidia/deepstream/deepstream/lib/libnvbufsurface.so /tmp/libnvbufsurface_stub.c; \
-    printf '%s\n' \
-      'int NvBufSurfTransform(void*a,void*b,void*c){(void)a;(void)b;(void)c;return -1;}' \
-      > /tmp/libnvbufsurftransform_stub.c; \
-    rm -f /opt/nvidia/deepstream/deepstream/lib/libnvbufsurftransform.so; \
-    gcc -shared -fPIC -o /opt/nvidia/deepstream/deepstream/lib/libnvbufsurftransform.so /tmp/libnvbufsurftransform_stub.c; \
-    rm -f /tmp/libnvbufsurface_stub.c /tmp/libnvbufsurftransform_stub.c
+# The SBSA container ships real libnvbufsurface.so / libnvbufsurftransform.so
+# under /opt/nvidia/deepstream/deepstream/lib — no Tegra stub hack needed
+# (the Orin build had to fake these at build time because the l4t image's
+# copies were dangling symlinks into host-mounted /usr/lib/.../tegra/).
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build --parallel \
   && install -Dm755 build/pipeline-supervisor /usr/local/bin/pipeline-supervisor
 
+# Restore libraries the DS base image STRIPS while keeping their dpkg
+# entries registered ("dpkg thinks it's installed, but the file isn't
+# there") — a plain install no-ops, so --reinstall is REQUIRED:
+#   - libjbig0: needed by system libtiff → our OpenCV imgcodecs; without
+#     it nvinfer fails to dlopen the DS-Yolo parser.
+#   - the patent-encumbered codec set (x264/x265/vpx/lame/flac/mpg123):
+#     stripped by NVIDIA; ffmpeg/ffprobe won't even start without them,
+#     which silently breaks the RTSP codec probe → every H.265 camera
+#     gets an H.264 graph and crash-loops.
+# The asserts fail the build loudly if the base image changes shape.
+RUN apt-get update \
+  && apt-get install -y --reinstall --no-install-recommends \
+       libjbig0 libflac12t64 libmp3lame0 libmpg123-0t64 \
+       libvpx9 libx264-164 libx265-199 \
+  && rm -rf /var/lib/apt/lists/* \
+  && test -e /usr/lib/aarch64-linux-gnu/libjbig.so.0 \
+  && ffprobe -version >/dev/null \
+  && ffmpeg -version >/dev/null
+
 # Default nvinfer config, overridable via FNVR_INFER_CONFIG.
 COPY deploy/config/nvinfer /etc/fnvr/nvinfer
-
-# Default to trafficcamnet — it's bundled in the deepstream-l4t samples image,
-# so first boot "just works" without fetching model weights. Swap via
-# FNVR_INFER_CONFIG (e.g. /etc/fnvr/nvinfer/yolo11.txt once you've placed
-# the ONNX weights under /var/lib/fnvr/models/).
-# Re-install libx264 at the END of the build. The base image's layer layout
-# does something to our earlier apt install that leaves the file missing at
-# runtime (dpkg thinks it's installed, but find / doesn't see it). Doing it
-# last works.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    udev libudev1 \
-    kmod \
-    ffmpeg libx265-199 libxvidcore4 \
-  && apt-get install -y --reinstall --no-install-recommends \
-    libx264-163 libx265-199 libxvidcore4 \
-    libavcodec58 libavutil56 libavformat58 \
-    libswresample3 libswscale5 libvpx7 libmp3lame0 libflac8 libmpg123-0 \
-    libde265-0 \
-  && rm -rf /var/lib/apt/lists/*
 
 ENV FNVR_INFER_CONFIG=/etc/fnvr/nvinfer/trafficcamnet.txt
 ENV FNVR_RECORDINGS_DIR=/var/lib/fnvr/recordings
 ENV FNVR_USE_DEEPSTREAM=1
 
-# On Jetson, the DeepStream-l4t image ships a dGPU-style libcuda under
-# /usr/lib/.../nvidia/ that lacks the CUDA_GPU_ID IOCTL used by
-# nvv4l2decoder. The correct Tegra libcuda is bind-mounted into
-# /usr/lib/aarch64-linux-gnu/tegra/ by nvidia-container-toolkit at container
-# start. Entrypoint writes a higher-priority ld.so.conf entry and re-runs
-# ldconfig so tegra wins over nvidia/.
 COPY deploy/docker/pipeline-entrypoint.sh /usr/local/bin/pipeline-entrypoint.sh
 COPY deploy/docker/calibrate-yolo26.sh /usr/local/bin/calibrate-yolo26.sh
 RUN chmod +x /usr/local/bin/pipeline-entrypoint.sh /usr/local/bin/calibrate-yolo26.sh
 
-# Tegra first (CUDA_GPU_ID IOCTL path), then standard system dirs so non-Tegra
-# libs (libx264.so.163, libavcodec.so.58, libFLAC, ...) installed via apt
-# remain resolvable.
-ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl:/usr/lib/aarch64-linux-gnu:/usr/local/lib
+# DeepStream libs first, then our own installs. No Tegra dirs — this is
+# an SBSA (dGPU-style) platform.
+ENV LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:/usr/local/lib
 
 ENTRYPOINT ["/usr/local/bin/pipeline-entrypoint.sh"]

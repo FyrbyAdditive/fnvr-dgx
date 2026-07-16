@@ -1,25 +1,31 @@
-# fnvr — M1 stack.
+# fnvr-dgx stack — targets NVIDIA DGX Spark (GB10).
 #
 # Profiles:
-#   default  = pipeline-supervisor included (Jetson host, requires nvidia-container-toolkit)
-#   lite     = skips the pipeline container (Mac / x86 workstations)
+#   gpu      = adds the pipeline-supervisor container (DGX Spark host,
+#              requires nvidia-container-toolkit)
+#   dev/lite = adds the synthetic testsrc RTSP source
+#   (Compose profiles are additive-only; the old `!lite` negation was
+#   never valid and silently excluded the pipeline on modern compose.)
 #
 # Usage:
-#   docker compose up -d                     # Jetson
-#   docker compose --profile lite up -d      # everywhere else
+#   docker compose --profile gpu up -d       # DGX Spark
+#   docker compose --profile lite up -d      # Mac / GPU-less workstations
 
 name: fnvr
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg18
     restart: unless-stopped
     environment:
       POSTGRES_USER: fnvr
       POSTGRES_PASSWORD: fnvr
       POSTGRES_DB: fnvr
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # postgres 18+ images keep PGDATA in a version subdirectory under
+      # /var/lib/postgresql — mount the parent, not .../data, so future
+      # major upgrades can pg_upgrade --link across one mount.
+      - postgres-data:/var/lib/postgresql
     # Tuning targets an Orin AGX-class host (32 GB RAM, NVMe). Numbers are
     # conservative — the Orin has plenty of headroom and our workload is
     # detection inserts + JSONB scans + segment housekeeping. Stock pg16
@@ -103,11 +109,13 @@ services:
       # SSD cycles on it. Shared named volume so pipeline writer and api
       # reader see the same backing store.
       - fnvr-live:/var/lib/fnvr/live
-      # Surface host V4L2 device metadata for the /system/local-devices endpoint.
-      # Read-only. /sys/class/video4linux/videoN is a symlink into
-      # /sys/devices/..., so we need both for the {name,device_caps} reads.
-      - /sys/class/video4linux:/sys/class/video4linux:ro
-      - /sys/devices:/sys/devices:ro
+      # NOTE: the Orin compose bind-mounted /sys/class/video4linux (+
+      # /sys/devices) for the /system/local-devices USB-camera listing.
+      # On a host with no V4L2 devices that path doesn't exist and
+      # docker refuses to start the container. The endpoint degrades to
+      # an empty list without the mounts; re-add them if you attach USB
+      # cameras directly to the Spark (the usb-bridge profile is the
+      # supported route anyway).
     ports:
       # Public: web UI + JSON API (+ unauthenticated /metrics scrape
       # endpoint for Prometheus).
@@ -203,11 +211,12 @@ services:
     ports:
       - "8080:80"
 
-  # Pipeline — runs on the Jetson host. Uses the nvidia-container runtime so
-  # DeepStream/NVDEC/NVENC/DLA access is wired automatically; we do not bind
-  # individual /dev/nvhost-* nodes (those vary per JetPack release).
+  # Pipeline — runs on the DGX Spark host. GPU access via a compose
+  # device reservation (nvidia-container-toolkit + CDI on DGX OS) —
+  # the host registers no `nvidia` docker runtime, so `runtime: nvidia`
+  # would fail here.
   pipeline:
-    profiles: ["!lite"]
+    profiles: ["gpu"]
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.pipeline
@@ -217,54 +226,30 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
-    runtime: nvidia
-    # nvidia-container-toolkit exposes the GPU + /dev/nvhost-* nodes when
-    # NVIDIA_VISIBLE_DEVICES=all and NVIDIA_DRIVER_CAPABILITIES covers
-    # compute+video. On JetPack 6 the V4L2 M2M codec devices (NVDEC/NVENC)
-    # are NOT covered by that mechanism and must be bound explicitly.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       NVIDIA_VISIBLE_DEVICES: "all"
-      NVIDIA_DRIVER_CAPABILITIES: "all"
+      # compute = CUDA/TensorRT, video = NVDEC/NVENC, utility = nvidia-smi.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
       FNVR_NATS_URL: "nats://nats:4222"
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
       FNVR_USE_DEEPSTREAM: "${FNVR_USE_DEEPSTREAM:-1}"
       FNVR_RECONCILE_SEC: "${FNVR_RECONCILE_SEC:-5}"
-      # splitmuxsink has a g_assert in check_completed_gop that aborts the
-      # entire process if the first buffer arrives without a GOP context.
-      # Unset G_DEBUG so fatal-warnings are off — without this, one bad
-      # camera can crash-kill all the others sharing the supervisor process.
+      # Some GStreamer elements g_assert on non-fatal conditions. Unset
+      # G_DEBUG so fatal-warnings are off — without this, one bad camera
+      # can crash-kill all the others sharing the supervisor process.
       G_DEBUG: ""
-    # No /dev/video* mapping here: nvv4l2{dec,enc}oder talks to the Tegra
-    # nodes /dev/v4l2-nvdec + /dev/v4l2-nvenc, which are reachable via the
-    # /usr/share/{egl,glvnd}/* host mounts below. We used to list
-    # /dev/video0 and /dev/video1 but those are USB-webcam nodes, not NVENC
-    # / NVDEC — and if a USB cam was later unplugged, docker refused to
-    # (re)create the container at all ("no such file or directory") which
-    # killed every camera in one go. Do not re-add them.
-    # Docker masks /sys/firmware by default. The Tegra libv4l2 plugin reads
-    # /sys/firmware/devicetree/base/{compatible,chosen/ids} to identify the
-    # chip and take its fast-path (which skips the generic v4l2 capability
-    # query that fails on the /dev/v4l2-nvenc stub). Unmask it.
-    security_opt:
-      - "systempaths=unconfined"
     volumes:
       - fnvr-data:/var/lib/fnvr
       - fnvr-live:/var/lib/fnvr/live
       - ../config:/etc/fnvr:ro
-      # Tegra libv4l2 plugin queries libudev for device properties on the
-      # /dev/v4l2-nv* nodes. Without /run/udev the lookup fails and the
-      # plugin falls back to a generic v4l2 path that issues VIDIOC_QUERYCAP
-      # on the stub node, which returns EINVAL.
-      - /run/udev:/run/udev:ro
-      # nvidia-l4t-gbm package (host-only) ships
-      # /usr/share/egl/egl_external_platform.d/nvidia_gbm.json. Without it
-      # libEGL fails to find the Tegra GBM vendor and falls back to Mesa,
-      # which in turn makes nvv4l2{enc,dec} take the dGPU /dev/nvidia0 path
-      # (EINVAL on VIDIOC_QUERYCAP).
-      - /usr/share/egl/egl_external_platform.d:/usr/share/egl/egl_external_platform.d:ro
-      # nvidia_icd.json and related glvnd vendor files live here on Jetson.
-      - /usr/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d:ro
 
   # Synthetic RTSP source for dev & CI. Publishes a looped test pattern at
   # rtsp://mediamtx:8554/test — add as a camera URL to exercise ingest/record
@@ -304,7 +289,10 @@ services:
       # host candidate alongside its own container-bridge IP. Browsers
       # on the same LAN reach this; without it ICE only sees 172.18.x.x
       # which is unreachable from the user's Mac at 172.16.x.x.
-      MTX_WEBRTCADDITIONALHOSTS: "172.16.4.23"
+      # Set FNVR_LAN_IP to the DGX Spark's LAN address (falls back to
+      # the historical dev-host IP so an un-configured bring-up still
+      # advertises *something* routable on that LAN).
+      MTX_WEBRTCADDITIONALHOSTS: "${FNVR_LAN_IP:-172.16.4.23}"
       # Single-port UDP for ICE so we can publish exactly one UDP port
       # through docker. Without this MediaMTX uses ephemeral UDP ports
       # and we'd need to expose a wide range or use host networking.

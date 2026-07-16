@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.23-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY apps/api-server ./apps/api-server
 COPY libs ./libs
@@ -9,7 +9,7 @@ COPY libs ./libs
 # against a clean checkout.
 RUN cd apps/api-server && go mod tidy && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/fnvr-api ./cmd/api
 
-FROM alpine:3.20
+FROM alpine:3.23
 # ffmpeg is used by the snapshot endpoint to extract JPEG keyframes from
 # recorded segments. Alpine's ffmpeg is static-ish and ~20 MB.
 RUN apk add --no-cache ca-certificates tzdata ffmpeg

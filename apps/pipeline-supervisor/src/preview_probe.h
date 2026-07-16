@@ -13,7 +13,7 @@ namespace fnvr {
 //
 // The probe is rate-limited to 1 frame/sec on a steady_clock; on the
 // fast path it returns GST_PAD_PROBE_OK immediately. On the slow path
-// it does VIC-accelerated NV12→RGBA scale to a reusable dst surface,
+// it does GPU-accelerated NV12→RGBA scale to a reusable dst surface,
 // maps it for CPU read, and uses face_crop_jpeg's encodeJpegRGBA
 // helper to write the ring slot atomically (tmp + rename).
 //
