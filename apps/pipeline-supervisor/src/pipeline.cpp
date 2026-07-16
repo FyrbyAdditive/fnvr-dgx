@@ -772,6 +772,27 @@ gboolean GroupPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer user_data)
             }
             abortGroupAfterFault(self->group_id_, "bus error", 3);
         }
+        // LATENCY: an element's latency changed after the initial
+        // PLAYING transition — rtspclientsink does this once its RTSP
+        // handshake completes, well after we started. gst-launch
+        // recalculates on this message ("Redistribute latency...");
+        // an app-managed pipeline MUST do the same or sync'd sinks
+        // pace against a stale latency budget. Symptom before this
+        // handler existed: the MediaMTX push leg trickled 1-2 fps of
+        // mid-GOP frames (every buffer "late" → dropped) while the
+        // inference leg ran at full rate — browsers then only ever
+        // decoded the odd surviving IDR.
+        case GST_MESSAGE_LATENCY:
+            gst_bin_recalculate_latency(GST_BIN(self->pipeline_));
+            break;
+        // CLOCK_LOST: the clock provider left (e.g. a member's source
+        // torn down). The documented recovery is a PAUSED→PLAYING
+        // bounce so the pipeline elects a new clock; without it every
+        // sync'd sink can stall forever.
+        case GST_MESSAGE_CLOCK_LOST:
+            gst_element_set_state(self->pipeline_, GST_STATE_PAUSED);
+            gst_element_set_state(self->pipeline_, GST_STATE_PLAYING);
+            break;
         case GST_MESSAGE_STATE_CHANGED: {
             if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->pipeline_)) {
                 GstState oldS, newS;
