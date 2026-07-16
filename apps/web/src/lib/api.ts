@@ -220,6 +220,22 @@ export type APIToken = {
   last_used_at?: string | null;
 };
 
+// One-time H.265 capability probe: MSE (Chrome/Safari path) or native
+// <video> (Safari blob path). Recordings are H.265 passthrough, so a
+// browser failing both needs the transcoder.
+let h265Cache: boolean | null = null;
+function browserPlaysH265(): boolean {
+  if (h265Cache !== null) return h265Cache;
+  const codecs = ['video/mp4; codecs="hvc1.1.6.L153.b0"',
+                  'video/mp4; codecs="hev1.1.6.L153.b0"'];
+  const mse = typeof MediaSource !== "undefined" &&
+    codecs.some((c) => MediaSource.isTypeSupported(c));
+  const native = codecs.some(
+    (c) => document.createElement("video").canPlayType(c) !== "");
+  h265Cache = mse || native;
+  return h265Cache;
+}
+
 export const api = {
   systemInfo: () => req<{ version: string; milestone: string; time: string }>("/system/info"),
   me: () => req<Me>("/me"),
@@ -342,12 +358,18 @@ export const api = {
     durationSec: number,
     opts: { download?: boolean } = {},
   ) => {
-    const origin = `${window.location.protocol}//${window.location.hostname}:9996`;
+    // Browsers without H.265 decode (Firefox; some remote clients) get
+    // the NVDEC→NVENC transcoder on :9995 instead of raw MediaMTX
+    // playback on :9996 — same query contract, H.264 out. Downloads
+    // always fetch the untouched original.
+    const transcode = !opts.download && !browserPlaysH265();
+    const port = transcode ? 9995 : 9996;
+    const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
     const p = new URLSearchParams({
       path: `live_${cameraId}`,
       start: start.toISOString(),
       duration: String(durationSec),
-      format: opts.download ? "mp4" : "fmp4",
+      ...(transcode ? {} : { format: opts.download ? "mp4" : "fmp4" }),
     });
     return `${origin}/get?${p}`;
   },

@@ -336,6 +336,11 @@ RUN set -eux; \
     rm -rf /tmp/nvdsinfer_rfdetr /tmp/nvdsinfer_plates
 
 WORKDIR /src
+# Playback transcoder (the `transcoder` compose service runs THIS
+# image with a different entrypoint — same GStreamer/NVDEC/NVENC
+# stack, zero extra image builds).
+COPY tools/transcoder/transcoder.py /usr/local/bin/fnvr-transcoder.py
+
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs
 

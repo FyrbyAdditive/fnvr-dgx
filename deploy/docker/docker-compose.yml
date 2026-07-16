@@ -287,6 +287,31 @@ services:
       - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
       - "9996:9996" # playback API (timeline /get clips)
 
+  # On-demand playback transcoder: H.265 recordings → H.264 fMP4 for
+  # browsers without H.265 MSE (Firefox; some remote clients). Reuses
+  # the pipeline image (GStreamer + NVDEC/NVENC); both units are
+  # otherwise idle while someone scrubs the timeline. The web timeline
+  # falls back to :9995 when MediaSource can't do hvc1.
+  transcoder:
+    profiles: ["gpu"]
+    image: fnvr-pipeline
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    entrypoint: ["python3", "/usr/local/bin/fnvr-transcoder.py"]
+    environment:
+      FNVR_MTX_PLAYBACK: "http://mediamtx:9996"
+      FNVR_TRANSCODER_MAX: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "9995:9995"
+
   # USB→RTSP bridge. When /dev/video0 exists on the host, reads MJPEG and
   # publishes H.264 to rtsp://mediamtx:8554/fnvr-usb0. Camera entries in the
   # DB use that URL; pipeline-supervisor then hits it via the working RTSP
