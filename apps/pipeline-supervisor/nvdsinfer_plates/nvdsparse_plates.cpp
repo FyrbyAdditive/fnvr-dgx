@@ -70,22 +70,46 @@ extern "C" bool NvDsInferParseCustomPlateDet(
     if (!detectionParams.perClassPreclusterThreshold.empty())
         thr0 = detectionParams.perClassPreclusterThreshold[0];
 
-    // Single-tensor end2end convention (open-image-models yolo-v9-t):
-    // one output ("output0") of rows [x1, y1, x2, y2, score, class].
+    // Single-tensor end2end conventions (open-image-models yolo-v9-t
+    // exports "output0" [N,7]: batch_idx, x1, y1, x2, y2, class, score;
+    // some exports use [N,6] without the batch column).
+    //
+    // IMPORTANT: this function must NEVER return false — DS 9.1's
+    // "Failed to parse bboxes" error path has a fatal free() (SIGSEGV
+    // observed under gdb). Unknown layouts log once and yield an empty
+    // detection list instead.
     if (outputLayersInfo.size() == 1 || (!det_scores && !det_boxes)) {
         const NvDsInferLayerInfo& out = outputLayersInfo[0];
-        if (!out.buffer || out.inferDims.numDims < 1) return false;
+        if (!out.buffer || out.inferDims.numDims < 1) return true;
         const unsigned last = out.inferDims.d[out.inferDims.numDims - 1];
-        if (last != 6) return false;
+        if (last != 6 && last != 7) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr,
+                        "plates parser: unexpected detector output width %u "
+                        "(want 6 or 7) — emitting no plates\n", last);
+            }
+            return true;
+        }
         unsigned N = 1;
         for (int i = 0; i < out.inferDims.numDims - 1; i++)
             N *= out.inferDims.d[i];
         const float* p = static_cast<const float*>(out.buffer);
+        const unsigned stride = last;
+        const unsigned off = (last == 7) ? 1 : 0;  // skip batch_idx col
         for (unsigned i = 0; i < N; i++) {
-            const float conf = p[i * 6 + 4];
-            if (conf < thr0) continue;
-            float x1 = p[i * 6 + 0], y1 = p[i * 6 + 1];
-            float x2 = p[i * 6 + 2], y2 = p[i * 6 + 3];
+            const float* r = p + i * stride;
+            // Column order after xyxy varies: [.., class, score] vs
+            // [.., score, class]. The class column is integral (0.0 for
+            // this single-class model); pick the other as confidence.
+            float a = r[off + 4], b = r[off + 5];
+            float conf = (last == 6) ? a
+                         : (std::floor(a) == a && b >= 0.f && b <= 1.f) ? b
+                         : a;
+            if (!(conf > thr0) || conf > 1.f) continue;  // also drops NaN
+            float x1 = r[off + 0], y1 = r[off + 1];
+            float x2 = r[off + 2], y2 = r[off + 3];
             if (x2 <= 1.5f && y2 <= 1.5f) { x1 *= W; x2 *= W; y1 *= H; y2 *= H; }
             NvDsInferObjectDetectionInfo obj{};
             obj.classId = 0;
@@ -101,7 +125,7 @@ extern "C" bool NvDsInferParseCustomPlateDet(
     }
 
     if (!det_boxes || !det_scores || !det_boxes->buffer || !det_scores->buffer)
-        return false;
+        return true;  // never false — see comment above
 
     unsigned N = 1;
     for (int i = 0; i < det_boxes->inferDims.numDims - 1; i++)
@@ -174,8 +198,10 @@ extern "C" bool NvDsInferParsePlateOCRCCT(
     float classifierThreshold,
     std::vector<NvDsInferAttribute>& attrList,
     std::string& descString) {
+    // Never return false — DS 9.1's classifier parse-failure path is
+    // as fragile as the detector one. No decode → no attribute.
     const auto& cs = charset();
-    if (cs.empty() || outputLayersInfo.empty()) return false;
+    if (cs.empty() || outputLayersInfo.empty()) return true;
     const unsigned C = unsigned(cs.size());
 
     // v2 global models emit TWO heads: "plate" [slots, C] and "region"
@@ -196,11 +222,11 @@ extern "C" bool NvDsInferParsePlateOCRCCT(
             if (t % C == 0 && t / C >= 4) { out = &l; break; }
         }
     }
-    if (!out) return false;
+    if (!out) return true;
 
     unsigned total = 1;
     for (int i = 0; i < out->inferDims.numDims; i++) total *= out->inferDims.d[i];
-    if (C == 0 || total % C != 0) return false;
+    if (C == 0 || total % C != 0) return true;
     const unsigned slots = total / C;
     const float* p = static_cast<const float*>(out->buffer);
 

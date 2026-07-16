@@ -32,21 +32,27 @@ std::string runDir() {
     return (d && *d) ? d : "/tmp/fnvr-run";
 }
 
-// Read (and consume) the fault marker a child wrote before exiting
-// rc=4. Returns the camera id, or empty.
-std::string consumeFaultMarker(const std::string& group_id) {
+// Read (and consume) the fault marker file: one camera id per line,
+// appended by the child each time a member's source chain died during
+// that child's life. Used for strike counting — a member is only
+// quarantined after repeated faults (transient RTSP burps must not
+// yank cameras out of their groups).
+std::vector<std::string> consumeFaultMarkers(const std::string& group_id) {
+    std::vector<std::string> cams;
     const std::string path = runDir() + "/group-" + group_id + ".fault";
     std::ifstream f(path);
-    if (!f) return {};
+    if (!f) return cams;
     std::string cam;
-    std::getline(f, cam);
+    while (std::getline(f, cam)) {
+        while (!cam.empty() && (cam.back() == '\r' || cam.back() == '\n' ||
+                                cam.back() == ' '))
+            cam.pop_back();
+        if (!cam.empty()) cams.push_back(cam);
+    }
     f.close();
     std::error_code ec;
     std::filesystem::remove(path, ec);
-    while (!cam.empty() && (cam.back() == '\r' || cam.back() == '\n' ||
-                            cam.back() == ' '))
-        cam.pop_back();
-    return cam;
+    return cams;
 }
 
 // Healthy marker: the child writes this once its pipeline is PLAYING
@@ -314,6 +320,11 @@ void Supervisor::workerMain(Worker* w) {
     // startup grace, overridden for chronic loops).
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
 
+    // Per-member fault strikes (10-min sliding window) for quarantine
+    // decisions — see the strike-counting block below.
+    std::map<std::string, std::deque<std::chrono::steady_clock::time_point>>
+        member_strikes;
+
     // Chronic crash-loop detector (see kChronicFlapThreshold): a
     // worker that has died young many times in a row must surface as
     // failed even inside startup grace.
@@ -424,19 +435,36 @@ void Supervisor::workerMain(Worker* w) {
                       << WTERMSIG(status) << "\n";
         }
 
-        // Member-fault: quarantine the offender and retire this worker
-        // — the next reconcile replans without it, so the healthy
-        // members stop being restarted alongside a broken camera.
-        if (rc == 4) {
-            std::string cam = consumeFaultMarker(w->plan.group_id);
-            if (!cam.empty()) {
-                quarantineMember(cam);
+        // Strike counting: each member fault recorded by the child adds
+        // a strike; only a REPEAT offender (3 strikes in 10 min) gets
+        // quarantined. A single transient RTSP burp costs one debounced
+        // group restart (the child's self-heal), nothing more — the
+        // old first-offence quarantine amplified every burp into a
+        // quarantine→probation→rejoin triple restart.
+        {
+            const auto nowt = std::chrono::steady_clock::now();
+            bool retired_for_quarantine = false;
+            for (const auto& cam : consumeFaultMarkers(w->plan.group_id)) {
+                auto& hist = member_strikes[cam];
+                hist.push_back(nowt);
+                while (!hist.empty() &&
+                       nowt - hist.front() > std::chrono::minutes(10)) {
+                    hist.pop_front();
+                }
+                std::cerr << "group[" << w->plan.group_id << "]: strike "
+                          << hist.size() << "/3 for [" << cam << "]\n";
+                if (hist.size() >= 3) {
+                    quarantineMember(cam);
+                    hist.clear();
+                    retired_for_quarantine = true;
+                }
+            }
+            if (retired_for_quarantine) {
                 w->retired.store(true);
                 std::cerr << "group[" << w->plan.group_id
-                          << "]: retiring after member fault (" << cam << ")\n";
+                          << "]: retiring — repeat-offender member quarantined\n";
                 return;
             }
-            // rc=4 without a marker — treat as a generic fault.
         }
 
         auto child_uptime = std::chrono::duration_cast<std::chrono::seconds>(

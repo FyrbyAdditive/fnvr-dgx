@@ -158,6 +158,27 @@ static int runWorkerGroup(const std::string& group_id,
         g_main_loop_quit(loop);
     });
 
+    // Self-heal: a member whose source chain bus-errored is marked dead
+    // (siblings keep streaming — see BusHandler). One debounced restart
+    // per incident revives the branch: after the FIRST death has aged
+    // 120 s, exit rc=3 so the supervisor respawns the whole group once.
+    // Multiple deaths within the window share the same single restart.
+    std::thread self_heal([&p, &group_id] {
+        while (!g_stop && !p.Faulted()) {
+            if (p.DeadMembers() > 0) {
+                auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - p.FirstDeathAt()).count();
+                if (age >= 120) {
+                    std::cerr << "group[" << group_id << "]: self-heal restart ("
+                              << p.DeadMembers() << " dead member(s) for "
+                              << age << "s)\n";
+                    std::_Exit(3);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    });
+
     // Data-flow watchdog (revived from the Orin build, where it was
     // disabled after recording moved to MediaMTX). The detection probe
     // bumps a per-source frame counter; if the SUM stalls for 20 s
@@ -236,6 +257,7 @@ static int runWorkerGroup(const std::string& group_id,
     if (heartbeat.joinable()) heartbeat.join();
     if (flow_watchdog.joinable()) flow_watchdog.join();
     if (healthy_marker.joinable()) healthy_marker.join();
+    if (self_heal.joinable()) self_heal.join();
     g_main_loop_unref(loop);
 
     p.Stop();

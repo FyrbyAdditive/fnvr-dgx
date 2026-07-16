@@ -691,7 +691,9 @@ gboolean GroupPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer user_data)
                       << msg_str << "\n";
             if (err) g_error_free(err);
             g_free(dbg);
-            self->faulted_.store(true);
+            // NOTE: faulted_ is only set on paths that abort the
+            // process — a member-attributed error keeps the group
+            // alive (heartbeats/watchdogs must keep running).
 
             // Try to attribute the error to one member's source chain
             // by climbing the message source's parents looking for our
@@ -713,30 +715,50 @@ gboolean GroupPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer user_data)
             }
             if (member >= 0 && size_t(member) < self->sources_.size() &&
                 self->sources_.size() > 1) {
-                const std::string& cam_id = self->sources_[member]->cam.id;
-                std::cerr << "group[" << self->group_id_
-                          << "]: fault attributed to member " << member
-                          << " (" << cam_id << ")\n";
-                // Marker file → supervisor quarantines this member.
-                std::error_code ec;
-                fs::create_directories(RunDir(), ec);
-                std::ofstream mk(RunDir() + "/group-" + self->group_id_ + ".fault",
-                                 std::ios::trunc);
-                mk << cam_id << "\n";
-                mk.close();
-                if (self->nats_) {
-                    const std::string subj = "fnvr.state.camera." + cam_id;
-                    const std::string payload =
-                        "{\"camera_id\":\"" + cam_id + "\",\"state\":\"failed\"}";
-                    self->nats_->Publish(subj, payload, /*flush=*/true);
+                auto& src = *self->sources_[member];
+                const std::string& cam_id = src.cam.id;
+                // Mark the member's branch dead and KEEP THE GROUP
+                // RUNNING — siblings must not pay for one camera's
+                // transient RTSP burp. The group self-heals with one
+                // debounced restart (main.cpp) to revive the branch;
+                // the supervisor strike-counts the marker and only
+                // quarantines repeat offenders.
+                if (!src.dead.exchange(true)) {
+                    const int now_dead = self->dead_members_.fetch_add(1) + 1;
+                    if (now_dead == 1) {
+                        self->first_death_at_ = std::chrono::steady_clock::now();
+                    }
+                    std::cerr << "group[" << self->group_id_
+                              << "]: member " << member << " (" << cam_id
+                              << ") source chain died — marking dead ("
+                              << now_dead << "/" << self->sources_.size()
+                              << "), siblings keep running\n";
+                    std::error_code ec;
+                    fs::create_directories(RunDir(), ec);
+                    std::ofstream mk(RunDir() + "/group-" + self->group_id_ + ".fault",
+                                     std::ios::app);
+                    mk << cam_id << "\n";
+                    mk.close();
+                    if (self->nats_) {
+                        const std::string subj = "fnvr.state.camera." + cam_id;
+                        const std::string payload =
+                            "{\"camera_id\":\"" + cam_id + "\",\"state\":\"failed\"}";
+                        self->nats_->Publish(subj, payload, /*flush=*/true);
+                    }
                 }
-                abortGroupAfterFault(self->group_id_, "member fault", 4);
+                // All members dead → nothing left to protect; restart now.
+                if (self->dead_members_.load() >= int(self->sources_.size())) {
+                    self->faulted_.store(true);
+                    abortGroupAfterFault(self->group_id_, "all members dead", 3);
+                }
+                return TRUE;  // swallow the error; group stays PLAYING
             }
 
             // Unattributed (or solo group): for a solo group the single
             // member IS the fault domain — publish failed for it once
             // we're past startup grace, matching the old per-camera
             // behaviour.
+            self->faulted_.store(true);
             auto age = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - g_worker_process_start).count();
             const bool within_grace = g_worker_startup_grace_sec > 0 &&

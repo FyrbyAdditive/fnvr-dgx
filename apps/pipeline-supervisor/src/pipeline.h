@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -31,6 +32,10 @@ struct SourceRuntime {
     // heartbeat thread derives per-camera running/stalled from this;
     // the flow watchdog sums across sources.
     std::atomic<std::uint64_t> frames{0};
+    // Set when this member's source chain posted a bus ERROR. The
+    // branch is dead until the group's debounced self-heal restart;
+    // siblings keep streaming meanwhile.
+    std::atomic<bool> dead{false};
 };
 
 // GroupPipeline — the batched-mux shape. N member cameras share one
@@ -72,6 +77,12 @@ public:
     bool Faulted() const { return faulted_.load(); }
     bool Playing() const { return playing_.load(); }
     void Fault() { faulted_.store(true); }
+    // Member-death bookkeeping for the debounced self-heal restart.
+    int DeadMembers() const { return dead_members_.load(); }
+    // Monotonic time of the FIRST unhealed member death (0 = none).
+    std::chrono::steady_clock::time_point FirstDeathAt() const {
+        return first_death_at_;
+    }
 
 private:
     GstElement* BuildPipeline();
@@ -93,6 +104,8 @@ private:
     guint            bus_watch_id_ = 0;
     std::atomic<bool> faulted_{false};
     std::atomic<bool> playing_{false};
+    std::atomic<int>  dead_members_{0};
+    std::chrono::steady_clock::time_point first_death_at_{};
 
     // Mux canvas. N==1: probed source dims (aspect-exact, no
     // letterbox). N>1: fixed canvas; sources letterbox into it and the
