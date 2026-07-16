@@ -296,9 +296,55 @@ static int runWorkerGroup(const std::string& group_id,
         }
     });
 
+    // Pipeline metrics: one JSON blob per group every 15 s on
+    // fnvr.metrics.pipeline.<group_id>. api-server re-exports the
+    // fields as Prometheus gauges — no new scrape target, and the
+    // per-member input/push/infer rates make silent degradation
+    // (the class of bug the push watchdog now catches) visible on a
+    // dashboard instead of only in a post-mortem.
+    std::thread metrics([&p, &nats, &group_id] {
+        const size_t n = p.MemberCount();
+        std::vector<std::uint64_t> li(n, 0), lp(n, 0), lf(n, 0);
+        auto last = std::chrono::steady_clock::now();
+        while (!g_stop && !p.Faulted()) {
+            for (int i = 0; i < 30 && !g_stop && !p.Faulted(); i++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (g_stop || p.Faulted() || !p.Playing()) continue;
+            const auto now = std::chrono::steady_clock::now();
+            const double dt =
+                std::chrono::duration<double>(now - last).count();
+            last = now;
+            if (dt <= 0) continue;
+            std::ostringstream j;
+            j << "{\"group_id\":\"" << group_id << "\",\"dead_members\":"
+              << p.DeadMembers() << ",\"members\":[";
+            for (size_t i = 0; i < n; i++) {
+                const auto in = p.InputFramesForSource(i);
+                const auto pu = p.PushFramesForSource(i);
+                const auto fr = p.FramesForSource(i);
+                char buf[192];
+                std::snprintf(buf, sizeof buf,
+                              "%s{\"camera_id\":\"%s\",\"input_fps\":%.1f,"
+                              "\"push_fps\":%.1f,\"infer_fps\":%.1f,"
+                              "\"dead\":%s}",
+                              i ? "," : "", p.Member(i).id.c_str(),
+                              double(in - li[i]) / dt,
+                              double(pu - lp[i]) / dt,
+                              double(fr - lf[i]) / dt,
+                              p.MemberDead(i) ? "true" : "false");
+                j << buf;
+                li[i] = in; lp[i] = pu; lf[i] = fr;
+            }
+            j << "]}";
+            nats.Publish("fnvr.metrics.pipeline." + group_id, j.str());
+        }
+    });
+
     g_main_loop_run(loop);
     g_source_remove(watch_id);
     if (stop_watcher.joinable()) stop_watcher.join();
+    if (metrics.joinable()) metrics.join();
     if (heartbeat.joinable()) heartbeat.join();
     if (flow_watchdog.joinable()) flow_watchdog.join();
     if (healthy_marker.joinable()) healthy_marker.join();

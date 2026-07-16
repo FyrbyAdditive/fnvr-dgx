@@ -24,6 +24,7 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
 	"github.com/fnvr/fnvr/apps/api-server/internal/pipeline"
+	"github.com/fnvr/fnvr/apps/api-server/internal/pipemetrics"
 	"github.com/fnvr/fnvr/apps/api-server/internal/plates"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
@@ -157,6 +158,13 @@ func runServe() error {
 	if err := pipelineStat.Start(ctx); err != nil {
 		return fmt.Errorf("pipeline state start: %w", err)
 	}
+
+	// Pipeline worker metrics → Prometheus gauges on /metrics.
+	pipeMetrics, err := pipemetrics.New(cfg.NATSURL)
+	if err != nil {
+		return fmt.Errorf("pipeline metrics exporter: %w", err)
+	}
+	defer pipeMetrics.Close()
 
 	// MediaMTX re-muxer integration: optional. If configured, we expose
 	// a callback that the camera PATCH handlers invoke after toggling

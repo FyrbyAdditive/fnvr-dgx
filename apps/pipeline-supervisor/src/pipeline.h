@@ -86,6 +86,9 @@ public:
     std::uint64_t PushFramesForSource(size_t i) const {
         return sources_[i]->push_frames.load(std::memory_order_relaxed);
     }
+    bool MemberDead(size_t i) const {
+        return sources_[i]->dead.load(std::memory_order_relaxed);
+    }
     std::uint64_t TotalFrames() const {
         std::uint64_t t = 0;
         for (const auto& s : sources_) t += s->frames.load(std::memory_order_relaxed);

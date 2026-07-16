@@ -15,11 +15,12 @@
 ARG DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark
 FROM ${DEEPSTREAM_IMAGE}
 
-# CUDA version for the custom-parser builds below (DeepStream-Yolo, TAO
-# parsers, RetinaFace parser). The DS 9.1 triton image ships CUDA 13.2
-# (verified: /usr/local/cuda-13.2, nvcc V13.2.78); override if the base
-# image moves.
-ARG CUDA_VER=13.2
+# CUDA version for the custom-parser/supervisor builds below. The DS
+# 9.1 image ships CUDA 13.2; we install the 13.3 user-space toolchain
+# in-image (layer below) and build OUR components with it — the r580
+# driver supports the whole 13.x series via minor-version
+# compatibility. Flip back to 13.2 to revert the experiment.
+ARG CUDA_VER=13.3
 
 # The DS 9.1 triton image ships with NVIDIA's Jetson apt repo enabled in
 # /etc/apt/sources.list (r39.x). Its packages shadow Ubuntu's with higher
@@ -93,6 +94,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # with the stock nvinfer parser; this .so is what makes it work.
 # (TensorRT dev headers ship with the triton base image.)
 #
+# --- CUDA 13.3 user-space toolchain (2026-07-17) ---------------------
+# The host runs the CUDA 13.3 toolkit now; driver stays r580 (native
+# 13.0) and DeepStream ships 13.2. This installs nvcc/cudart 13.3 from
+# the CUDA sbsa repo already configured in the base image, repoints
+# /usr/local/cuda, and (via the final ENV below) puts the 13.3 cudart
+# first on LD_LIBRARY_PATH. cudart's soname is libcudart.so.13 across
+# the 13.x series, so the WHOLE process — DeepStream included — runs
+# on the 13.3 runtime while TRT/DS libs remain the 13.2-built ones
+# (minor-version compatibility). Drop this layer + CUDA_VER to revert.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cuda-minimal-build-13-3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda \
+    && /usr/local/cuda/bin/nvcc --version | tail -1
+
 # TODO(pin): after the first successful build+run on the Spark, pin
 # DS_YOLO_COMMIT to that validated commit instead of master.
 ARG DS_YOLO_COMMIT=master
@@ -376,6 +392,7 @@ RUN chmod +x /usr/local/bin/pipeline-entrypoint.sh /usr/local/bin/calibrate-yolo
 
 # DeepStream libs first, then our own installs. No Tegra dirs — this is
 # an SBSA (dGPU-style) platform.
-ENV LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:/usr/local/lib
+# cuda-13.3 lib dir FIRST: one cudart (13.3) serves the whole process.
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.3/targets/sbsa-linux/lib:/opt/nvidia/deepstream/deepstream/lib:/usr/local/lib
 
 ENTRYPOINT ["/usr/local/bin/pipeline-entrypoint.sh"]
