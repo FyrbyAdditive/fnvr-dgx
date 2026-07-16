@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <map>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -95,10 +96,25 @@ constexpr bool kMuxPadsCentered = false;
 
 // Per-member view the probes use to attribute batch frames back to
 // cameras and to invert the mux letterbox when normalising bboxes.
+// Per-track publish-thinning state (objects only; faces/plates are
+// never thinned). A track re-publishes when it MOVES (> eps of the
+// frame), changes class, or its keepalive lapses — a parked car or a
+// wall-mounted monitor no longer produces 20 rows/second of identical
+// detections. Movement-based publishing keeps consecutive sightings
+// dense enough for the tripwire rules (which interpolate between
+// consecutive published positions).
+struct TrackPubState {
+    float x = -1, y = -1, w = 0, h = 0;
+    std::string cls;
+    std::chrono::steady_clock::time_point last_pub{};
+    std::chrono::steady_clock::time_point last_seen{};
+};
+
 struct SourceView {
     std::string                 camera_id;
     std::set<std::string>       muted_classes;
     std::atomic<std::uint64_t>* frames = nullptr;
+    std::map<std::uint64_t, TrackPubState> track_pub;
     // Letterbox mapping, computed lazily from the first frame's
     // source_frame_{width,height} (runtime truth beats the probe).
     bool  lb_ready = false;
@@ -161,6 +177,32 @@ std::string json_escape(std::string_view s) {
         }
     }
     return out;
+}
+
+// Publish-thinning knobs (env-overridable). Keepalive must stay well
+// under the Live overlay age-out and comfortably under rule windows.
+inline int thinKeepaliveMs() {
+    static const int v = [] {
+        const char* e = std::getenv("FNVR_THIN_KEEPALIVE_MS");
+        int n = e ? std::atoi(e) : 2000;
+        return n > 0 ? n : 2000;
+    }();
+    return v;
+}
+inline float thinEps() {
+    static const float v = [] {
+        const char* e = std::getenv("FNVR_THIN_EPS");
+        float f = e ? float(std::atof(e)) : 0.02f;
+        return (f > 0.f && f < 0.5f) ? f : 0.02f;
+    }();
+    return v;
+}
+inline bool thinEnabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("FNVR_THIN");
+        return !(e && std::string(e) == "0");
+    }();
+    return v;
 }
 
 // The plate detector is attached as gie-unique-id=2 in platedet.txt.
@@ -501,6 +543,33 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 ? obj->parent->object_id
                 : obj->object_id;
 
+            // Publish thinning (objects only): skip the crop + publish
+            // work for a track that hasn't moved, changed class, or
+            // hit its keepalive since the last publish.
+            if (!is_plate && !is_face && thinEnabled()) {
+                const auto now_tp = std::chrono::steady_clock::now();
+                auto& tp = sv.track_pub[track_id];
+                tp.last_seen = now_tp;
+                const bool first = tp.x < 0;
+                const float eps = thinEps();
+                const bool moved =
+                    !first && (std::abs(x - tp.x) > eps ||
+                               std::abs(y - tp.y) > eps ||
+                               std::abs(w - tp.w) > eps ||
+                               std::abs(h - tp.h) > eps);
+                const bool reclassed = !first && tp.cls != label;
+                const bool keepalive =
+                    !first &&
+                    now_tp - tp.last_pub >
+                        std::chrono::milliseconds(thinKeepaliveMs());
+                if (!(first || moved || reclassed || keepalive)) {
+                    continue;
+                }
+                tp.x = x; tp.y = y; tp.w = w; tp.h = h;
+                tp.cls = label;
+                tp.last_pub = now_tp;
+            }
+
             const std::string det_id = short_id();
             if (is_face) {
                 saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
@@ -557,6 +626,19 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         if (frame_had_obj) ctx->hb_frames_obj++;
     }
     if ((ctx->hb_buffers % 250) == 0) {
+        // Prune per-track thinning state for tracks unseen >30 s so
+        // long-running workers don't accumulate dead track ids.
+        const auto cutoff =
+            std::chrono::steady_clock::now() - std::chrono::seconds(30);
+        for (auto& sv : ctx->sources) {
+            for (auto it = sv.track_pub.begin(); it != sv.track_pub.end();) {
+                if (it->second.last_seen < cutoff) {
+                    it = sv.track_pub.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         std::cerr << "probe[" << ctx->group_id << "]: buffers=" << ctx->hb_buffers
                   << " batch_null=" << ctx->hb_batch_null
                   << " frames_with_obj=" << ctx->hb_frames_obj

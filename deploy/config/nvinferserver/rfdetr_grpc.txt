@@ -1,0 +1,55 @@
+# nvinferserver (Triton gRPC) config for the RF-DETR primary detector.
+# Part of the Triton refactor (T3.8): one shared tritonserver owns the
+# engines; workers talk gRPC with CUDA buffer sharing (zero-copy on
+# GB10 unified memory). Preprocessing mirrors rfdetr.txt.template:
+# raw 0-255 RGB (normalisation is baked into the exported graph),
+# square resize (no aspect padding), same custom parser .so.
+#
+# Validated in the sandbox before any fleet graph uses it; the fleet
+# flip is gated behind settings detector.inference_backend.
+infer_config {
+  unique_id: 1
+  gpu_ids: [0]
+  max_batch_size: 1
+  backend {
+    triton {
+      model_name: "rfdetr"
+      version: -1
+      grpc {
+        url: "localhost:8001"
+        # cudaIpc (CUDA shm) is unsupported on integrated-GPU
+        # platforms — GB10 included. Tensors ride regular gRPC;
+        # ~4 MB/frame at fp32 560² is noise for a Grace CPU.
+        enable_cuda_buffer_sharing: false
+      }
+    }
+  }
+  preprocess {
+    network_format: IMAGE_FORMAT_RGB
+    tensor_order: TENSOR_ORDER_LINEAR
+    tensor_name: "input"
+    maintain_aspect_ratio: 0
+    frame_scaling_hw: FRAME_SCALING_HW_GPU
+    frame_scaling_filter: 1
+    normalize {
+      scale_factor: 1.0
+    }
+  }
+  postprocess {
+    labelfile_path: "/var/lib/fnvr/models/rfdetr/labels.txt"
+    detection {
+      num_detected_classes: 91
+      custom_parse_bbox_func: "NvDsInferParseCustomRFDETR"
+      simple_cluster {
+        threshold: 0.5
+      }
+    }
+  }
+  custom_lib {
+    path: "/usr/local/lib/fnvr/libnvdsinfer_custom_impl_rfdetr.so"
+  }
+}
+input_control {
+  process_mode: PROCESS_MODE_FULL_FRAME
+  interval: 0
+}
