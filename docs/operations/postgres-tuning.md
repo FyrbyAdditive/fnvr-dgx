@@ -1,17 +1,23 @@
 # PostgreSQL tuning
 
 fnvr uses postgres for detections, segments, incidents, settings, and
-face embeddings (via pgvector). The default `pgvector/pgvector:pg16`
+face embeddings (via pgvector). The default `pgvector/pgvector:pg18`
 image ships stock postgres defaults, which assume a small VM and leave
-most of an Orin-class host on the table. We override those defaults in
+most of a DGX-Spark-class host on the table. We override those defaults in
 [deploy/docker/docker-compose.yml](../../deploy/docker/docker-compose.yml)
 via `command:` flags so the deployment is self-contained — no separate
 `postgresql.conf` to mount and version.
 
 ## Target host shape
 
-The defaults below target an **NVIDIA Jetson AGX Orin (32 GB RAM, NVMe)**
-or any similar single-host deployment. fnvr's postgres workload is:
+The defaults below target the **NVIDIA DGX Spark (GB10: 128 GB coherent
+unified LPDDR5x, NVMe)**. The critical shape difference from a normal
+128 GB server: the memory pool is SHARED with the GPU — TensorRT
+engines, decode surfaces and inference activations all come out of the
+same 128 GB, and the platform plan reserves **≥80 GB for GPU-side use**
+at the 16-camera design point. Postgres therefore gets a
+generous-but-bounded slice (16 GB shared_buffers), NOT the classic
+25%-of-RAM. fnvr's postgres workload is:
 
 - High-volume detection inserts from `event-processor` (a few hundred per
   second when several cameras are busy).
@@ -29,20 +35,24 @@ purges don't checkpoint thrash.
 
 | Flag | Value | Why |
 |---|---|---|
-| `shared_buffers` | `2GB` | Stock 128MB is laughable on 32GB RAM. 2GB keeps the hot detection / segment / settings rows resident. |
-| `effective_cache_size` | `8GB` | Tells the planner roughly how much OS page cache is available. The Orin runs other services, so 8GB (¼ of RAM) is a safe planner hint, not a reservation. |
-| `work_mem` | `32MB` | JSONB scans, ORDER BY, and pgvector searches all benefit. Per-sort, per-hash — set per-connection so 32 conns × multiple sorts can still spike, but rarely. |
-| `maintenance_work_mem` | `512MB` | VACUUM, CREATE INDEX, and ANALYZE all use this. Bigger = faster maintenance windows. |
+| `shared_buffers` | `16GB` | Keeps weeks of hot detection / segment / settings rows resident. Bounded well below the classic 25% because the GPU shares the pool. |
+| `effective_cache_size` | `64GB` | Planner hint (not a reservation): with recordings on NVMe and the GPU idle-ish, the OS page cache can genuinely reach this. |
+| `work_mem` | `64MB` | JSONB scans, ORDER BY, and pgvector searches all benefit. Per-sort, per-hash — 72 pooled conns × spikes still fit comfortably in the slice. |
+| `maintenance_work_mem` | `2GB` | VACUUM, CREATE INDEX, and ANALYZE all use this. RF-DETR-era detection volume (~40 inserts/s sustained) makes fast VACUUM matter. |
 | `random_page_cost` | `1.1` | NVMe random I/O is essentially as cheap as sequential. The default 4.0 came from spinning rust and biases the planner against indexes. |
 | `effective_io_concurrency` | `200` | NVMe handles deep queues. Lets the planner issue many parallel reads for bitmap scans. |
-| `max_wal_size` | `4GB` | Retention DELETEs generate a lot of WAL. Larger ceiling = fewer forced checkpoints during purges. |
-| `min_wal_size` | `1GB` | Avoid recycling WAL too aggressively. |
+| `max_wal_size` | `16GB` | Retention DELETEs generate a lot of WAL. Larger ceiling = fewer forced checkpoints during purges. |
+| `min_wal_size` | `2GB` | Avoid recycling WAL too aggressively. |
 | `checkpoint_completion_target` | `0.9` | Spread checkpoint I/O over 90% of the interval rather than spiking. |
 | `default_statistics_target` | `200` | We run JSONB queries with `->>` operators where the planner needs accurate selectivity estimates. 200 is double the default, well worth the slightly slower ANALYZE. |
+| `max_parallel_workers_per_gather` | `4` | 20 Grace cores; timeline range scans and pgvector rebuilds parallelise well without starving the pipeline processes. |
 
-If you deploy fnvr on a smaller host (e.g. an Orin Nano with 8 GB RAM,
-or a workstation with limited RAM headroom), halve `shared_buffers` and
-`effective_cache_size` and drop `work_mem` to 16 MB.
+If you deploy fnvr on a smaller host, halve `shared_buffers` and
+`effective_cache_size` (repeatedly, until they fit) and drop `work_mem`
+to 16 MB. If GPU memory pressure appears at high camera counts
+(engine build failures, `cudaErrorMemoryAllocation`), shrink
+`shared_buffers` first — on unified memory postgres and the GPU
+compete directly.
 
 ## Client (pgxpool) sizing
 
@@ -81,7 +91,7 @@ sudo docker exec fnvr-postgres-1 \
 ```
 
 Expected `setting` values reflect the compose flags above (note that
-`shared_buffers` reports in 8KB pages, so 2GB shows as `262144`).
+`shared_buffers` reports in 8KB pages, so 16GB shows as `2097152`).
 
 ## When to revisit
 

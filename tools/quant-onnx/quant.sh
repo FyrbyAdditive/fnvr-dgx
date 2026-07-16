@@ -18,7 +18,12 @@ VARIANT="${1:?usage: quant.sh <variant> [mode]  (mode: int8|fp8|nvfp4, default f
 # Orin-era workaround.
 MODE="${2:-fp8}"
 case "$MODE" in int8|fp8|nvfp4) ;; *) echo "bad mode $MODE"; exit 1;; esac
-ONNX_SRC="/work/onnx-src/best.onnx"
+# Model geometry/domain. yolo26: 640, [0,1]. rfdetr: 560, raw 0..255
+# (normalisation baked into the exported graph), square resize.
+IMGSZ="${IMGSZ:-640}"
+NPY_RANGE="${NPY_RANGE:-unit}"
+NPY_RESIZE="${NPY_RESIZE:-}"
+ONNX_SRC="${ONNX_SRC:-/work/onnx-src/best.onnx}"
 ONNX_DST="/work/out/${VARIANT}.quant-${MODE}.onnx"
 CALIB_NPY="/work/calib.npy"
 
@@ -42,7 +47,9 @@ if [ ! -f "$CALIB_NPY" ]; then
     python3 /work/make-npy.py \
         --src "$CALIB_SRC" \
         --dst "$CALIB_NPY" \
-        --imgsz 640
+        --imgsz "$IMGSZ" \
+        --range "$NPY_RANGE" \
+        ${NPY_RESIZE:+--resize}
 else
     echo "calib.npy already present, reusing"
 fi

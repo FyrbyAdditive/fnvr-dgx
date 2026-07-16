@@ -26,35 +26,39 @@ services:
       # /var/lib/postgresql — mount the parent, not .../data, so future
       # major upgrades can pg_upgrade --link across one mount.
       - postgres-data:/var/lib/postgresql
-    # Tuning targets an Orin AGX-class host (32 GB RAM, NVMe). Numbers are
-    # conservative — the Orin has plenty of headroom and our workload is
-    # detection inserts + JSONB scans + segment housekeeping. Stock pg16
-    # defaults (shared_buffers=128MB, work_mem=4MB, NVMe-naive page costs)
-    # leave most of the box on the table. If you deploy on a smaller host,
-    # halve shared_buffers / effective_cache_size and drop work_mem to 16MB.
-    # See docs/operations/postgres-tuning.md.
+    # Tuning targets the DGX Spark (GB10: 128 GB coherent unified
+    # LPDDR5x shared between CPU and GPU, NVMe). Deliberately NOT the
+    # classic 25%-of-RAM shared_buffers: the GPU, TRT engines and video
+    # buffers live in the SAME memory pool, and the plan reserves
+    # ≥80 GB for them — postgres gets a generous-but-bounded slice.
+    # Workload is detection inserts (~40/s with RF-DETR) + JSONB scans
+    # + pgvector similarity + segment housekeeping. If you deploy on a
+    # smaller host, halve shared_buffers / effective_cache_size and
+    # drop work_mem to 16MB. See docs/operations/postgres-tuning.md.
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=2GB"
+      - "shared_buffers=16GB"
       - "-c"
-      - "effective_cache_size=8GB"
+      - "effective_cache_size=64GB"
       - "-c"
-      - "work_mem=32MB"
+      - "work_mem=64MB"
       - "-c"
-      - "maintenance_work_mem=512MB"
+      - "maintenance_work_mem=2GB"
       - "-c"
       - "random_page_cost=1.1"
       - "-c"
       - "effective_io_concurrency=200"
       - "-c"
-      - "max_wal_size=4GB"
+      - "max_wal_size=16GB"
       - "-c"
-      - "min_wal_size=1GB"
+      - "min_wal_size=2GB"
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
       - "default_statistics_target=200"
+      - "-c"
+      - "max_parallel_workers_per_gather=4"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fnvr -d fnvr"]
       interval: 5s

@@ -29,6 +29,16 @@ def main() -> None:
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--limit", type=int, default=0,
                     help="0 = use all images; otherwise cap at this many")
+    # rfdetr: square-resize any input (nvinfer maintain-aspect-ratio=0)
+    # and keep RAW 0..255 floats — the export bakes ImageNet mean/std
+    # into the graph, so net-scale-factor is 1.0 in nvinfer and the
+    # calibration tensor must be in the same raw domain.
+    ap.add_argument("--resize", action="store_true",
+                    help="square-resize inputs instead of requiring "
+                         "pre-letterboxed images")
+    ap.add_argument("--range", choices=["unit", "raw255"], default="unit",
+                    help="unit: /255 (yolo26); raw255: keep 0..255 (rfdetr, "
+                         "normalisation baked into the graph)")
     args = ap.parse_args()
 
     src = Path(args.src)
@@ -47,15 +57,22 @@ def main() -> None:
         if img is None:
             raise SystemExit(f"failed to read {p}")
         if img.shape[:2] != (args.imgsz, args.imgsz):
-            raise SystemExit(
-                f"{p}: expected {args.imgsz}x{args.imgsz}, got {img.shape[:2]}. "
-                "Re-letterbox via tools/compile-hef/make-calib.py first.")
+            if args.resize:
+                img = cv2.resize(img, (args.imgsz, args.imgsz),
+                                 interpolation=cv2.INTER_LINEAR)
+            else:
+                raise SystemExit(
+                    f"{p}: expected {args.imgsz}x{args.imgsz}, got {img.shape[:2]}. "
+                    "Re-letterbox via tools/compile-hef/make-calib.py first.")
         # BGR -> RGB, HWC -> CHW, [0,255] -> [0,1] float32. Matches
         # nvinfer's net-scale-factor=1/255 + model-color-format=0
         # (RGB) in deploy/config/nvinfer/yolo26.txt.template.
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         chw = rgb.transpose(2, 0, 1)  # H,W,C -> C,H,W
-        arr[i] = chw.astype(np.float32) / 255.0
+        if args.range == "raw255":
+            arr[i] = chw.astype(np.float32)
+        else:
+            arr[i] = chw.astype(np.float32) / 255.0
 
     print(f"writing {arr.shape} {arr.dtype} -> {args.dst}")
     np.save(args.dst, arr)
