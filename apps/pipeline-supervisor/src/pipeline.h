@@ -36,6 +36,16 @@ struct SourceRuntime {
     // branch is dead until the group's debounced self-heal restart;
     // siblings keep streaming meanwhile.
     std::atomic<bool> dead{false};
+    // Push-leg health counters: encoded frames entering the member's
+    // chain (depay src) vs frames actually handed to rtspclientsink
+    // (push sink pad). A healthy relay keeps these in lockstep; a
+    // stress window (GPU contention, mediamtx hiccup) can leave the
+    // sink pacing below the input rate PERMANENTLY while the leaky
+    // queue eats the difference — live tiles then stutter at a
+    // fraction of real fps until the process restarts. The push
+    // watchdog in main.cpp compares the two and self-heals.
+    std::atomic<std::uint64_t> input_frames{0};
+    std::atomic<std::uint64_t> push_frames{0};
 };
 
 // GroupPipeline — the batched-mux shape. N member cameras share one
@@ -64,6 +74,12 @@ public:
     const CameraConfig& Member(size_t i) const { return sources_[i]->cam; }
     std::uint64_t FramesForSource(size_t i) const {
         return sources_[i]->frames.load(std::memory_order_relaxed);
+    }
+    std::uint64_t InputFramesForSource(size_t i) const {
+        return sources_[i]->input_frames.load(std::memory_order_relaxed);
+    }
+    std::uint64_t PushFramesForSource(size_t i) const {
+        return sources_[i]->push_frames.load(std::memory_order_relaxed);
     }
     std::uint64_t TotalFrames() const {
         std::uint64_t t = 0;

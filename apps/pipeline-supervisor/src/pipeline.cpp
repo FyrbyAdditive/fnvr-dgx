@@ -1030,6 +1030,43 @@ GstElement* GroupPipeline::BuildPipeline() {
                      (guint64)(500 * GST_MSECOND), nullptr);
     }
 
+    // Push-leg health probes: count encoded frames entering each
+    // member chain (depay_i src) and frames reaching its MediaMTX
+    // push sink (push_i sink). The push watchdog in main.cpp compares
+    // the rates and self-heals when the relay falls persistently
+    // behind — the degraded state is sticky once entered (observed
+    // twice on the fleet) and invisible to the frame-flow watchdog,
+    // which only sees the inference leg.
+    for (size_t i = 0; i < sources_.size(); i++) {
+        auto* sr = sources_[i].get();
+        auto attach_counter = [&](const std::string& elem,
+                                  const char* pad_name,
+                                  std::atomic<std::uint64_t>* counter) {
+            GstElement* e = gst_bin_get_by_name(GST_BIN(pipeline), elem.c_str());
+            if (!e) return;
+            GstPad* pad = gst_element_get_static_pad(e, pad_name);
+            if (pad) {
+                gst_pad_add_probe(
+                    pad, GST_PAD_PROBE_TYPE_BUFFER,
+                    [](GstPad*, GstPadProbeInfo*, gpointer u) -> GstPadProbeReturn {
+                        static_cast<std::atomic<std::uint64_t>*>(u)->fetch_add(
+                            1, std::memory_order_relaxed);
+                        return GST_PAD_PROBE_OK;
+                    },
+                    counter, nullptr);
+                gst_object_unref(pad);
+            }
+            gst_object_unref(e);
+        };
+        attach_counter("depay_" + std::to_string(i), "src", &sr->input_frames);
+        // rtspclientsink's sink pads are request pads (sink_%u), so
+        // count on the parser feeding it instead: pp_i.src pushes
+        // synchronously into the sink, so its rate IS the sink's
+        // consumption rate (the leaky qp_i upstream absorbs the
+        // difference from the input side).
+        attach_counter("pp_" + std::to_string(i), "src", &sr->push_frames);
+    }
+
 #if FNVR_HAS_DEEPSTREAM
     if (has_inference_) {
         // Preview-thumbnail probe on pgie.src — batch-aware, per-source

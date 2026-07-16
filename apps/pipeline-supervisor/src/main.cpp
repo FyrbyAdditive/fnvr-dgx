@@ -164,6 +164,19 @@ static int runWorkerGroup(const std::string& group_id,
     // 120 s, exit rc=3 so the supervisor respawns the whole group once.
     // Multiple deaths within the window share the same single restart.
     std::thread self_heal([&p, &group_id] {
+        // Push-leg degradation tracking: per member, consecutive 30 s
+        // windows where the MediaMTX relay consumed < 60 % of the
+        // frames the camera delivered. The degraded state is sticky
+        // once entered (observed twice on the fleet: a stress window
+        // leaves rtspclientsink pacing below input rate forever, the
+        // leaky queue eats the difference, live tiles stutter at a
+        // fraction of real fps) and invisible to the flow watchdog,
+        // which only sees the inference leg. 4 consecutive bad
+        // windows (2 min) → debounced restart.
+        const size_t n = p.MemberCount();
+        std::vector<std::uint64_t> last_in(n, 0), last_push(n, 0);
+        std::vector<int> bad_windows(n, 0);
+        auto last_window = std::chrono::steady_clock::now();
         while (!g_stop && !p.Faulted()) {
             if (p.DeadMembers() > 0) {
                 auto age = std::chrono::duration_cast<std::chrono::seconds>(
@@ -173,6 +186,38 @@ static int runWorkerGroup(const std::string& group_id,
                               << p.DeadMembers() << " dead member(s) for "
                               << age << "s)\n";
                     std::_Exit(3);
+                }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (p.Playing() && now - last_window >= std::chrono::seconds(30)) {
+                last_window = now;
+                for (size_t i = 0; i < n; i++) {
+                    const std::uint64_t in_now   = p.InputFramesForSource(i);
+                    const std::uint64_t push_now = p.PushFramesForSource(i);
+                    const std::uint64_t d_in   = in_now - last_in[i];
+                    const std::uint64_t d_push = push_now - last_push[i];
+                    last_in[i]   = in_now;
+                    last_push[i] = push_now;
+                    // Need real input flow to judge (≥2 fps for 30 s);
+                    // a camera that is down/reconnecting is the bus
+                    // handler's problem, not ours.
+                    if (d_in < 60) { bad_windows[i] = 0; continue; }
+                    if (d_push * 10 < d_in * 6) {
+                        bad_windows[i]++;
+                        std::cerr << "group[" << group_id << "]: push leg ["
+                                  << p.Member(i).id << "] degraded — "
+                                  << d_push << "/" << d_in
+                                  << " frames relayed in 30s (window "
+                                  << bad_windows[i] << "/4)\n";
+                        if (bad_windows[i] >= 4) {
+                            std::cerr << "group[" << group_id
+                                      << "]: push-leg self-heal restart ["
+                                      << p.Member(i).id << "]\n";
+                            std::_Exit(3);
+                        }
+                    } else {
+                        bad_windows[i] = 0;
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::seconds(5));
