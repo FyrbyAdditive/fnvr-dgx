@@ -302,6 +302,10 @@ services:
     environment:
       FNVR_MTX_PLAYBACK: "http://mediamtx:9996"
       FNVR_TRANSCODER_MAX: "3"
+      # `video` is NOT in the default capability set — without it the
+      # container has no NVDEC/NVENC and nvv4l2decoder fails with
+      # "not enough memory or failing driver".
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
     deploy:
       resources:
         reservations:

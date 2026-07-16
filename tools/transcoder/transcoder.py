@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import http.server
 import os
-import shlex
 import signal
 import socketserver
 import subprocess
@@ -72,20 +71,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _sem.release()
 
     def _stream(self, src: str):
-        # decodebin picks nvv4l2decoder (top-ranked) for H.264/H.265
-        # alike; NVMM caps keep decode→convert→encode zero-copy.
-        pipeline = (
-            f"souphttpsrc location={shlex.quote(src)} ! "
-            "qtdemux ! parsebin ! nvv4l2decoder name=dec ! "
-            "nvvideoconvert compute-hw=1 ! "
-            "video/x-raw(memory:NVMM),format=NV12 ! "
-            f"nvv4l2h264enc bitrate={BITRATE} insert-sps-pps=1 "
-            "iframeinterval=30 idrinterval=30 ! h264parse ! "
-            "mp4mux streamable=true fragment-duration=1000 ! "
-            "fdsink fd=1 sync=false"
-        )
+        # ffmpeg with cuda hwaccel + h264_nvenc (the Ubuntu build in
+        # the DS image ships both): decode on NVDEC, encode on NVENC,
+        # correct timestamps carried end-to-end, fragmented MP4 out.
+        # (A gst fdsrc→nvv4l2decoder→nvv4l2h264enc→mp4mux chain was
+        # tried first and died on "Buffer has no PTS" at the muxer —
+        # the encoder's first output lacks a timestamp and gst has no
+        # knob for it.)
         proc = subprocess.Popen(
-            ["gst-launch-1.0", "-q"] + shlex.split(pipeline),
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-hwaccel", "cuda", "-i", src,
+             "-c:v", "h264_nvenc", "-preset", "p4",
+             "-b:v", BITRATE, "-g", "30",
+             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+             "-f", "mp4", "pipe:1"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid,
