@@ -11,6 +11,11 @@
 # Classes: car (0), bicycle (1), person (2), road_sign (3).
 
 [property]
+# GB10 unified memory: nvinfer's output-pool growth guard compares CUDA
+# "free" memory (= free SYSTEM RAM here, which Linux keeps low by
+# design) against a 99% threshold and refuses to grow — dropping
+# batches and killing the group. 100 disables the broken check.
+max-gpu-mem-per=100
 gpu-id=0
 net-scale-factor=0.00392156862745098
 onnx-file=/var/lib/fnvr/models/primary_detector/resnet18_trafficcamnet_pruned.onnx

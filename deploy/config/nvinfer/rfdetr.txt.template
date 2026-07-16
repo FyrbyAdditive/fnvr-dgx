@@ -15,6 +15,11 @@
 # net-scale-factor stays 1.0 and there are no offsets here.
 
 [property]
+# GB10 unified memory: nvinfer's output-pool growth guard compares CUDA
+# "free" memory (= free SYSTEM RAM here, which Linux keeps low by
+# design) against a 99% threshold and refuses to grow — dropping
+# batches and killing the group. 100 disables the broken check.
+max-gpu-mem-per=100
 gpu-id=0
 net-scale-factor=1.0
 model-color-format=0

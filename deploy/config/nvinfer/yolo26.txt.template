@@ -17,6 +17,11 @@
 #                  fine-tunes that target the user's trimmed taxonomy)
 
 [property]
+# GB10 unified memory: nvinfer's output-pool growth guard compares CUDA
+# "free" memory (= free SYSTEM RAM here, which Linux keeps low by
+# design) against a 99% threshold and refuses to grow — dropping
+# batches and killing the group. 100 disables the broken check.
+max-gpu-mem-per=100
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
