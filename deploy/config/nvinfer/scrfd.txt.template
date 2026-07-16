@@ -37,7 +37,7 @@ gie-unique-id=4
 # SGIE mode, operating on YOLO26's person class (class 0 in coco).
 process-mode=2
 operate-on-gie-id=1
-operate-on-class-ids=0
+operate-on-class-ids=$PERSON_CLASS_ID
 network-type=0
 # Parser does its own NMS, so DS should not cluster.
 cluster-mode=4

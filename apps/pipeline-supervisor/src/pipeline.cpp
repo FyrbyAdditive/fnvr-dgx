@@ -155,11 +155,11 @@ std::string json_escape(std::string_view s) {
     return out;
 }
 
-// LPDNet is attached as gie-unique-id=2 in lpdnet.txt. Any obj_meta
-// with this component id is a plate crop, not a primary-detector
-// object. Pgie (YOLO26) = 1; LPRNet (classifier) only updates
+// The plate detector is attached as gie-unique-id=2 in platedet.txt.
+// Any obj_meta with this component id is a plate crop, not a primary-
+// detector object. Pgie = 1; the OCR (classifier) only updates
 // classifier_meta on the plate's obj_meta — it doesn't add new objs.
-constexpr unsigned LPDNET_GIE_ID  = 2;
+constexpr unsigned PLATEDET_GIE_ID = 2;
 // SCRFD detector is gie-unique-id=4 in scrfd.txt (arcface is 5).
 constexpr unsigned SCRFD_GIE_ID   = 4;
 // ArcFace's 512-d output lands on the face obj_meta's user meta.
@@ -540,7 +540,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             if (x + w > 1.f) w = 1.f - x;
             if (y + h > 1.f) h = 1.f - y;
 
-            const bool is_plate = (obj->unique_component_id == LPDNET_GIE_ID);
+            const bool is_plate = (obj->unique_component_id == PLATEDET_GIE_ID);
             const bool is_face  = (obj->unique_component_id == SCRFD_GIE_ID);
             const char* label = is_plate
                 ? "plate"
@@ -932,16 +932,20 @@ GstElement* GroupPipeline::BuildPipeline() {
         const bool wants_anpr = use_anpr_ && detectorListed("anpr");
         const bool wants_face = use_face_id_ && detectorListed("face");
 
+        // scrfd/platedet configs are RENDERED by the entrypoint into
+        // /var/lib/fnvr/nvinfer/ — their operate-on-class-ids depend on
+        // the active detector family's label space (COCO-80 vs RF-DETR's
+        // 91-slot space, where person/vehicles sit at different ids).
         std::string anpr_chain, face_chain;
         if (wants_anpr) {
             anpr_chain =
-                "nvinfer name=lpdnet config-file-path=/etc/fnvr/nvinfer/lpdnet.txt ! "
-                "nvinfer name=lprnet config-file-path=/etc/fnvr/nvinfer/lprnet.txt ! ";
+                "nvinfer name=platedet config-file-path=/var/lib/fnvr/nvinfer/platedet.txt ! "
+                "nvinfer name=plateocr config-file-path=/etc/fnvr/nvinfer/plateocr.txt ! ";
         }
         if (wants_face) {
             face_chain =
-                "nvinfer name=scrfd  config-file-path=/etc/fnvr/nvinfer/scrfd.txt ! "
-                "nvinfer name=arcface config-file-path=/etc/fnvr/nvinfer/arcface.txt ! ";
+                "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! "
+                "nvinfer name=embedder config-file-path=/etc/fnvr/nvinfer/adaface.txt ! ";
         }
 
         p << "nvstreammux name=mux batch-size=" << sources_.size()
@@ -995,9 +999,9 @@ GstElement* GroupPipeline::BuildPipeline() {
 
         // Detection probe on the LAST nvinfer in the active chain.
         if (nats_) {
-            GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "arcface");
-            const char* attach_name = "arcface";
-            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "lprnet"); attach_name = "lprnet"; }
+            GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "embedder");
+            const char* attach_name = "embedder";
+            if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "plateocr"); attach_name = "plateocr"; }
             if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker"); attach_name = "tracker"; }
             if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie"); attach_name = "pgie"; }
             if (attach) {

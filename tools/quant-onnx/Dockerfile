@@ -6,9 +6,9 @@
 # a QDQ-annotated ONNX that trtexec loads through the explicit-
 # precision path — different code, different bug surface.
 #
-# Builds an x86_64-only image. Modelopt's torch deps are flaky on
-# aarch64; we run quantisation off-Jetson and ship the resulting
-# ONNX to the Orin where trtexec then builds the engine.
+# Runs on the DGX Spark itself (arm64): base on NGC's multi-arch
+# PyTorch container, which carries a CUDA-13/Blackwell-ready torch.
+# The old x86_64-only constraint was an Orin-era workaround.
 #
 # Build:
 #   docker build -t fnvr-quant-onnx tools/quant-onnx/
@@ -22,7 +22,10 @@
 # Poll:
 #   docker logs -f fnvr-quant-yolo26m
 # Output: /work/out/gpu-yolo26m-v1.quant.onnx
-FROM python:3.11-slim-bookworm
+# Multi-arch NGC PyTorch base (arm64 slice is Grace/Blackwell-ready).
+# Override if the tag ages: --build-arg BASE=nvcr.io/nvidia/pytorch:<yy.mm>-py3
+ARG BASE=nvcr.io/nvidia/pytorch:25.08-py3
+FROM ${BASE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \

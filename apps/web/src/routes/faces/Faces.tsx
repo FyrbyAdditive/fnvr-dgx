@@ -284,7 +284,7 @@ function EmbeddingTile({
   // The badge shows each embedding's mean cosine to its 3 nearest
   // neighbours in the pool — a proxy for "does this embedding belong
   // with the others?" without penalising legitimate pose/lighting
-  // variants. Colour floors calibrated against observed ArcFace
+  // variants. Colour floors calibrated against observed embedding
   // data: an outlier stranger scores <0.35; a real-person variant
   // with similar siblings lands ≥0.50 even across pose changes.
   // Pools with fewer than 2 embeddings have no neighbours to compare

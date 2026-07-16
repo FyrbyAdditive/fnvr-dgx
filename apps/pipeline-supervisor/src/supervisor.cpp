@@ -197,7 +197,7 @@ void Supervisor::reconcileOnce() {
         faceid_engines.push_back(
             "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine");
         faceid_engines.push_back(
-            "/var/lib/fnvr/models/faceid/arcface.onnx_b16_gpu0_fp16.engine");
+            "/var/lib/fnvr/models/faceid/adaface.onnx_b16_gpu0_fp16.engine");
     }
 
     bool first_start = true;
@@ -288,10 +288,10 @@ void validateAllEngines(const std::string& pgie_engine_path) {
     }
     if (const char* e = std::getenv("FNVR_USE_ANPR"); e && std::string(e) == "1") {
         validateEngineFile(
-            "/var/lib/fnvr/models/anpr/LPDNet_usa.onnx_b16_gpu0_fp16.engine",
+            "/var/lib/fnvr/models/anpr/platedet.onnx_b16_gpu0_fp16.engine",
             256 * 1024);
         validateEngineFile(
-            "/var/lib/fnvr/models/anpr/LPRNet_usa.onnx_b16_gpu0_fp16.engine",
+            "/var/lib/fnvr/models/anpr/plateocr.onnx_b16_gpu0_fp16.engine",
             256 * 1024);
     }
     if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
@@ -299,7 +299,7 @@ void validateAllEngines(const std::string& pgie_engine_path) {
             "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine",
             256 * 1024);
         validateEngineFile(
-            "/var/lib/fnvr/models/faceid/arcface.onnx_b16_gpu0_fp16.engine",
+            "/var/lib/fnvr/models/faceid/adaface.onnx_b16_gpu0_fp16.engine",
             1 * 1024 * 1024);
     }
 }

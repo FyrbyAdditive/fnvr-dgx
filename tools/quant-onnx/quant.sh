@@ -11,9 +11,15 @@
 # Args: <variant>  (e.g. gpu-yolo26m-v1)
 set -euo pipefail
 
-VARIANT="${1:?usage: quant.sh <variant>  (e.g. gpu-yolo26m-v1)}"
+VARIANT="${1:?usage: quant.sh <variant> [mode]  (mode: int8|fp8|nvfp4, default fp8)}"
+# Quantisation mode. On GB10/Blackwell prefer fp8 or nvfp4 (native
+# tensor-core formats, no calibration-table fragility); int8 kept for
+# comparison. Runs ON the Spark now — the x86-only constraint was an
+# Orin-era workaround.
+MODE="${2:-fp8}"
+case "$MODE" in int8|fp8|nvfp4) ;; *) echo "bad mode $MODE"; exit 1;; esac
 ONNX_SRC="/work/onnx-src/best.onnx"
-ONNX_DST="/work/out/${VARIANT}.quant.onnx"
+ONNX_DST="/work/out/${VARIANT}.quant-${MODE}.onnx"
 CALIB_NPY="/work/calib.npy"
 
 mkdir -p /work/out
@@ -41,7 +47,7 @@ else
     echo "calib.npy already present, reusing"
 fi
 
-echo "=== [2/3] running modelopt PTQ (INT8 entropy) ==="
+echo "=== [2/3] running modelopt PTQ ($MODE) ==="
 # Modelopt's CLI:
 #   --onnx_path                source ONNX
 #   --output_path              QDQ-annotated ONNX written here
@@ -50,12 +56,13 @@ echo "=== [2/3] running modelopt PTQ (INT8 entropy) ==="
 #   --calibration_method entropy  same algorithm trtexec uses, just
 #                              applied through ONNX Q/DQ insertion
 #                              instead of in-engine calibration
+EXTRA=""
+[ "$MODE" = "int8" ] && EXTRA="--calibration_method=entropy"
 python3 -m modelopt.onnx.quantization \
     --onnx_path="$ONNX_SRC" \
     --output_path="$ONNX_DST" \
     --calibration_data="$CALIB_NPY" \
-    --quantize_mode=int8 \
-    --calibration_method=entropy
+    --quantize_mode="$MODE" $EXTRA
 
 echo "=== [3/3] inspecting result ==="
 python3 - <<PY
@@ -75,9 +82,10 @@ echo
 echo "=== done ==="
 echo "QDQ ONNX: $ONNX_DST"
 echo
-echo "Next: scp to the Orin and trtexec it:"
-echo "  scp $ONNX_DST tim@172.16.4.23:/tmp/"
-echo "  ssh tim@172.16.4.23 'sudo docker exec fnvr-pipeline-1 trtexec \\"
-echo "      --onnx=/tmp/${VARIANT}.quant.onnx \\"
-echo "      --saveEngine=/tmp/${VARIANT}.quant.engine \\"
-echo "      --fp16 --memPoolSize=workspace:4096'"
+echo "Next (same box): drop it into the models volume and point the"
+echo "detector at it — nvinfer builds the engine through the explicit-"
+echo "precision QDQ path:"
+echo "  sudo cp $ONNX_DST \\"
+echo "      /var/lib/docker/volumes/fnvr_fnvr-data/_data/models/yolo26/${VARIANT}-${MODE}.onnx"
+echo "Then set detector.yolo26_variant='${VARIANT}-${MODE}' (custom name)"
+echo "in Settings and restart the pipeline."

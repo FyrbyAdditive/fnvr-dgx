@@ -15,8 +15,8 @@ The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX 
   nvstreammux (batch-size=N, canvas 1920×1080, enable-padding=1)
     → nvinfer  pgie   (yolo26, one b$BATCH engine shared by the group)
     → nvtracker  (NvDCF; per-source track state is native)
-    → nvinfer  lpdnet/lprnet   (plate SGIEs, optional — group shape)
-    → nvinfer  scrfd/arcface   (face SGIEs, optional — group shape)
+    → nvinfer  platedet/plateocr (plate SGIEs, optional — group shape)
+    → nvinfer  scrfd/embedder    (face SGIEs, optional — group shape)
     → fakesink                                  (detection probe taps here)
   (a pad probe on pgie.src — see preview_probe.cpp — walks the batch and
    writes each member's 1 fps 480×270 JPEG ring. No second decode.)
@@ -38,7 +38,7 @@ Per-camera choices baked into the graph:
 
 ## Detections → NATS
 
-Each `nvinfer` + tracker hit is attached to the buffer as `NvDsObjectMeta`. A bus-watch probe after the trackers walks the metadata, builds a [`Detection` payload](../../apps/event-processor/internal/rules/engine.go), and publishes it on `fnvr.events.detection.<camera_id>`. Face probes additionally extract the 512-d ArcFace embedding from tensor-meta and base64-encode it into `attributes.embedding` for the matcher to read downstream.
+Each `nvinfer` + tracker hit is attached to the buffer as `NvDsObjectMeta`. A bus-watch probe after the trackers walks the metadata, builds a [`Detection` payload](../../apps/event-processor/internal/rules/engine.go), and publishes it on `fnvr.events.detection.<camera_id>`. Face probes additionally extract the 512-d AdaFace IR-101 embedding from tensor-meta and base64-encode it into `attributes.embedding` for the matcher to read downstream.
 
 The probe does NOT query the DB. Person labels are resolved afterwards in [event-processor](rules-engine.md) so the pipeline stays stateless.
 
@@ -93,7 +93,7 @@ Pre-bake path: a `trtexec` invocation in [deploy/docker/calibrate-yolo26.sh](../
 
 ## Secondary inference (SGIEs)
 
-ANPR and face-ID run as secondary `nvinfer` elements chained after the primary detector + tracker. They only process objects whose class ID matches their "operate-on" list (cars for LPDNet, persons for SCRFD), so the per-frame GPU cost on a camera with no candidates in frame is near zero — but the engine still sits in memory and the nvstreammux batch still binds to it, so *presence* in the graph has non-trivial cost.
+ANPR and face-ID run as secondary `nvinfer` elements chained after the primary detector + tracker. They only process objects whose class ID matches their "operate-on" list (vehicles for the plate detector, persons for the face detector — the ids are rendered per detector family by the entrypoint, since RF-DETR's 91-slot label space places them differently than COCO-80), so the per-frame GPU cost on a camera with no candidates in frame is near zero — but the engine still sits in memory and the nvstreammux batch still binds to it, so *presence* in the graph has non-trivial cost.
 
 Per-camera enable/disable is effective-min of two controls:
 - **Pipeline-level kill switches** — `settings.detector.anpr_enabled` / `settings.detector.face_id_enabled`. Off = every worker's graph omits that SGIE chain. Flipping these restarts the whole pipeline container.
@@ -102,7 +102,7 @@ Per-camera enable/disable is effective-min of two controls:
   - `["object","face"]` — whitelist; each listed kind enables its SGIE chain
   - `["none"]` — explicit no-inference tier (see below)
 
-A camera only gets the ANPR chain (LPDNet + LPRNet) when the pipeline-level kill-switch is on AND `"anpr"` is in its whitelist (or the whitelist is empty). Same for face (SCRFD + ArcFace). The supervisor respawns only the affected worker when `enabled_detectors` changes, leaving the other cameras untouched.
+A camera only gets the ANPR chain (open-image-models plate detector + fast-plate-ocr global CCT, 65+ countries) when the pipeline-level kill-switch is on AND `"anpr"` is in its whitelist (or the whitelist is empty). Same for face (RetinaFace + AdaFace IR-101). The supervisor respawns only the affected worker when `enabled_detectors` changes, leaving the other cameras untouched.
 
 ## No-AI tier
 

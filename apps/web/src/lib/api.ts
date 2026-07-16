@@ -626,8 +626,13 @@ export const api = {
 // presents the stock list in a dropdown alongside any fnvr-vN
 // values it discovers.
 export type DetectorSettings = {
+  // Primary detector family: yolo26 (DeepStream-Yolo) or rfdetr
+  // (Roboflow RF-DETR). The image bakes rfdetr base+medium.
+  model_family?: "yolo26" | "rfdetr";
+  rfdetr_variant?: "nano" | "small" | "medium" | "base" | "large";
   yolo26_variant: string;
-  yolo26_precision: "fp16" | "int8";
+  // fp8/nvfp4 consume a pre-quantised ONNX from tools/quant-onnx.
+  yolo26_precision: "fp16" | "fp8" | "nvfp4" | "int8";
   anpr_enabled?: boolean;
   face_id_enabled?: boolean;
 };

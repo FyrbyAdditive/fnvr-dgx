@@ -73,17 +73,32 @@ func validYoloVariant(v string) bool {
 	// the stock list at a glance in logs and Settings.
 	return len(v) >= 6 && v[:5] == "fnvr-"
 }
-// INT8 is served via offline trtexec calibration (see
-// docs/deployment/known-issues.md and deploy/docker/calibrate-yolo26.sh).
-// The in-process TRT calibrator hits an assertion on TRT 10.3 so the
-// entrypoint runs the offline path on first INT8 boot; this validator
-// accepts the setting and lets that flow take over.
+// fp16 is the default; fp8/nvfp4 consume a pre-quantised ONNX produced
+// by tools/quant-onnx on the Spark (Blackwell-native precisions); int8
+// is the legacy offline-trtexec calibration path.
 var validPrecisions = map[string]struct{}{
-	"fp16": {},
-	"int8": {},
+	"fp16":  {},
+	"fp8":   {},
+	"nvfp4": {},
+	"int8":  {},
+}
+
+var validFamilies = map[string]struct{}{
+	"yolo26": {},
+	"rfdetr": {},
+}
+
+var validRFDETRVariants = map[string]struct{}{
+	"nano": {}, "small": {}, "medium": {}, "base": {}, "large": {},
 }
 
 type Detector struct {
+	// ModelFamily picks the primary detector: "yolo26" (default) or
+	// "rfdetr". The entrypoint renders the matching nvinfer config.
+	ModelFamily string `json:"model_family"`
+	// RFDETRVariant selects the RF-DETR size when family=rfdetr.
+	// The image bakes base+medium; other sizes need an image rebuild.
+	RFDETRVariant string `json:"rfdetr_variant"`
 	YoloVariant   string `json:"yolo26_variant"`
 	YoloPrecision string `json:"yolo26_precision"`
 	// AnprEnabled toggles the LPDNet + LPRNet SGIE chain in the
@@ -100,7 +115,18 @@ type Detector struct {
 // key is missing (e.g. after a fresh install before the migration's seed
 // row runs — belt-and-braces).
 func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
-	d := Detector{YoloVariant: "yolo26x", YoloPrecision: "fp16"}
+	d := Detector{ModelFamily: "yolo26", RFDETRVariant: "base",
+		YoloVariant: "yolo26x", YoloPrecision: "fp16"}
+	if raw, err := s.Get(ctx, "detector.model_family"); err == nil {
+		_ = json.Unmarshal(raw, &d.ModelFamily)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
+	if raw, err := s.Get(ctx, "detector.rfdetr_variant"); err == nil {
+		_ = json.Unmarshal(raw, &d.RFDETRVariant)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
 	if raw, err := s.Get(ctx, "detector.yolo26_variant"); err == nil {
 		_ = json.Unmarshal(raw, &d.YoloVariant)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -133,10 +159,30 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	if _, ok := validPrecisions[d.YoloPrecision]; !ok {
 		return fmt.Errorf("invalid yolo26_precision %q", d.YoloPrecision)
 	}
+	if d.ModelFamily == "" {
+		d.ModelFamily = "yolo26"
+	}
+	if _, ok := validFamilies[d.ModelFamily]; !ok {
+		return fmt.Errorf("invalid model_family %q (want yolo26|rfdetr)", d.ModelFamily)
+	}
+	if d.RFDETRVariant == "" {
+		d.RFDETRVariant = "base"
+	}
+	if _, ok := validRFDETRVariants[d.RFDETRVariant]; !ok {
+		return fmt.Errorf("invalid rfdetr_variant %q", d.RFDETRVariant)
+	}
+	mb, _ := json.Marshal(d.ModelFamily)
+	rb, _ := json.Marshal(d.RFDETRVariant)
 	vb, _ := json.Marshal(d.YoloVariant)
 	pb, _ := json.Marshal(d.YoloPrecision)
 	ab, _ := json.Marshal(d.AnprEnabled)
 	fb, _ := json.Marshal(d.FaceIDEnabled)
+	if err := s.Set(ctx, "detector.model_family", mb); err != nil {
+		return err
+	}
+	if err := s.Set(ctx, "detector.rfdetr_variant", rb); err != nil {
+		return err
+	}
 	if err := s.Set(ctx, "detector.yolo26_variant", vb); err != nil {
 		return err
 	}

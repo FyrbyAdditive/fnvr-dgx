@@ -6,7 +6,7 @@ import { api, ApiError, Person } from "@/lib/api";
 //
 // Flow:
 // 1. Operator picks a file + existing person (or types a new name).
-// 2. Client POSTs multipart; server runs RetinaFace+ArcFace via
+// 2. Client POSTs multipart; server runs RetinaFace+AdaFace via
 //    ml-worker.
 // 3. On a single-face image the server enrols immediately and
 //    returns the embedding row.

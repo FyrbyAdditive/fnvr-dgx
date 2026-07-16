@@ -1,0 +1,44 @@
+# DeepStream nvinfer — RF-DETR (Roboflow, Apache-2.0). NMS-free DETR;
+# parsed by our custom NvDsInferParseCustomRFDETR (nvdsinfer_rfdetr/).
+# Not for direct nvinfer consumption — the entrypoint envsubst's this
+# into /var/lib/fnvr/models/rfdetr/rfdetr.effective.txt using the
+# variant + dims from the export's meta.json sidecar.
+#
+# Placeholders resolved by the entrypoint:
+#   $MODEL          rfdetr-base / rfdetr-medium / ...
+#   $RFDETR_W/H     network input dims from <variant>.meta.json (kept
+#                   for reference; the static ONNX carries its dims)
+#   $NUM_CLASSES    label count from meta.json (labels.txt written beside)
+#
+# Normalisation note: ImageNet mean/std are BAKED INTO the exported
+# ONNX graph (export_rfdetr.py), so the pipeline feeds raw 0-255 RGB —
+# net-scale-factor stays 1.0 and there are no offsets here.
+
+[property]
+gpu-id=0
+net-scale-factor=1.0
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/rfdetr/$MODEL.onnx
+model-engine-file=/var/lib/fnvr/models/rfdetr/$MODEL.onnx_b1_gpu0_fp16.engine
+labelfile-path=/var/lib/fnvr/models/rfdetr/labels.txt
+# rfdetr's ONNX export is STATIC batch-1 (verified: dets Float(1,300,4)).
+# nvinfer chunks the mux batch into sequential b1 inferences — correct,
+# and on GB10 batching buys no compute anyway (FLOPs-bound; see the
+# batched-mux comparison doc).
+batch-size=1
+workspace-size=4096
+# FP16 (FP8/NVFP4 arrive via tools/quant-onnx pre-quantised ONNX).
+network-mode=2
+num-detected-classes=$NUM_CLASSES
+interval=0
+gie-unique-id=1
+process-mode=1
+maintain-aspect-ratio=0
+# DETR is NMS-free; no clustering.
+cluster-mode=4
+parse-bbox-func-name=NvDsInferParseCustomRFDETR
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_rfdetr.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.4
+topk=300

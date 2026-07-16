@@ -108,6 +108,8 @@ function Detector() {
     refetchInterval: 3_000,
   });
 
+  const [family, setFamily] = useState<NonNullable<DetectorSettings["model_family"]>>("yolo26");
+  const [rfVariant, setRfVariant] = useState<NonNullable<DetectorSettings["rfdetr_variant"]>>("base");
   const [variant, setVariant] = useState<DetectorSettings["yolo26_variant"]>("yolo26x");
   const [precision, setPrecision] = useState<DetectorSettings["yolo26_precision"]>("fp16");
   const [anpr, setAnpr] = useState<boolean>(false);
@@ -116,6 +118,8 @@ function Detector() {
   // Seed local state from server once.
   useEffect(() => {
     if (current) {
+      setFamily(current.model_family ?? "yolo26");
+      setRfVariant(current.rfdetr_variant ?? "base");
       setVariant(current.yolo26_variant);
       setPrecision(current.yolo26_precision);
       setAnpr(!!current.anpr_enabled);
@@ -126,6 +130,8 @@ function Detector() {
   const save = useMutation({
     mutationFn: async () => {
       await api.updateDetectorSettings({
+        model_family: family,
+        rfdetr_variant: rfVariant,
         yolo26_variant: variant,
         yolo26_precision: precision,
         anpr_enabled: anpr,
@@ -142,7 +148,9 @@ function Detector() {
 
   const dirty =
     !!current &&
-    (variant !== current.yolo26_variant ||
+    (family !== (current.model_family ?? "yolo26") ||
+      rfVariant !== (current.rfdetr_variant ?? "base") ||
+      variant !== current.yolo26_variant ||
       precision !== current.yolo26_precision ||
       anpr !== !!current.anpr_enabled ||
       faceId !== !!current.face_id_enabled);
@@ -151,10 +159,39 @@ function Detector() {
     <section>
       <h2 className="text-lg font-semibold mb-2">Object detector</h2>
       <p className="text-sm text-neutral-500 mb-3">
-        Primary detector run on every camera (unless disabled per-camera). YOLO26, 80 COCO classes.
+        Primary detector run on every camera (unless disabled per-camera). COCO label space for both families.
       </p>
 
       <div className="grid gap-3 text-sm">
+        <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
+          <label
+            className="text-neutral-400"
+            title="RF-DETR (Roboflow, NMS-free DETR) is the newer family; YOLO26 remains the proven fallback. Switching restarts the pipeline and builds a TensorRT engine on first use."
+          >
+            Model family
+          </label>
+          <div className="flex items-center gap-2">
+            <select
+              className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+              value={family}
+              onChange={(e) => setFamily(e.target.value as typeof family)}
+            >
+              <option value="yolo26">YOLO26</option>
+              <option value="rfdetr">RF-DETR</option>
+            </select>
+            {family === "rfdetr" && (
+              <select
+                className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+                value={rfVariant}
+                onChange={(e) => setRfVariant(e.target.value as typeof rfVariant)}
+                title="base + medium ship in the image; other sizes need an image rebuild"
+              >
+                <option value="base">base</option>
+                <option value="medium">medium</option>
+              </select>
+            )}
+          </div>
+        </div>
         <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
           <label className="text-neutral-400">Model size</label>
           <select
@@ -228,14 +265,14 @@ function Detector() {
           <label className="text-neutral-400">ANPR</label>
           <label
             className="inline-flex items-center gap-2"
-            title="Adds NVIDIA TAO LPDNet + LPRNet after the object detector. Reads licence plates on vehicles (US charset). Toggling restarts the pipeline."
+            title="Adds a global plate detector + fast-plate-ocr CCT (65+ countries) after the object detector. Toggling restarts the pipeline."
           >
             <input
               type="checkbox"
               checked={anpr}
               onChange={(e) => setAnpr(e.target.checked)}
             />
-            <span>Read licence plates (LPDNet + LPRNet)</span>
+            <span>Read licence plates (global ANPR)</span>
           </label>
         </div>
 
@@ -243,14 +280,14 @@ function Detector() {
           <label className="text-neutral-400">Face ID</label>
           <label
             className="inline-flex items-center gap-2"
-            title="Adds a YOLOv8-face detector + ArcFace R100 embedder after the object detector. Enrol + match persons from the Faces tab. Toggling restarts the pipeline."
+            title="Adds a RetinaFace detector + AdaFace IR-101 embedder after the object detector. Enrol + match persons from the Faces tab. Toggling restarts the pipeline."
           >
             <input
               type="checkbox"
               checked={faceId}
               onChange={(e) => setFaceId(e.target.checked)}
             />
-            <span>Detect &amp; recognise faces (SCRFD-like + ArcFace)</span>
+            <span>Detect &amp; recognise faces (RetinaFace + AdaFace)</span>
           </label>
         </div>
 

@@ -218,9 +218,11 @@ func (s *Store) AddEmbedding(ctx context.Context, personID string, vector []floa
 	if detectionID > 0 {
 		did = detectionID
 	}
+	// model tag: everything enrolled since the DGX retarget embeds with
+	// AdaFace IR-101 (pipeline SGIE and ml-worker use the same ONNX).
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO face_embeddings (person_id, embedding, source, detection_id)
-		VALUES ($1, $2::vector, $3, $4)
+		INSERT INTO face_embeddings (person_id, embedding, source, detection_id, model)
+		VALUES ($1, $2::vector, $3, $4, 'adaface_ir101')
 		RETURNING id::text, person_id::text, source, created_at, detection_id`,
 		personID, vecLit, source, did).
 		Scan(&e.ID, &e.PersonID, &e.Source, &e.CreatedAt, &e.DetectionID)

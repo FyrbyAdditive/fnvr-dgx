@@ -1631,10 +1631,13 @@ func (e *Engine) fireDriftIncident(ctx context.Context, a DriftAlert) error {
 // with that person's metadata, parses the pgvector text literal, and
 // L2-normalises so cosine similarity degenerates to a dot product.
 func (e *Engine) loadFaceEnrolments(ctx context.Context) ([]enrolledEmbedding, error) {
+	// model filter: embeddings are only comparable within the model
+	// that produced them (AdaFace IR-101 since the DGX retarget) —
+	// scoring across spaces yields confident false matches.
 	rows, err := e.pool.Query(ctx, `
 		SELECT p.id::text, p.label, p.alert_on_match, fe.embedding::text
 		FROM face_embeddings fe JOIN persons p ON p.id = fe.person_id
-		WHERE p.enabled = TRUE`)
+		WHERE p.enabled = TRUE AND fe.model = 'adaface_ir101'`)
 	if err != nil {
 		// If the migration hasn't run yet the table doesn't exist;
 		// return empty so the rest of reload() still succeeds.

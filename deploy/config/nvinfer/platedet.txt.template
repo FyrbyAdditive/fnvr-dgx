@@ -1,0 +1,34 @@
+# Plate detector — open-image-models yolo-v9-t license-plate "end2end"
+# ONNX (EfficientNMS baked in), global coverage. Replaces the US-only
+# TAO LPDNet. Runs as SGIE on vehicle detections from the primary;
+# parsed by NvDsInferParseCustomPlateDet (nvdsinfer_plates/).
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/anpr/platedet.onnx
+# Match nvinfer's auto-derived name so subsequent boots reuse the
+# built engine.
+model-engine-file=/var/lib/fnvr/models/anpr/platedet.onnx_b16_gpu0_fp16.engine
+batch-size=16
+network-mode=2
+num-detected-classes=1
+interval=0
+# Unique across the nvinfer chain — pgie=1, this=2, plateocr=3.
+gie-unique-id=2
+operate-on-gie-id=1
+# COCO class IDs to look inside of: car=2, motorcycle=3, bus=5, truck=7
+# (both detector families emit COCO label space).
+operate-on-class-ids=$VEHICLE_CLASS_IDS
+process-mode=2
+# NMS already ran inside the graph; take detections as-is.
+cluster-mode=4
+maintain-aspect-ratio=1
+symmetric-padding=1
+parse-bbox-func-name=NvDsInferParseCustomPlateDet
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_plates.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.35
+topk=8

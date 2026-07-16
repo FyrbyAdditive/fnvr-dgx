@@ -1,7 +1,7 @@
 """ONNX-runtime inference helpers for the ml-worker sidecar.
 
-Runs the same RetinaFace (face_detector.onnx) + ArcFace R100
-(arcface.onnx) models the live pipeline uses, but on CPU via
+Runs the same RetinaFace (face_detector.onnx) + AdaFace IR-101
+(adaface.onnx) models the live pipeline uses, but on CPU via
 onnxruntime. Used by the photo-upload enrolment endpoint; by
 design it is *not* on the hot path for live frames — the pipeline
 handles those via DeepStream.
@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 _MODELS_DIR = os.environ.get("FNVR_MODELS_DIR", "/var/lib/fnvr/models/faceid")
 _DET_PATH = os.path.join(_MODELS_DIR, "face_detector.onnx")
-_EMB_PATH = os.path.join(_MODELS_DIR, "arcface.onnx")
+_EMB_PATH = os.path.join(_MODELS_DIR, "adaface.onnx")
 
 # RetinaFace MobileNet-0.25 priors. Copied verbatim from biubug6's
 # Pytorch_Retinaface/data/config.py — the exported ONNX we ship is
@@ -79,7 +79,7 @@ def _load_embedder() -> ort.InferenceSession:
         if _emb_session is None:
             if not os.path.exists(_EMB_PATH):
                 raise FileNotFoundError(
-                    f"arcface ONNX not found at {_EMB_PATH}"
+                    f"adaface ONNX not found at {_EMB_PATH}"
                 )
             log.info("loading embedder: %s", _EMB_PATH)
             _emb_session = ort.InferenceSession(
@@ -169,8 +169,13 @@ def _preprocess_det(jpg_bytes: bytes) -> tuple[np.ndarray, int, int]:
 
 
 def _preprocess_emb(face_bgr: np.ndarray) -> np.ndarray:
+    # AdaFace (CVLface export) consumes RGB, (x/255 - 0.5)/0.5 — the
+    # same scale as the old ArcFace path but RGB channel order. This
+    # MUST match adaface.txt (model-color-format=0) or ml-worker
+    # enrolments and pipeline embeddings drift apart.
     resized = cv2.resize(face_bgr, (_EMB_INPUT_SIZE, _EMB_INPUT_SIZE))
-    blob = resized.astype(np.float32)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    blob = rgb.astype(np.float32)
     blob = (blob - _EMB_MEANS) * _EMB_SCALE
     blob = blob.transpose(2, 0, 1)[None, ...]
     return blob

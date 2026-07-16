@@ -59,21 +59,54 @@ if [ -d "$YOLO_SRC" ]; then
     echo "entrypoint: yolo26 weights ready under $YOLO_DEST"
 fi
 
-# ANPR: seed the ONNX weights from /opt/fnvr/anpr/ (baked into the
-# image) onto the fnvr-data volume. nvinfer writes the derived TRT
-# engine next to the ONNX file — with the ONNX on a persistent volume,
-# the engine ends up on disk too, and subsequent container recreates
-# skip the ~2 min per-engine build. Without this, /opt is ephemeral,
-# so every recreate forces a rebuild.
+# ANPR: seed the plate detector/OCR ONNX + charset labels + meta from
+# /opt/fnvr/anpr/ (baked into the image) onto the fnvr-data volume.
+# nvinfer writes the derived TRT engine next to the ONNX file — with
+# the ONNX on a persistent volume the engine survives recreates.
 ANPR_SRC=/opt/fnvr/anpr
 ANPR_DEST=/var/lib/fnvr/models/anpr
 mkdir -p "$ANPR_DEST"
 if [ -d "$ANPR_SRC" ]; then
+    # Content-compare instead of cp -n: when an image upgrade changes
+    # an ONNX (e.g. the NCHW-wrapper rework), the stale volume copy AND
+    # its cached engines must be replaced, or nvinfer deserialises an
+    # engine that no longer matches the config.
     for f in "$ANPR_SRC"/*.onnx; do
         [ -f "$f" ] || continue
-        cp -n "$f" "$ANPR_DEST/"
+        dst="$ANPR_DEST/$(basename "$f")"
+        if ! cmp -s "$f" "$dst"; then
+            cp -f "$f" "$dst"
+            rm -f "${dst%.onnx}".onnx_b*_gpu0_*.engine
+            echo "entrypoint: refreshed $(basename "$f") (+ dropped stale engines)"
+        fi
     done
-    echo "entrypoint: anpr weights ready under $ANPR_DEST"
+    # Charset + meta are tiny and derived from the model config —
+    # always refresh so an image upgrade can't leave a stale charset
+    # (a wrong charset silently decodes wrong plates).
+    for f in "$ANPR_SRC"/plateocr.labels "$ANPR_SRC"/anpr.meta.json; do
+        [ -f "$f" ] && cp "$f" "$ANPR_DEST/"
+    done
+    echo "entrypoint: anpr models ready under $ANPR_DEST"
+fi
+
+# RF-DETR: seed ONNX exports + meta sidecars (dims/classes/labels).
+RFDETR_SRC=/opt/fnvr/rfdetr
+RFDETR_DEST=/var/lib/fnvr/models/rfdetr
+mkdir -p "$RFDETR_DEST"
+if [ -d "$RFDETR_SRC" ]; then
+    for f in "$RFDETR_SRC"/*.onnx; do
+        [ -f "$f" ] || continue
+        dst="$RFDETR_DEST/$(basename "$f")"
+        if ! cmp -s "$f" "$dst"; then
+            cp -f "$f" "$dst"
+            rm -f "${dst%.onnx}".onnx_b*_gpu0_*.engine
+            echo "entrypoint: refreshed $(basename "$f") (+ dropped stale engines)"
+        fi
+    done
+    for f in "$RFDETR_SRC"/*.meta.json; do
+        [ -f "$f" ] && cp "$f" "$RFDETR_DEST/"
+    done
+    echo "entrypoint: rfdetr models ready under $RFDETR_DEST"
 fi
 
 # ---- Resolve detector settings & render nvinfer config ----
@@ -85,6 +118,11 @@ fi
 
 VARIANT="${FNVR_YOLO_VARIANT:-yolo26x}"
 PRECISION="${FNVR_YOLO_PRECISION:-fp16}"
+# Primary detector family: "yolo26" (DeepStream-Yolo parser) or
+# "rfdetr" (Roboflow RF-DETR, our custom parser). Default stays yolo26
+# until the RF-DETR A/B validates on this deployment.
+MODEL_FAMILY="${FNVR_MODEL_FAMILY:-yolo26}"
+RFDETR_VARIANT="${FNVR_RFDETR_VARIANT:-base}"
 # Max nvinfer batch = max batched-mux group size. The supervisor chunks
 # camera groups at FNVR_GROUP_MAX members; the (dynamic-batch) engine is
 # built once at this max and serves every group size below it.
@@ -104,10 +142,14 @@ if command -v curl >/dev/null 2>&1; then
     if [ -n "$SETTINGS_JSON" ]; then
         V=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_variant":"\([^"]*\)".*/\1/p')
         P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
+        MF=$(echo "$SETTINGS_JSON" | sed -n 's/.*"model_family":"\([^"]*\)".*/\1/p')
+        RV=$(echo "$SETTINGS_JSON" | sed -n 's/.*"rfdetr_variant":"\([^"]*\)".*/\1/p')
         A=$(echo "$SETTINGS_JSON" | sed -n 's/.*"anpr_enabled":\(true\|false\).*/\1/p')
         F=$(echo "$SETTINGS_JSON" | sed -n 's/.*"face_id_enabled":\(true\|false\).*/\1/p')
         [ -n "$V" ] && VARIANT="$V"
         [ -n "$P" ] && PRECISION="$P"
+        [ -n "$MF" ] && MODEL_FAMILY="$MF"
+        [ -n "$RV" ] && RFDETR_VARIANT="$RV"
         if [ "$A" = "true" ]; then
             export FNVR_USE_ANPR=1
         else
@@ -336,15 +378,95 @@ else
         > "$EFFECTIVE_CFG"
 fi
 
-# Default to YOLO26 unless the operator has pinned a specific config via
-# the env (e.g. the old trafficcamnet for rollback).
+# ---- RF-DETR family: render its effective config from the export's
+# meta.json sidecar (dims + class count are model truths, not config).
+RFDETR_CFG=""
+if [ "$MODEL_FAMILY" = "rfdetr" ]; then
+    RFDETR_MODEL="rfdetr-${RFDETR_VARIANT}"
+    META="$RFDETR_DEST/${RFDETR_MODEL}.meta.json"
+    if [ -f "$META" ] && [ -f "$RFDETR_DEST/${RFDETR_MODEL}.onnx" ]; then
+        RFDETR_W=$(python3 -c "import json;print(json.load(open('$META'))['input_w'])")
+        RFDETR_H=$(python3 -c "import json;print(json.load(open('$META'))['input_h'])")
+        RF_CLASSES=$(python3 -c "import json;print(json.load(open('$META'))['num_classes'])")
+        python3 -c "import json;print('\n'.join(json.load(open('$META'))['labels']))" \
+            > "$RFDETR_DEST/labels.txt"
+        # (Person/vehicle class ids for the SGIE chains are computed
+        # from this labels file in the family-aware SGIE render below.)
+        RFDETR_CFG="$RFDETR_DEST/rfdetr.effective.txt"
+        export MODEL="$RFDETR_MODEL" RFDETR_W RFDETR_H
+        NUM_CLASSES="$RF_CLASSES"; export NUM_CLASSES
+        if command -v envsubst >/dev/null 2>&1; then
+            envsubst '$MODEL $BATCH $RFDETR_W $RFDETR_H $NUM_CLASSES' \
+                < /etc/fnvr/nvinfer/rfdetr.txt.template > "$RFDETR_CFG"
+        else
+            sed -e "s|\${BATCH}|$BATCH|g" -e "s|\$BATCH|$BATCH|g" \
+                -e "s|\$MODEL|$MODEL|g" \
+                -e "s|\$RFDETR_W|$RFDETR_W|g" -e "s|\$RFDETR_H|$RFDETR_H|g" \
+                -e "s|\$NUM_CLASSES|$NUM_CLASSES|g" \
+                /etc/fnvr/nvinfer/rfdetr.txt.template > "$RFDETR_CFG"
+        fi
+        echo "entrypoint: rfdetr family — $RFDETR_MODEL ${RFDETR_W}x${RFDETR_H} classes=$RF_CLASSES"
+    else
+        echo "entrypoint: WARNING model_family=rfdetr but $META missing — falling back to yolo26"
+        MODEL_FAMILY="yolo26"
+    fi
+fi
+
+# ---- Family-aware SGIE configs -------------------------------------
+# scrfd (face detector) and platedet (plate detector) operate on class
+# ids of the PRIMARY detector, and those ids depend on the family's
+# label space: COCO-80 (yolo26) has person=0, vehicles=2;3;5;7, while
+# RF-DETR's COCO-91 slot space puts them elsewhere. Render both configs
+# with ids computed from the ACTIVE label file so the SGIEs can never
+# silently run on the wrong classes.
+PERSON_CLASS_ID=0
+VEHICLE_CLASS_IDS="2;3;5;7"
+if [ "$MODEL_FAMILY" = "rfdetr" ] && [ -f "$RFDETR_DEST/labels.txt" ]; then
+    ids=$(python3 - "$RFDETR_DEST/labels.txt" <<'PYEOF'
+import sys
+labels = [l.rstrip("\n") for l in open(sys.argv[1])]
+def idx(name):
+    try: return labels.index(name)
+    except ValueError: return -1
+person = idx("person")
+veh = [i for i in (idx("car"), idx("motorcycle"), idx("bus"), idx("truck")) if i >= 0]
+print(person, ";".join(str(v) for v in veh))
+PYEOF
+)
+    PERSON_CLASS_ID=$(echo "$ids" | cut -d" " -f1)
+    VEHICLE_CLASS_IDS=$(echo "$ids" | cut -d" " -f2)
+    if [ "$PERSON_CLASS_ID" = "-1" ]; then
+        echo "entrypoint: WARNING no 'person' label in rfdetr space — disabling face-id"
+        export FNVR_USE_FACEID=0
+        PERSON_CLASS_ID=0
+    fi
+    [ -z "$VEHICLE_CLASS_IDS" ] && { echo "entrypoint: WARNING no vehicle labels — disabling ANPR"; export FNVR_USE_ANPR=0; VEHICLE_CLASS_IDS="0"; }
+fi
+mkdir -p /var/lib/fnvr/nvinfer
+export PERSON_CLASS_ID VEHICLE_CLASS_IDS
+for t in scrfd platedet; do
+    if command -v envsubst >/dev/null 2>&1; then
+        envsubst '$PERSON_CLASS_ID $VEHICLE_CLASS_IDS' \
+            < "/etc/fnvr/nvinfer/${t}.txt.template" > "/var/lib/fnvr/nvinfer/${t}.txt"
+    else
+        sed -e "s|\$PERSON_CLASS_ID|$PERSON_CLASS_ID|g" \
+            -e "s|\$VEHICLE_CLASS_IDS|$VEHICLE_CLASS_IDS|g" \
+            "/etc/fnvr/nvinfer/${t}.txt.template" > "/var/lib/fnvr/nvinfer/${t}.txt"
+    fi
+done
+echo "entrypoint: SGIE ids — person=$PERSON_CLASS_ID vehicles=$VEHICLE_CLASS_IDS"
+
+# Pick the pgie config: rfdetr when selected and rendered, else the
+# YOLO26 effective config, unless the operator pinned one via env.
 if [ -z "$FNVR_INFER_CONFIG" ] || [ "$FNVR_INFER_CONFIG" = "/etc/fnvr/nvinfer/trafficcamnet.txt" ]; then
-    if [ -f /var/lib/fnvr/models/yolo26/"$VARIANT".onnx ]; then
+    if [ "$MODEL_FAMILY" = "rfdetr" ] && [ -n "$RFDETR_CFG" ]; then
+        export FNVR_INFER_CONFIG="$RFDETR_CFG"
+    elif [ -f /var/lib/fnvr/models/yolo26/"$VARIANT".onnx ]; then
         export FNVR_INFER_CONFIG="$EFFECTIVE_CFG"
     fi
 fi
 
-echo "entrypoint: FNVR_INFER_CONFIG=$FNVR_INFER_CONFIG"
+echo "entrypoint: family=$MODEL_FAMILY FNVR_INFER_CONFIG=$FNVR_INFER_CONFIG"
 
 # DeepStream-Yolo's custom engine builder (NvDsInferYoloCudaEngineGet,
 # wired via engine-create-func-name= in the nvinfer config) ignores

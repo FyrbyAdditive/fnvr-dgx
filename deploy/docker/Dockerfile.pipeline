@@ -176,49 +176,6 @@ RUN set -eux; \
       rm -f "${v}.pt"; \
     done
 
-# ANPR: NVIDIA TAO LPDNet (plate detector) + LPRNet (OCR).
-# Kept for Phase-1 parity with the Orin build; Phase 3 replaces this
-# stack with open-image-models + fast-plate-ocr (global coverage, no
-# NVIDIA model licence). If the TAO parser builds break against DS 9.1,
-# set FNVR_USE_ANPR=0 and move on — this chain is scheduled for removal.
-# - Weights are pulled from NGC archived-model URLs (no auth required).
-# - The custom LPRNet classifier parser lives in deepstream_tao_apps;
-#   compile its .so so nvinfer can pull plate text via CTC decode.
-ARG LPDNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lpdnet/versions/pruned_v2.3/files/LPDNet_usa_pruned_tao5.onnx
-ARG LPRNET_URL=https://api.ngc.nvidia.com/v2/models/nvidia/tao/lprnet/versions/deployable_onnx_v1.1/files/us_lprnet_baseline18_deployable.onnx
-ARG LPRNET_LABELS_URL=https://raw.githubusercontent.com/NVIDIA-AI-IOT/deepstream_tao_apps/release/tao_ds7.1ga/configs/lpr_tao5/labels_us.txt
-RUN set -eux; \
-    mkdir -p /opt/fnvr/anpr; \
-    wget -q "${LPDNET_URL}" -O /opt/fnvr/anpr/LPDNet_usa.onnx; \
-    wget -q "${LPRNET_URL}" -O /opt/fnvr/anpr/LPRNet_usa.onnx; \
-    wget -q "${LPRNET_LABELS_URL}" -O /etc/fnvr/nvinfer/lprnet.labels 2>/dev/null || true
-
-# TAO custom parsers (.so) — provides NvDsInferParseCustomNVPlate, the
-# CTC decoder that turns LPRNet logits into the plate string surfaced
-# via NvDsClassifierMeta. Source lives in deepstream_tao_apps; the
-# build step mirrors the repo's own README.
-ARG DS_TAO_COMMIT=release/tao_ds7.1ga
-# Two separate .so builds from the deepstream_tao_apps repo:
-# - post_processor: generic bbox parsers (used by LPDNet)
-# - nvinfer_custom_lpr_parser: CTC decoder for LPRNet plate text,
-#   exports NvDsInferParseCustomNVPlate
-# Both Makefiles derive DS_VERSION by running `deepstream-app -v`
-# which can fail on build images; patch both to hard-code 9.1.
-RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
-        https://github.com/NVIDIA-AI-IOT/deepstream_tao_apps.git /tmp/ds-tao \
-  && for dir in post_processor apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser; do \
-        sed -i 's|^DS_VER = .*|DS_VER = 9.1|' /tmp/ds-tao/$dir/Makefile || true; \
-     done \
-  && cd /tmp/ds-tao/post_processor \
-  && CUDA_VER=${CUDA_VER} make \
-  && install -Dm755 libnvds_infercustomparser_tao.so \
-        /opt/nvidia/deepstream/deepstream/lib/libnvds_infercustomparser_tao.so \
-  && cd /tmp/ds-tao/apps/tao_others/deepstream_lpr_app/nvinfer_custom_lpr_parser \
-  && CUDA_VER=${CUDA_VER} make \
-  && install -Dm755 libnvdsinfer_custom_impl_lpr.so \
-        /opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_lpr.so \
-  && ldconfig
-
 # Face ID:
 # - Detector: RetinaFace MobileNet-0.25 (biubug6/Pytorch_Retinaface,
 #   MIT). Runs as an SGIE on YOLO26's person-class crops (process-mode=2,
@@ -231,15 +188,12 @@ RUN git clone --depth 1 --branch ${DS_TAO_COMMIT} \
 #   custom nvinfer parser (MIT). Patched at build time to (a) strip
 #   landmark writes that require a forked gst-nvinfer and (b) soften
 #   NMS IoU from 0.1 to 0.45.
-# - Embedder: ArcFace R100 ONNX from insightface's buffalo_l pack,
-#   mirrored on immich-app's HuggingFace space. Apache 2.0.
-#   (Phase 3 swaps this for AdaFace IR-101.)
+# - Embedder: AdaFace IR-101 (WebFace12M) — exported in the model-prep
+#   layer below (same torch install), replacing ArcFace R100.
 ARG RETINAFACE_REPO=https://github.com/biubug6/Pytorch_Retinaface.git
 ARG RETINAFACE_WEIGHTS_URL=https://huggingface.co/LPX55/retinaface/resolve/main/model.pth
-ARG ARCFACE_URL=https://huggingface.co/immich-app/buffalo_l/resolve/main/recognition/model.onnx
 RUN set -eux; \
     mkdir -p /opt/fnvr/faceid; \
-    wget -q "${ARCFACE_URL}" -O /opt/fnvr/faceid/arcface.onnx; \
     apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*; \
     # torch 2.7 is the newest line whose torch.onnx.export still
     # defaults to the legacy TorchScript exporter (2.8+ default to
@@ -284,8 +238,57 @@ for node in m.graph.node:
 onnx.save(m, "/opt/fnvr/faceid/face_detector.onnx")
 print("face_detector.onnx written with outputs:", [o.name for o in m.graph.output])
 PY
+# --- Model prep (Phase 3 refresh) ------------------------------------
+# Runs in the same torch install as the RetinaFace export above:
+#   - RF-DETR base+medium → nvinfer-ready ONNX (ImageNet norm baked in)
+#     + meta.json sidecars (dims/classes/labels) for the entrypoint.
+#   - AdaFace IR-101 (WebFace12M) → 512-d embedder ONNX.
+#   - open-image-models plate detector + fast-plate-ocr global CCT
+#     (ONNX + charset labels generated from the model's own config).
+COPY tools/model-prep /opt/model-prep
+# A venv over the system site-packages reuses the torch installed for
+# the RetinaFace export while giving rfdetr/transformers their own
+# coherent numpy — installing them with --break-system-packages
+# tramples numpy's dist-info ("Unable to compare versions for numpy").
+# Split into per-script RUNs so buildkit caches completed steps and a
+# failure's log isn't drowned by a sibling's output. The venv persists
+# across layers (plain files under /tmp); the cleanup layer removes it.
 RUN set -eux; \
-    rm -rf /tmp/rf /root/.cache/pip; \
+    python3 -m venv --system-site-packages /tmp/prep-venv; \
+    # The system numpy's dist-info is broken (earlier --break-system-
+    # packages installs); give the venv its own copy so importlib
+    # metadata resolves (--ignore-installed forces a venv-local numpy
+    # even though the system one "satisfies" the requirement).
+    /tmp/prep-venv/bin/pip install --no-cache-dir --ignore-installed numpy; \
+    /tmp/prep-venv/bin/pip install --no-cache-dir \
+        "rfdetr[onnx]" transformers pyyaml \
+        fast-plate-ocr open-image-models
+
+RUN /tmp/prep-venv/bin/python /opt/model-prep/export_rfdetr.py \
+        --variants base medium --out /opt/fnvr/rfdetr 2>/dev/null \
+  && test -s /opt/fnvr/rfdetr/rfdetr-base.onnx \
+  && test -s /opt/fnvr/rfdetr/rfdetr-medium.onnx
+
+# CVLface's remote modeling code pulls in a tail of small deps
+# (omegaconf config, fvcore/iopath utils, timm backbones, easydict).
+# Installed in THIS layer (not the shared pip layer) so the rfdetr
+# export cache above survives iteration here.
+# transformers<5: CVLface's remote code targets the 4.x internals
+# (AttributeError: all_tied_weights_keys on 5.x).
+RUN /tmp/prep-venv/bin/pip install --no-cache-dir \
+        omegaconf fvcore iopath timm easydict "transformers<5" \
+  && /tmp/prep-venv/bin/python /opt/model-prep/export_adaface.py \
+        --out /opt/fnvr/faceid/adaface.onnx \
+  && test -s /opt/fnvr/faceid/adaface.onnx
+
+RUN /tmp/prep-venv/bin/python /opt/model-prep/fetch_plate_models.py --out /opt/fnvr/anpr \
+  && test -s /opt/fnvr/anpr/platedet.onnx \
+  && test -s /opt/fnvr/anpr/plateocr.onnx \
+  && test -s /opt/fnvr/anpr/plateocr.labels
+
+RUN set -eux; \
+    rm -rf /tmp/rf /tmp/prep-venv /root/.roboflow \
+        /root/.cache/pip /root/.cache/huggingface /root/.cache/fast*; \
     pip3 uninstall -y --break-system-packages torch torchvision onnx numpy || true
 
 # Retinaface custom parser — clone zhouyuchong's parser, patch it to
@@ -313,6 +316,20 @@ RUN set -eux; \
         /usr/local/lib/fnvr/libnvdsinfer_custom_impl_retinaface.so; \
     rm -rf /tmp/rf-parser; \
     ldconfig
+
+# Custom nvinfer parsers for the refreshed model stack: RF-DETR bbox
+# parser + plate detector/OCR parsers (see the nvdsinfer_*/ dirs).
+COPY apps/pipeline-supervisor/nvdsinfer_rfdetr /tmp/nvdsinfer_rfdetr
+COPY apps/pipeline-supervisor/nvdsinfer_plates /tmp/nvdsinfer_plates
+RUN set -eux; \
+    make -C /tmp/nvdsinfer_rfdetr CUDA_VER=${CUDA_VER}; \
+    install -Dm755 /tmp/nvdsinfer_rfdetr/libnvdsinfer_custom_impl_rfdetr.so \
+        /usr/local/lib/fnvr/libnvdsinfer_custom_impl_rfdetr.so; \
+    make -C /tmp/nvdsinfer_plates CUDA_VER=${CUDA_VER}; \
+    install -Dm755 /tmp/nvdsinfer_plates/libnvdsinfer_custom_impl_plates.so \
+        /usr/local/lib/fnvr/libnvdsinfer_custom_impl_plates.so; \
+    ldconfig; \
+    rm -rf /tmp/nvdsinfer_rfdetr /tmp/nvdsinfer_plates
 
 WORKDIR /src
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor

@@ -1,0 +1,32 @@
+# Plate OCR — fast-plate-ocr cct-s-v2-global (65+ countries). Replaces
+# the US-only TAO LPRNet. Runs as tertiary nvinfer on plate crops from
+# platedet (gie-id=2). Decoded by NvDsInferParsePlateOCRCCT
+# (nvdsinfer_plates/): per-slot argmax over the model's own charset
+# (/var/lib/fnvr/models/anpr/plateocr.labels, generated at image build
+# from the model config). The plate string surfaces via
+# NvDsClassifierMeta exactly like LPRNet did, so the pipeline's
+# extractPlateText() is unchanged.
+#
+# Input: the fetch step rewrites the model's native NHWC input to a
+# standard NCHW [B,3,64,128] with an inserted Transpose, so this is a
+# plain 3-channel RGB network to nvinfer. Raw 0-255, net-scale 1.0.
+
+[property]
+gpu-id=0
+net-scale-factor=1.0
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/anpr/plateocr.onnx
+model-engine-file=/var/lib/fnvr/models/anpr/plateocr.onnx_b16_gpu0_fp16.engine
+batch-size=16
+network-mode=2
+gie-unique-id=3
+operate-on-gie-id=2
+operate-on-class-ids=0
+process-mode=2
+network-type=1
+classifier-async-mode=0
+classifier-threshold=0.5
+maintain-aspect-ratio=0
+
+parse-classifier-func-name=NvDsInferParsePlateOCRCCT
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_plates.so
