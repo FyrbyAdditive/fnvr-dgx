@@ -1141,6 +1141,70 @@ GstElement* GroupPipeline::BuildPipeline() {
 
 #if FNVR_HAS_DEEPSTREAM
     if (has_inference_) {
+        // Rect-clamp probe on tracker.src. NvDCF emits PREDICTED rects
+        // for objects leaving the frame — a vehicle exiting bottom of
+        // frame keeps a rect whose top can sit BELOW the canvas. Any
+        // downstream SGIE crop of such an object (or of a child object
+        // mapped inside it, e.g. a plate) hands NvBufSurfTransform an
+        // off-surface src rect → error -3 → group-fatal. Clamp every
+        // object rect into the canvas once, here, for all consumers;
+        // fully-off-canvas objects shrink to a degenerate size the
+        // SGIE min-size gates then skip.
+        {
+            GstElement* trk = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
+            if (trk) {
+                GstPad* src = gst_element_get_static_pad(trk, "src");
+                if (src) {
+                    // Canvas dims via heap-allocated pair (probe outlives
+                    // this scope; leaked once per pipeline build).
+                    auto* dims = new std::pair<int, int>(mux_w_, mux_h_);
+                    gst_pad_add_probe(
+                        src, GST_PAD_PROBE_TYPE_BUFFER,
+                        [](GstPad*, GstPadProbeInfo* info,
+                           gpointer u) -> GstPadProbeReturn {
+                            auto* d = static_cast<std::pair<int, int>*>(u);
+                            const float W = float(d->first);
+                            const float H = float(d->second);
+                            GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+                            NvDsBatchMeta* batch =
+                                gst_buffer_get_nvds_batch_meta(buf);
+                            if (!batch) return GST_PAD_PROBE_OK;
+                            for (NvDsMetaList* fl = batch->frame_meta_list; fl;
+                                 fl = fl->next) {
+                                auto* frame =
+                                    static_cast<NvDsFrameMeta*>(fl->data);
+                                for (NvDsMetaList* ol = frame->obj_meta_list;
+                                     ol; ol = ol->next) {
+                                    auto* obj =
+                                        static_cast<NvDsObjectMeta*>(ol->data);
+                                    auto& r = obj->rect_params;
+                                    float x1 = std::max(0.f, float(r.left));
+                                    float y1 = std::max(0.f, float(r.top));
+                                    float x2 = std::min(W, float(r.left) +
+                                                               float(r.width));
+                                    float y2 = std::min(H, float(r.top) +
+                                                               float(r.height));
+                                    if (x2 - x1 < 1.f) x2 = std::min(W, x1 + 1.f);
+                                    if (y2 - y1 < 1.f) y2 = std::min(H, y1 + 1.f);
+                                    x1 = std::min(x1, W - 1.f);
+                                    y1 = std::min(y1, H - 1.f);
+                                    r.left = x1;
+                                    r.top = y1;
+                                    r.width = x2 - x1;
+                                    r.height = y2 - y1;
+                                }
+                            }
+                            return GST_PAD_PROBE_OK;
+                        },
+                        dims, nullptr);
+                    gst_object_unref(src);
+                    std::cerr << "group[" << group_id_
+                              << "]: rect-clamp probe attached on tracker.src\n";
+                }
+                gst_object_unref(trk);
+            }
+        }
+
         // Preview-thumbnail probe on pgie.src — batch-aware, per-source
         // 1 fps JPEG rings tapped from the in-flight NVMM surfaces.
         {

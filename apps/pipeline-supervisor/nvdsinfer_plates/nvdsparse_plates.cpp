@@ -111,13 +111,22 @@ extern "C" bool NvDsInferParseCustomPlateDet(
             float x1 = r[off + 0], y1 = r[off + 1];
             float x2 = r[off + 2], y2 = r[off + 3];
             if (x2 <= 1.5f && y2 <= 1.5f) { x1 *= W; x2 *= W; y1 *= H; y2 *= H; }
+            // 2 px inset from the network edges: as an SGIE detector,
+            // these boxes get mapped network → vehicle crop → canvas,
+            // and an edge-touching box can land a hair outside the
+            // parent after float scaling — the downstream OCR's crop
+            // then fails NvBufSurfTransform with error -3 (group-
+            // fatal). Plates flush against the crop edge are partial
+            // reads anyway.
+            x1 = std::max(2.f, x1); y1 = std::max(2.f, y1);
+            x2 = std::min(W - 2.f, x2); y2 = std::min(H - 2.f, y2);
             NvDsInferObjectDetectionInfo obj{};
             obj.classId = 0;
             obj.detectionConfidence = conf;
-            obj.left   = std::max(0.f, x1);
-            obj.top    = std::max(0.f, y1);
-            obj.width  = std::min(W - obj.left, x2 - x1);
-            obj.height = std::min(H - obj.top, y2 - y1);
+            obj.left   = x1;
+            obj.top    = y1;
+            obj.width  = x2 - x1;
+            obj.height = y2 - y1;
             // Sub-pixel plates (tiny vehicle crops) map to zero-dim
             // rects in frame space and crash the downstream OCR
             // transform with invalid params — require a readable size.
