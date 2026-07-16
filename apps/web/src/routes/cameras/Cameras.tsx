@@ -131,6 +131,31 @@ export function Cameras() {
   );
 }
 
+// StateChip — colour-coded pipeline state so a broken camera is visible
+// at a glance on this page (previously state only surfaced on Live).
+function StateChip({ camera }: { camera: Camera }) {
+  const state = camera.enabled ? camera.state ?? "unknown" : "disabled";
+  const cls =
+    state === "running"
+      ? "bg-green-900/60 text-green-300"
+      : state === "starting"
+        ? "bg-amber-900/60 text-amber-300"
+        : state === "failed"
+          ? "bg-red-900/60 text-red-300"
+          : "bg-neutral-800 text-neutral-400";
+  const hb = camera.last_heartbeat_at
+    ? `last heartbeat: ${new Date(camera.last_heartbeat_at).toLocaleString()}`
+    : "no heartbeat seen";
+  return (
+    <span
+      className={`text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 ${cls}`}
+      title={hb}
+    >
+      {state}
+    </span>
+  );
+}
+
 function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boolean; onDelete: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const qc = useQueryClient();
@@ -144,8 +169,16 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
         >
           {expanded ? "▾" : "▸"}
         </button>
-        <div className="flex-1 min-w-0">
-          <div className="font-medium">{camera.name}</div>
+        {/* The whole header toggles the editor — the chevron alone was
+            too subtle and operators re-created cameras to change URLs. */}
+        <div
+          className="flex-1 min-w-0 cursor-pointer select-none"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <div className="font-medium flex items-center gap-2">
+            {camera.name}
+            <StateChip camera={camera} />
+          </div>
           <div className="text-xs text-neutral-500 truncate">
             {camera.id} · {camera.url}
           </div>
@@ -157,6 +190,12 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
               enabled={camera.enabled}
               onChange={() => qc.invalidateQueries({ queryKey: ["cameras"] })}
             />
+            <button
+              className="text-xs text-blue-400 hover:underline"
+              onClick={() => setExpanded((v) => !v)}
+            >
+              {expanded ? "close" : "edit"}
+            </button>
             <button
               className="text-xs text-red-400 hover:underline"
               onClick={onDelete}
@@ -171,7 +210,6 @@ function CameraRow({ camera, isAdmin, onDelete }: { camera: Camera; isAdmin: boo
           <BasicsEditor camera={camera} />
           <LocationAndOverrides camera={camera} />
           <DetectorToggle camera={camera} />
-          <DetectorBackendSelect camera={camera} />
           <RotationSelect camera={camera} />
           <MtxProxyToggle camera={camera} />
           <ZoneEditor cameraId={camera.id} cameraName={camera.name} />
@@ -329,56 +367,6 @@ function BasicsEditor({ camera }: { camera: Camera }) {
           {err && <span className="text-red-400">{err}</span>}
           <span className="text-neutral-600 ml-auto">id: {camera.id}</span>
         </div>
-      </div>
-    </div>
-  );
-}
-
-// DetectorBackendSelect picks which inference engine runs this
-// camera's primary object detector (PGIE). "TensorRT (GPU)" is the
-// existing DeepStream nvinfer path; "Hailo-8 (PCIe)" offloads to the
-// Hailo accelerator, freeing GPU for SGIEs + encode. The Hailo option
-// is only enabled when /dev/hailo0 is reachable from the api-server
-// container (host driver + HailoRT installed + bind-mounted in).
-function DetectorBackendSelect({ camera }: { camera: Camera }) {
-  const qc = useQueryClient();
-  const { data: hailo } = useQuery({
-    queryKey: ["system-hailo"],
-    queryFn: api.getHailoStatus,
-    // This rarely changes — polling every 30s is plenty, and it's
-    // cheap (single syscall inside the container).
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-  });
-  const current = camera.detector_backend ?? "trt";
-  const update = useMutation({
-    mutationFn: (backend: "trt" | "hailo") =>
-      api.updateCameraDetectorBackend(camera.id, backend),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["cameras"] }),
-  });
-  const hailoPresent = hailo?.present ?? false;
-  return (
-    <div className="pl-3 border-l-2 border-neutral-800">
-      <div className="text-xs text-neutral-400 mb-1">Detector backend</div>
-      <div className="flex items-center gap-2 text-xs">
-        <select
-          className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
-          value={current}
-          disabled={update.isPending}
-          onChange={(e) =>
-            update.mutate(e.target.value as "trt" | "hailo")
-          }
-        >
-          <option value="trt">TensorRT (GPU)</option>
-          <option value="hailo" disabled={!hailoPresent}>
-            Hailo-8 (PCIe){hailoPresent ? "" : " — not detected"}
-          </option>
-        </select>
-        {current === "hailo" && (
-          <span className="text-neutral-500">
-            primary detector offloaded to Hailo-8
-          </span>
-        )}
       </div>
     </div>
   );
