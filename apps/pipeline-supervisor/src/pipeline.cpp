@@ -900,7 +900,7 @@ GstElement* GroupPipeline::BuildPipeline() {
         // Push branch.
         p << "t_0. ! queue name=qp_0 max-size-buffers=200 leaky=downstream ! "
              "h264parse name=pp_0 config-interval=-1 ! "
-             "rtspclientsink name=push_0 location=rtsp://mediamtx:8554/live_"
+             "rtspclientsink name=push_0 latency=200 location=rtsp://mediamtx:8554/live_"
           << c0.id << " protocols=tcp ";
     } else if (solo_none) {
         // Record-only: no decode, no inference — parse + push only.
@@ -913,7 +913,7 @@ GstElement* GroupPipeline::BuildPipeline() {
         p << (sources_[0]->codec == "h265"
                   ? "h265parse name=pp_0 config-interval=-1 ! "
                   : "h264parse name=pp_0 config-interval=-1 ! ");
-        p << "rtspclientsink name=push_0 location=rtsp://mediamtx:8554/live_"
+        p << "rtspclientsink name=push_0 latency=200 location=rtsp://mediamtx:8554/live_"
           << c0.id << " protocols=tcp ";
     } else {
         // --- Batched shape (N ≥ 1, no transcode) ---------------------------
@@ -955,7 +955,7 @@ GstElement* GroupPipeline::BuildPipeline() {
               << " max-size-buffers=200 leaky=downstream ! "
               << parse << " name=pp_" << i << " config-interval=-1 ! "
               << "rtspclientsink name=push_" << i
-              << " location=rtsp://mediamtx:8554/live_" << s->cam.id
+              << " latency=200 location=rtsp://mediamtx:8554/live_" << s->cam.id
               << " protocols=tcp ";
         }
     }
@@ -1013,6 +1013,21 @@ GstElement* GroupPipeline::BuildPipeline() {
         std::cerr << "gst_parse_launch: " << (err ? err->message : "unknown") << "\n";
         if (err) g_error_free(err);
         return nullptr;
+    }
+
+    // Force a fixed, small pipeline latency instead of the computed
+    // max across branches. The push legs are live RELAYS — their
+    // timing rides on RTP timestamps, not render pacing — but their
+    // sync'd internals get configured with the pipeline-wide latency
+    // budget. When that budget balloons (rtspclientsink's rtpbin
+    // alone reports 2 s; the infer branch adds more) the push sink
+    // queues overflow while sync-waiting and the leg trickles at
+    // 1-2 fps of mid-GOP frames. Every real sink in this graph is
+    // either sync=false (fakesink) or a relay, so a flat 500 ms is
+    // both sufficient and safe.
+    if (GST_IS_PIPELINE(pipeline)) {
+        g_object_set(pipeline, "latency",
+                     (guint64)(500 * GST_MSECOND), nullptr);
     }
 
 #if FNVR_HAS_DEEPSTREAM
