@@ -13,12 +13,17 @@ A web-based network video recorder that:
 - Lets operators flag mis-identifications and clean up enrolment pools.
 - Exposes REST + SSE + Prometheus; integrates with Home Assistant, MQTT, webhooks, ntfy.
 
-**Status.** Upstream M1–M4 complete on Orin. DGX Spark retarget in
-progress: Phase 1 (platform port: DS 9.1 SBSA container, Hailo path
-removed, GPU-compute transforms) is code-complete pending on-device
-verification; Phases 2–4 (batched multi-camera mux, model refresh to
-RF-DETR/AdaFace/global-ANPR + FP8, scale-to-16-cameras tuning) are
-planned. See [PLAN.md](PLAN.md) for the original milestone list.
+**Status (2026-07-17).** The DGX Spark retarget is live on real
+hardware: platform port (DS 9.1 SBSA container, Hailo path removed,
+GPU-compute transforms), batched multi-camera mux with strike-based
+member resilience and self-healing push relays, model refresh
+(**RF-DETR base** primary detector — 3× the headroom of yolo26x with
+better recall — AdaFace IR-101 face embeddings, global ANPR),
+substream inference (zero main-stream decode), per-member Prometheus
+pipeline metrics, and 128 GB-unified-memory Postgres tuning. FP8
+quantisation was evaluated and rejected on output parity (fp16
+stays; see [tools/benchmark/](tools/benchmark/)). See
+[PLAN.md](PLAN.md) for the original milestone list.
 
 ## Documentation
 
@@ -37,13 +42,16 @@ DeepStream on the Spark is container-only; the pipeline image builds
 from the DS 9.1 SBSA container (NGC login required for the base pull).
 
 ```bash
-# on the Spark, once
-sudo mkdir -p /var/lib/fnvr && sudo chown $USER /var/lib/fnvr
-
 # clone + start
-git clone <repo> fnvr-dgx && cd fnvr-dgx
-export FNVR_LAN_IP=<spark-lan-ip>       # advertised to browsers for WebRTC
-docker compose -f deploy/docker/docker-compose.yml --profile gpu up -d
+git clone <repo> fnvr-dgx && cd fnvr-dgx/deploy/docker
+
+# REQUIRED: set FNVR_LAN_IP in .env (comma-separated LAN IPs of this
+# host) — MediaMTX advertises these to browsers as WebRTC ICE hosts.
+# Never pass it as a shell variable; it would shadow .env and is the
+# documented cause of black/flickering live tiles.
+$EDITOR .env
+
+docker compose --profile gpu up -d
 ```
 
 Open `http://<spark-ip>:8080`. Default login `admin / admin` — change it immediately.

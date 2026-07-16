@@ -105,6 +105,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (minor-version compatibility). Drop this layer + CUDA_VER to revert.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cuda-minimal-build-13-3 \
+        libcublas-dev-13-3 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda \
     && /usr/local/cuda/bin/nvcc --version | tail -1

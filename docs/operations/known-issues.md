@@ -38,6 +38,72 @@ Also per DS 9.1 docs: only `nv3dsink` works for on-box display (we use `fakesink
 - DGX OS ships nvidia-container-toolkit in CDI mode with **no `nvidia` docker runtime registered** — `runtime: nvidia` fails. Use compose device reservations (`driver: nvidia, count: all, capabilities: [gpu]`).
 - Compose profiles are **additive-only**. The upstream `profiles: ["!lite"]` negation was never valid and silently excluded the pipeline from `docker compose up`. The pipeline now sits behind an explicit `gpu` profile: `docker compose --profile gpu up -d`.
 
+## DS 9.1 SIGSEGVs when a custom parser returns false
+
+**Status (2026-07-16):** worked around in every parser we ship; needs upstreaming.
+
+If a `NvDsInferParseCustom*` function returns `false`, DS 9.1's error
+path ("Failed to parse bboxes") calls `free()` on an invalid pointer
+inside `libnvds_infer.so` and the worker dies with SIGSEGV
+(gdb-confirmed on GB10). **Parsers must never return false** — on an
+unrecognised layout, log once and return `true` with an empty object
+list (see `nvdsinfer_plates/`, `nvdsinfer_rfdetr/`).
+
+## nvinfer's output-pool guard false-positives on unified memory
+
+**Status (2026-07-16):** worked around in every nvinfer config; needs upstreaming.
+
+`NvDsInferContextImpl::resizeOutputBufferpool` refuses to grow the
+output pool when `cudaMemGetInfo` "free" ≤ `(100 − max-gpu-mem-per)%`
+of total. On GB10 unified memory that "free" is **free system RAM**,
+which Linux keeps near zero by design (page cache), so the guard trips
+spuriously, batches drop ("Dropping the batch as output bufferpool
+resize failed") and the error cascade can take the whole group down —
+including collateral `GPUassert` inside the (closed-source) NvDCF
+tracker that looks like an unrelated bug. Fix shipped: every nvinfer
+config sets `max-gpu-mem-per=100` (the check becomes `free ≤ 0`,
+never true). Source: `sources/libs/nvdsinfer/nvdsinfer_context_impl.cpp:1455`.
+
+## App-managed pipelines MUST handle LATENCY and CLOCK_LOST
+
+**Status (2026-07-16):** handled in `pipeline.cpp` BusHandler + forced pipeline latency.
+
+`rtspclientsink` completes its RTSP handshake after PLAYING and posts a
+LATENCY message; without `gst_bin_recalculate_latency()` the sync'd
+push internals pace against a stale latency budget and the MediaMTX
+relay trickles at 1–2 fps of mid-GOP frames (browsers then decode only
+stray IDRs — "flickering feeds") while inference runs at full rate.
+gst-launch recalculates automatically, which is why replicas of the
+same graph "worked". Belt-and-braces: the pipeline also forces a flat
+500 ms latency (`GstPipeline::latency`) and clamps
+`rtspclientsink latency=200`, and a push-leg watchdog self-heals any
+member whose relay ratio drops below 60% for 2 minutes.
+
+## WebRTC cannot carry H.265 B-frames
+
+**Status (2026-07-16):** camera-side setting; MediaMTX enforces.
+
+Cameras with "smart" encode modes (H.265+/adaptive B-frames) produce
+B-frames under motion. RTP has no DTS, so MediaMTX closes WebRTC
+readers with `WebRTC doesn't support H265 streams with B-frames`, and
+the recorder logs `DTS is not monotonically increasing`. Fix on the
+camera: plain H.265, smart encoding off. Long camera GOPs are also
+passthrough-visible: a WebRTC join can take a full GOP to paint
+(the web player waits up to 60 s for the first IDR by design).
+
+## Host network sharing: big downloads starve the 4K feeds
+
+**Status (2026-07-16):** operational note.
+
+shodan's uplink is WiFi (`wlP9s9`). Multi-GB downloads on the host
+(driver/CUDA updates, image pulls) contend with camera RTSP traffic;
+the highest-bitrate (4K H.265) streams hit `Could not read from
+resource` first and self-heal when bandwidth returns. Prefer a wired
+NIC for camera traffic, or schedule big downloads knowing the 4K
+feeds will blip. Similarly, heavy GPU jobs on the box (engine builds,
+quantisation) can stall push pacing — the push-leg watchdog now
+recovers it automatically.
+
 ## Postgres 18 image data layout
 
 **Status (2026-07-16):** handled in compose.

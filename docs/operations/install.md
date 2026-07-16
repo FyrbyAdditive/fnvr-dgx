@@ -1,84 +1,125 @@
-# Install on Jetson
+# Install on DGX Spark
 
-Target host: NVIDIA Jetson AGX Orin 64 GB dev kit with JetPack 6.2 and a dedicated NVMe for recordings.
+Target host: NVIDIA DGX Spark (GB10 — 20-core Grace, Blackwell GPU,
+128 GB coherent unified memory, 1× NVDEC / 1× NVENC) running DGX OS.
+All GPU components run in containers — DeepStream has **no native
+install** on this platform, and the pipeline image pins the one
+supported base: `nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark`.
 
-Mac / x86 without a Jetson: skip to [developer/running-locally.md](../developer/running-locally.md).
+Mac / x86 without a Spark: skip to [developer/running-locally.md](../developer/running-locally.md).
 
 ## 1. Host prep (once per machine)
 
 ```bash
-# Confirm the host is actually a Jetson running JetPack 6.x.
-cat /etc/nv_tegra_release     # should show R36.x
+# Confirm platform + driver. DGX OS manages the NVIDIA driver — never
+# install a driver from a CUDA runfile/repo; toolkit-only installs are
+# fine and containers don't use them anyway.
+nvidia-smi                     # driver 580.x+, GB10 listed
+uname -r                       # -nvidia kernel flavour
 
-# nvidia-container-toolkit installed, docker using the nvidia runtime.
-docker info | grep -i runtime
-# → Default Runtime: nvidia
-
-# Peak performance power mode. Adjust to your thermal envelope.
-sudo nvpmodel -m 0
-sudo jetson_clocks
+# Docker with NVIDIA CDI (DGX OS default). There is NO `nvidia` docker
+# runtime on DGX OS — compose uses device reservations instead, which
+# ship in our compose file already.
+docker info | grep -i cdi
 
 # NTP synced — segment filenames and event timestamps are evidence.
 timedatectl status
 
-# Recording disk. Recommend XFS + noatime on a dedicated NVMe.
-sudo mkfs.xfs /dev/nvme1n1
-sudo mkdir -p /var/lib/fnvr
-sudo mount -o noatime /dev/nvme1n1 /var/lib/fnvr
-# Persist via /etc/fstab.
-sudo chown $USER /var/lib/fnvr        # dev only — tighten for prod.
+# Recording space. Recordings, models, engines and thumbnails all live
+# in the fnvr-data docker volume; make sure the docker data-root disk
+# has room (a 4K H.265 camera ≈ 30–60 GB/day before retention).
+df -h /var/lib/docker
 ```
 
-UPS via `nut-client` is strongly recommended; a mid-write power cut can corrupt the last hour's `rec.mp4`.
+Networking note: if the Spark's uplink is WiFi, large host downloads
+will starve the highest-bitrate camera streams (they self-heal, but
+tiles blip). A wired NIC for camera traffic is strongly recommended —
+see [dual-nic.md](dual-nic.md) and the WiFi entry in
+[known-issues.md](known-issues.md).
+
+UPS via `nut-client` is strongly recommended; a mid-write power cut
+can corrupt the last recording segment.
 
 ## 2. First boot
 
 ```bash
-git clone <repo> fnvr && cd fnvr
-docker compose -f deploy/docker/docker-compose.yml up -d
-docker compose -f deploy/docker/docker-compose.yml logs -f api pipeline
+git clone <repo> fnvr-dgx && cd fnvr-dgx/deploy/docker
+cp .env .env.local 2>/dev/null || true
+# REQUIRED: set FNVR_LAN_IP in .env to the host's LAN address(es),
+# comma-separated. MediaMTX advertises these as WebRTC ICE hosts —
+# wrong/missing values = black live tiles with "deadline exceeded".
+# NEVER pass FNVR_LAN_IP as a shell variable; it must live in .env.
+docker compose --profile gpu up -d
+docker compose --profile gpu logs -f api pipeline
 ```
+
+The pipeline image build (first time only) compiles OpenCV, the
+DeepStream-Yolo and custom parser libraries, and exports the RF-DETR /
+AdaFace / ANPR models — expect 30–60 minutes on first build, seconds
+afterwards (layer cache).
 
 On first boot:
 
-- api-server runs goose migrations (22+ files) — this is fast.
-- pipeline waits for at least one enabled camera before building a TRT engine. Without a camera it idles.
-- nats + postgres come up in seconds; everything else in under a minute if the images are local.
+- api-server runs goose migrations — fast.
+- pipeline seeds models into the data volume and builds TRT engines on
+  first use (RF-DETR base FP16 ≈ 1–3 min on GB10; cached afterwards).
+- nats + postgres come up in seconds.
 
-Point your browser at `http://<orin-ip>:8080`. Default login `admin / admin` — change it immediately via **Settings → Users**.
+Point your browser at `http://<spark-ip>:8080`. Default login
+`admin / admin` — change it immediately via **Settings → Users**.
 
 ## 3. Add your first camera
 
-- **Settings → Cameras → Add.** URL is an `rtsp://user:pass@host:port/path` string. Default protocol is TCP transport; the UI doesn't expose a UDP option yet.
-- Optionally set `retention_days`, `quota_gb`, `location_kind` (indoor/outdoor) now. These are all editable later from the Storage page / Cameras page.
+- **Settings → Cameras → Add.** URL is an
+  `rtsp://user:pass@host:port/path` string (TCP transport).
+- Editable later in place (name / URL / substream / rotation /
+  detectors) — no re-create needed.
+- **Substream (recommended at scale):** set the camera's low-res
+  substream URL in the camera's Basics editor. Detection then decodes
+  the substream while the full-res main stream is relayed to
+  live/recordings with **zero decode cost** — the single NVDEC is the
+  ~16-camera ceiling and this is how you stay under it. Keep the same
+  aspect ratio as the main stream or overlay boxes will be offset.
+- Camera-side encode settings that matter: plain H.264/H.265 only
+  (smart/H.265+ modes emit B-frames, which WebRTC cannot carry), and
+  an I-frame interval ≈ 1–4 s (live view joins wait for an IDR).
 
-On save:
-- The supervisor spawns a worker process for this camera.
-- First inference run compiles the TRT engine (5–30 s on Orin for yolo26x FP16, up to 15 min for larger variants).
-- Live view appears on the Live page with a "starting…" badge during compile, then flips to `running`.
+On save the supervisor plans the camera into a batched worker group
+(cameras sharing a detector set share one process and one batched
+engine pass). Note: config edits restart the group, briefly blipping
+co-grouped cameras.
 
-If you don't have a camera yet, bring up the synthetic source: `docker compose --profile dev -f deploy/docker/docker-compose.yml up -d` publishes a testsrc stream at `rtsp://mediamtx:8554/test`.
+If you don't have a camera yet: `docker compose --profile dev up -d`
+publishes a synthetic stream at `rtsp://mediamtx:8554/test`.
 
 ## 4. First-run checklist
 
-- **Live view** shows video within ~1 s.
+- **Live view** shows video within a couple of seconds (up to one
+  camera GOP on a fresh join).
 - **Events** tab lists detections as they happen (SSE).
 - **Timeline** plays recorded segments; event pins appear on the ruler.
-- **Storage** page shows your camera's GB/day burn rate after ~1 hour of recording.
-- `tegrastats` shows GPU / NVDEC / NVENC utilisation consistent with your camera count.
+- **Storage** page shows GB/day burn after ~1 hour.
+- `nvidia-smi dmon -s um` — SM well under 50 % and `dec` consistent
+  with camera count; `curl -s localhost:8081/metrics | grep
+  fnvr_pipeline_member` shows per-camera input/push/infer rates in
+  lockstep (~ camera fps each).
 
 ## 5. Optional
 
-- **Per-camera retention.** Storage page → *edit* on a row. Ceiling 3650 days / 10 000 GB.
-- **Face-ID.** Settings → Face-ID → Enable. See [face-id.md](face-id.md) before enrolling.
-- **ANPR.** Settings → Detector → ANPR on. Camera-level toggle too.
-- **MQTT / HA bridge.** Settings → Integrations. HA auto-discovers cameras + rules over MQTT.
-- **Notifications.** Settings → Channels to create (webhook/ntfy/mqtt), then attach to rules inline on the Rules page.
-- **Dual-NIC.** If you want to isolate the camera VLAN from the user LAN, see [dual-nic.md](dual-nic.md).
+- **Per-camera retention.** Storage page → *edit* on a row.
+- **Face-ID.** Settings → Face-ID → Enable (AdaFace IR-101 embedder).
+  See [face-id.md](face-id.md) before enrolling.
+- **ANPR.** Settings → Detector → ANPR on (global plate models).
+  Camera-level detector toggles too.
+- **Detector family.** RF-DETR (base) is the validated default;
+  `yolo26` remains selectable in Settings → Detector.
+- **MQTT / HA bridge.** Settings → Integrations.
+- **Notifications.** Settings → Channels, then attach to rules.
+- **Dual-NIC / camera VLAN.** See [dual-nic.md](dual-nic.md).
 
 ## Troubleshooting first boot
 
-See [troubleshooting.md](troubleshooting.md). The two most common symptoms:
-
-- **"streaming unsupported" / empty SSE.** Means some middleware isn't passing `http.Flusher` through. Fixed in recent builds; see the troubleshooting doc for details.
-- **Pipeline "offline" banner but the video works.** Camera heartbeat drift. Confirm with [the troubleshooting doc's NATS heartbeat section](troubleshooting.md#pipeline-offline-but-the-video-is-fine).
+See [troubleshooting.md](troubleshooting.md) and
+[known-issues.md](known-issues.md) (the GB10-specific traps live
+there: container-only DeepStream, the Jetson-repo apt shadowing, the
+unified-memory nvinfer pool guard, WebRTC B-frames).

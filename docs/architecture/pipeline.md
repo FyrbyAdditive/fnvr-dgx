@@ -13,7 +13,7 @@ The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX 
 
   shared, once per group:
   nvstreammux (batch-size=N, canvas 1920×1080, enable-padding=1)
-    → nvinfer  pgie   (yolo26, one b$BATCH engine shared by the group)
+    → nvinfer  pgie   (RF-DETR base by default; yolo26 fallback family)
     → nvtracker  (NvDCF; per-source track state is native)
     → nvinfer  platedet/plateocr (plate SGIEs, optional — group shape)
     → nvinfer  scrfd/embedder    (face SGIEs, optional — group shape)
@@ -24,11 +24,40 @@ The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX 
 
 Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) (`GroupPipeline`). Mixed codecs within one group are fine — depay/parse are per-member; only the decoded NVMM surfaces meet at the mux.
 
+**Substream inference.** When `cameras.substream` is set, the member's
+graph splits: the main stream goes straight `depay → leaky queue →
+parse → rtspclientsink` (relay only — **zero NVDEC cost**), and a
+second `rtspsrc` decodes the low-res substream into the mux
+(`src_sub_i/depay_sub_i/parse_sub_i` element names). The single
+Blackwell NVDEC is the ~16-camera ceiling, so this is the primary
+capacity lever. Detections are published normalised to source space,
+which stays valid for main-stream overlays as long as both streams
+share an aspect ratio — the builder probes both and logs a loud
+warning when they don't. Solo substream members use the substream
+dims as the mux canvas (aspect-exact, no letterbox).
+
 **Letterbox + bbox mapping.** A single-member group keeps its native resolution as the mux canvas (no letterbox). Multi-member groups share a fixed 1920×1080 canvas: each source is aspect-preserving scaled and padded. Empirically verified on DS 9.1 (a 4608×1728 panorama scaled to 1920×720): the legacy mux anchors content **top-left and pads bottom/right** — `kMuxPadsCentered=false` in pipeline.cpp encodes this; the detection probe inverts the mapping so published bboxes are normalised to SOURCE space, and GPU crops use canvas space (the batched surface). Object metadata is attributed to members via `frame_meta->pad_index`.
 
 **Group restart semantics.** Editing a member's restart-relevant config (url, detectors, rotation, mtx_proxy) — or **adding a new camera that plans into an existing group** — restarts that group (~5–10 s blip for its members). Solo/bespoke cameras never affect others.
 
-**Member-fault quarantine.** A bus ERROR attributable to one member's source chain (elements are named `src_i/dec_i/…`) makes the child publish that camera's `failed`, write a fault marker, and exit rc=4; the supervisor quarantines the member (60 s backoff doubling to 10 min) and respawns the group WITHOUT it. On expiry the camera is re-admitted through a solo **probation** group; it graduates back into its natural group only after the child writes its healthy marker (PLAYING + frames flowing — uptime alone is not a health signal). The quarantine map is in-memory: a pipeline-container restart forgets it and re-learns within one fault cycle (~20 s). A member whose stream merely goes SILENT (publisher vanished but transport stays up) doesn't error the group at all — the per-member heartbeat flips it to `failed` while its siblings keep running.
+**Member-fault resilience (strike-based).** A bus ERROR attributable
+to one member's source chain (elements are named `src_i/dec_i/…`,
+including the `_sub_` substream variants) does NOT kill the group:
+the child marks that member **dead**, swallows the error, publishes
+`failed` for that camera only, and appends the camera id to the
+group's fault-marker file — siblings keep streaming. A debounced
+**self-heal** restarts the group once a dead member is ≥120 s old
+(one restart revives the branch); if ALL members die the child aborts
+immediately. The supervisor strike-counts fault-marker entries per
+camera (10-minute sliding window) and only **quarantines a 3-strike
+repeat offender** (60 s backoff doubling to 10 min) — a single RTSP
+burp costs one debounced restart, never a quarantine cascade. On
+expiry the camera is re-admitted through a solo **probation** group
+and graduates back only after the child writes its healthy marker
+(PLAYING + frames flowing — uptime alone is not a health signal).
+A member whose stream merely goes SILENT (publisher vanished but
+transport stays up) doesn't error the group at all — the per-member
+heartbeat flips it to `failed` while its siblings keep running.
 
 Per-camera choices baked into the graph:
 - **Codec passthrough.** The recording branch pushes the source elementary stream into MediaMTX unchanged. We do **not** transcode H.265 → H.264 anymore — saves ~40% NVENC and lets MediaMTX hand the same elementary stream to both fMP4 recording and the WebRTC live view.
@@ -87,9 +116,14 @@ The pgie is always NVIDIA's `nvinfer` running a TensorRT engine on the GPU. Dete
 
 ## First-run engine compilation
 
-DeepStream `nvinfer` elements lazy-compile their TensorRT engines on first use (cached thereafter under `/var/lib/fnvr/models/yolo26/*.engine`; the Orin took ~30 s per worker for yolo26x — re-measure on the Spark). The container entrypoint publishes `{"state":"starting"}` heartbeats during compile, and the UI's 15-min "starting" freshness window covers that.
-
-Pre-bake path: a `trtexec` invocation in [deploy/docker/calibrate-yolo26.sh](../../deploy/docker/calibrate-yolo26.sh) can produce the engine ahead of time.
+DeepStream `nvinfer` elements lazy-compile their TensorRT engines on
+first use (cached under `/var/lib/fnvr/models/<family>/*.engine`;
+GB10 builds rfdetr-base FP16 in ~1–3 min, yolo26x in ~19 s). Model
+ONNX seeding is content-compared at container start — a changed ONNX
+replaces the cached copy and drops its stale engines automatically.
+The entrypoint publishes `{"state":"starting"}` heartbeats during
+compile; the supervisor staggers group starts behind engine
+availability so siblings don't build in parallel.
 
 ## Secondary inference (SGIEs)
 
@@ -117,22 +151,49 @@ Use case: cameras that exist for recording + monitoring but don't need detection
 
 ## Watchdogs + hard-exit policy
 
-Three independent failure-detection paths in each worker. All converge on `std::_Exit(3)` — bypass at-exit destructors that might themselves deadlock on the same stuck resource, and let the supervisor's existing respawn + backoff + flapping-detection handle recovery.
+Independent failure-detection paths in each worker. The aborting ones
+converge on `std::_Exit(3)` — bypass at-exit destructors that might
+deadlock on the same stuck resource; the supervisor's respawn +
+backoff + strike counting handles recovery.
 
-1. **Startup PLAYING watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp) `stop_watcher` thread). Faults and publishes `failed` if the pipeline hasn't reached `GST_STATE_PLAYING` within 60 s of `Start()`. Catches `rtspsrc` SETUP hangs that `tcp-timeout=15s` doesn't catch.
-2. **Bus error** ([pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `BusHandler`). On any `GST_MESSAGE_ERROR` or `GST_MESSAGE_EOS`, publishes `failed` and hard-exits. Does **not** call `gst_element_set_state(NULL)` — that path blocked the process for 37 min once when an NvMedia element was wedged. Respawn is faster than graceful shutdown anyway, and a broken pipeline has nothing worth draining.
-3. **Data-flow watchdog (currently disabled).** A pad-probe-driven flow counter (see `buffersPassed_` in [pipeline.h](../../apps/pipeline-supervisor/src/pipeline.h)) is preserved in the source. It used to bump on the record-branch `h264parse` and the [main.cpp](../../apps/pipeline-supervisor/src/main.cpp) flow-watchdog thread sampled it every 5 s, hard-exiting on a 20 s stall. The probe target element (`recparse`) was removed when the recording branch moved to `rtspclientsink → MediaMTX`. The counter is kept because it's the only path that catches silent stalls (the bus never fires ERROR when the wedge is inside an NVIDIA library syscall); it needs re-pointing at a still-flowing pad such as `tracker.src` or the rtspclientsink request pad before the watchdog thread can be re-enabled.
+1. **Startup PLAYING watchdog** ([main.cpp](../../apps/pipeline-supervisor/src/main.cpp)). Faults and publishes `failed` if the pipeline hasn't reached `GST_STATE_PLAYING` within 60 s of `Start()`. Catches `rtspsrc` SETUP hangs that `tcp-timeout=15s` doesn't catch.
+2. **Bus error, member-attributed** ([pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) `BusHandler`). Marks the member dead and keeps the group alive (see resilience above); aborts only when no member survives. The handler also services `GST_MESSAGE_LATENCY` (`gst_bin_recalculate_latency` — without it the MediaMTX push legs pace on a stale latency budget and trickle at 1–2 fps) and `GST_MESSAGE_CLOCK_LOST` (PAUSED→PLAYING bounce). The pipeline additionally forces a flat 500 ms latency so relay pacing never depends on message timing.
+3. **Data-flow watchdog** (re-enabled). The detection probe bumps per-source frame counters; if the SUM stalls 20 s while PLAYING, the group is a zombie (bus silent, wedge inside an NVIDIA lib) — hard-exit.
+4. **Push-leg health watchdog.** Per member, encoded frames are counted entering the chain (`depay_i.src`) and reaching the MediaMTX push (`pp_i.src`). Four consecutive 30 s windows with a relay ratio < 60 % under real input flow → restart. Catches the sticky degradation where a stress window (GPU contention, MediaMTX hiccup) leaves `rtspclientsink` pacing below the camera rate forever while the leaky queue eats the difference — invisible to every other watchdog because the inference leg still runs at full rate.
+5. **Debounced self-heal** — dead member ≥120 s → one group restart.
 
-Log trail (look for these in `docker logs fnvr-pipeline-1 | grep worker`):
-- `worker[X]: did not reach PLAYING within 60s — faulting` — startup watchdog
-- `worker[X]: hard-exit rc=3 (bus error)` — bus error fired
-- `worker[X]: hard-exit rc=3 (EOS)` — source stream ended
-- `worker[X]: data-flow stalled 20s — hard exit rc=3` — silent stall
+Log trail (`docker logs fnvr-pipeline-1`):
+- `group[G]: member X source chain died — marking dead` — bus error attributed
+- `group[G]: self-heal restart (N dead member(s) for 120s)` — debounced revive
+- `group[G]: push leg [cam] degraded — a/b frames relayed in 30s (window k/4)` — relay decay
+- `group[G]: data-flow stalled 20s — hard exit rc=3` — zombie
+- `supervisor: strike k/3 for [cam]` / `supervisor: quarantined [cam]` — repeat offender
 
-In all cases the supervisor respawns via the fork+exec loop in [supervisor.cpp](../../apps/pipeline-supervisor/src/supervisor.cpp), and the flapping detector (`≥3 exits in 60 s → publish "failed"`) prevents a reliably-broken source from silently respawning forever.
+The supervisor respawns via the fork+exec loop in [supervisor.cpp](../../apps/pipeline-supervisor/src/supervisor.cpp); chronic-flap detection prevents a reliably-broken source from silently respawning forever.
 
-## Capacity
+## Pipeline metrics
 
-With YOLO26x FP16 on an Orin AGX 64 GB at nvpmodel MAXN, 3 × 1080p cameras at 10 fps ingest use roughly half the GPU. Adding ANPR + face-ID roughly doubles the load. Real numbers come from `tegrastats` + `/metrics`; the [benchmark tool](../../tools/benchmark/) (not yet shipped) will automate this.
+Every 15 s each worker publishes per-member rates to
+`fnvr.metrics.pipeline.<group_id>` (`input_fps` at depay, `push_fps`
+at the MediaMTX relay, `infer_fps` at the detection probe, `dead`).
+api-server's `pipemetrics` exporter re-exports them on its existing
+`/metrics` endpoint as `fnvr_pipeline_member_*` gauges with
+`{group,camera}` labels (90 s staleness janitor). A healthy camera
+shows all three rates in lockstep at ~its fps; `push_fps` sagging
+below `input_fps` is the push-leg failure mode above, now visible on
+a dashboard before anyone notices a stuttering tile.
 
-INT8 yolo26x calibration is blocked on [TRT 10.3 bug #3937](../operations/known-issues.md), not on our code. Resume path: JetPack 7.2 (Q2 2026).
+## Capacity (GB10, measured 2026-07-16)
+
+With RF-DETR base FP16 on the DGX Spark, the full 7-camera fleet
+(5 inference incl. one relayed 4K + panorama, ANPR + face-ID on) runs
+at **SM ≈ 25–45 %** and NVDEC ≈ 6–10 % (one 4K camera on substream
+inference). yolo26x FP16 measured ~3× hotter (SM 59–96 %) with worse
+recall — see [tools/benchmark/rfdetr-ab-2026-07-16.md](../../tools/benchmark/rfdetr-ab-2026-07-16.md).
+The GPU is FLOPs-bound at the network input size, NOT batch-bound —
+capacity levers in order: substream inference (NVDEC), `interval=N`
+on the pgie, model size, FP8 (currently rejected: naive PTQ fails
+output parity on RF-DETR; see the benchmark doc).
+
+Live numbers: `nvidia-smi dmon -s um` on the host plus the
+`fnvr_pipeline_member_*` gauges on api-server `/metrics`.
