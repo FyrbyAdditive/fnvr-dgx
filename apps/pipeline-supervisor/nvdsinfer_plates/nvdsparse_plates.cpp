@@ -118,7 +118,10 @@ extern "C" bool NvDsInferParseCustomPlateDet(
             obj.top    = std::max(0.f, y1);
             obj.width  = std::min(W - obj.left, x2 - x1);
             obj.height = std::min(H - obj.top, y2 - y1);
-            if (obj.width <= 0 || obj.height <= 0) continue;
+            // Sub-pixel plates (tiny vehicle crops) map to zero-dim
+            // rects in frame space and crash the downstream OCR
+            // transform with invalid params — require a readable size.
+            if (obj.width < 8.f || obj.height < 4.f) continue;
             objectList.push_back(obj);
         }
         return true;

@@ -27,6 +27,10 @@ network-type=1
 classifier-async-mode=0
 classifier-threshold=0.5
 maintain-aspect-ratio=0
+# Skip degenerate plate rects — NvBufSurfTransform rejects zero-dim
+# crops with error -3 and that error is FATAL to the whole group.
+input-object-min-width=24
+input-object-min-height=8
 
 parse-classifier-func-name=NvDsInferParsePlateOCRCCT
 custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_plates.so

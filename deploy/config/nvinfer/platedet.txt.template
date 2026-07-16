@@ -26,6 +26,10 @@ process-mode=2
 cluster-mode=4
 maintain-aspect-ratio=1
 symmetric-padding=1
+# Vehicles below this carry no readable plate; also guards the crop
+# transform against degenerate rects (error -3 is group-fatal).
+input-object-min-width=64
+input-object-min-height=64
 parse-bbox-func-name=NvDsInferParseCustomPlateDet
 custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_plates.so
 
