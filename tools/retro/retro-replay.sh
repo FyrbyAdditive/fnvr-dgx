@@ -64,8 +64,27 @@ for f in $(find "$REC" -name '*.mp4' | sort); do
     done
 
     echo "retro[$CAM]: $base"
-    if /usr/local/bin/pipeline-supervisor --worker-replay \
-            "$CAM" "$f" "$base_ms"; then
+    /usr/local/bin/pipeline-supervisor --worker-replay \
+        "$CAM" "$f" "$base_ms" &
+    RPID=$!
+    # Mid-file throttling: the between-files gate is useless once a
+    # long segment is replaying — an unthrottled replay measurably
+    # starves the live push relays (2026-07-17 incident). Pause the
+    # replay (SIGSTOP) whenever live SM is above the ceiling and
+    # resume when it drops.
+    paused=0
+    while kill -0 "$RPID" 2>/dev/null; do
+        sleep 5
+        sm=$(gpu_sm)
+        if [ "$sm" -ge "$SM_MAX" ] && [ "$paused" = "0" ]; then
+            kill -STOP "$RPID" 2>/dev/null && paused=1
+            echo "retro[$CAM]: paused (SM ${sm}% >= ${SM_MAX}%)"
+        elif [ "$sm" -lt "$SM_MAX" ] && [ "$paused" = "1" ]; then
+            kill -CONT "$RPID" 2>/dev/null && paused=0
+            echo "retro[$CAM]: resumed (SM ${sm}%)"
+        fi
+    done
+    if wait "$RPID"; then
         echo "$base" >> "$DONE"
         done_n=$((done_n+1))
     else

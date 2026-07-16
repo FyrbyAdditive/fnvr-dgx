@@ -376,7 +376,7 @@ int main(int argc, char** argv) {
     if (argc >= 5 && std::string(argv[1]) == "--worker-replay") {
         gst_init(&argc, &argv);
         const char* nurl = std::getenv("FNVR_NATS_URL");
-        NatsPublisher nats(nurl ? nurl : "nats://nats:4222");
+        fnvr::NatsPublisher nats(nurl ? nurl : "nats://nats:4222");
         const char* cfg = std::getenv("FNVR_INFER_CONFIG");
         const bool use_anpr =
             [] { const char* e = std::getenv("FNVR_USE_ANPR");

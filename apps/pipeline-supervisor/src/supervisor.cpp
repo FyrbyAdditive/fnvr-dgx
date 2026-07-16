@@ -114,6 +114,19 @@ void Supervisor::Stop() {
     stop_cv_.notify_all();
 }
 
+bool Supervisor::noteFaultAndCheckStorm(const std::string& camera_id) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(storm_mu_);
+    recent_faults_.emplace_back(now, camera_id);
+    while (!recent_faults_.empty() &&
+           now - recent_faults_.front().first > std::chrono::minutes(2)) {
+        recent_faults_.pop_front();
+    }
+    std::set<std::string> distinct;
+    for (const auto& [t, cam] : recent_faults_) distinct.insert(cam);
+    return distinct.size() >= 3;
+}
+
 void Supervisor::quarantineMember(const std::string& camera_id) {
     std::lock_guard<std::mutex> lk(quarantine_mu_);
     auto& q = quarantine_[camera_id];
@@ -445,6 +458,19 @@ void Supervisor::workerMain(Worker* w) {
             const auto nowt = std::chrono::steady_clock::now();
             bool retired_for_quarantine = false;
             for (const auto& cam : consumeFaultMarkers(w->plan.group_id)) {
+                if (noteFaultAndCheckStorm(cam)) {
+                    // Fleet-wide fault storm: many distinct cameras
+                    // faulting together means the CAUSE is shared
+                    // (GPU contention, MediaMTX, network) — punishing
+                    // individual cameras with strikes just cascades
+                    // quarantines on top of the original incident
+                    // (2026-07-17: an unthrottled retro-replay faulted
+                    // the fleet and quarantined an innocent camera).
+                    std::cerr << "group[" << w->plan.group_id
+                              << "]: fault storm — strike suppressed for ["
+                              << cam << "]\n";
+                    continue;
+                }
                 auto& hist = member_strikes[cam];
                 hist.push_back(nowt);
                 while (!hist.empty() &&

@@ -5,8 +5,10 @@
 #include <condition_variable>
 #include <map>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <set>
+#include <utility>
 #include <string>
 #include <thread>
 
@@ -60,6 +62,13 @@ private:
 
     void reconcileOnce();
     void workerMain(Worker* w);
+    // Fault-storm detector: records a member fault and returns true
+    // when the fleet is inside a storm window (faults from ≥3 DISTINCT
+    // cameras in the last 2 minutes). During a storm, strike counting
+    // is suppressed — infrastructure events (GPU contention, MediaMTX
+    // restart, network blips) fault many cameras at once and none of
+    // them deserve quarantine for it. Self-heal restarts still happen.
+    bool noteFaultAndCheckStorm(const std::string& camera_id);
     std::string readEnginePathFromInferConfig() const;
 
     // Quarantine helpers (lock quarantine_mu_).
@@ -74,6 +83,10 @@ private:
     std::map<std::string, std::unique_ptr<Worker>>  workers_;  // group_id → worker
 
     std::mutex                          quarantine_mu_;
+    // Fault-storm window (see noteFaultAndCheckStorm).
+    std::mutex storm_mu_;
+    std::deque<std::pair<std::chrono::steady_clock::time_point,
+                         std::string>> recent_faults_;
     std::map<std::string, Quarantine>   quarantine_;  // camera_id → entry
 
     std::atomic<bool>       stop_{false};
