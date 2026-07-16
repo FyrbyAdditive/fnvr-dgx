@@ -271,7 +271,7 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ rotation }),
     }),
-  updateCameraBasics: (id: string, body: { name?: string; url?: string }) =>
+  updateCameraBasics: (id: string, body: { name?: string; url?: string; substream?: string }) =>
     req<void>(`/cameras/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   updateCameraMtxProxy: (id: string, mtx_proxy: boolean) =>
     req<void>(`/cameras/${id}/mtx_proxy`, {

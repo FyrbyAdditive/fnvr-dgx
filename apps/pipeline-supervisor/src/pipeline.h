@@ -28,6 +28,11 @@ struct SourceRuntime {
     std::string codec = "h264";
     // Probed source dimensions (0 = unknown).
     int probed_w = 0, probed_h = 0;
+    // Substream (inference) codec/dims when cam.substream_url is set —
+    // the decode leg then reads the substream and the main stream is
+    // relayed to MediaMTX without ever touching NVDEC.
+    std::string sub_codec = "h264";
+    int sub_w = 0, sub_h = 0;
     // Frames observed for this source at the detection probe. The
     // heartbeat thread derives per-camera running/stalled from this;
     // the flow watchdog sums across sources.

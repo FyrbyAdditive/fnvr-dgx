@@ -660,7 +660,11 @@ namespace {
 // -1 when the name doesn't match.
 int memberIndexFromName(const char* name) {
     if (!name) return -1;
-    static const char* prefixes[] = {"src_", "depay_", "parse_", "qi_",
+    // "_sub_" variants first — "src_sub_3" must not be rejected by the
+    // "src_" prefix ("sub_3" fails the all-digits check) before the
+    // longer prefix gets a look.
+    static const char* prefixes[] = {"src_sub_", "depay_sub_", "parse_sub_",
+                                     "src_", "depay_", "parse_", "qi_",
                                      "dec_", "qm_", "qp_", "pp_", "push_"};
     for (const char* p : prefixes) {
         size_t n = std::strlen(p);
@@ -831,7 +835,13 @@ GstElement* GroupPipeline::BuildPipeline() {
                            c0.enabled_detectors[0] == "none";
     const bool solo_transcode = solo && (c0.rotation != 0 || c0.mtx_proxy);
 
-    // Probe every member's codec/dims up front.
+    // Probe every member's codec/dims up front. Members with a
+    // substream get BOTH streams probed: the substream feeds the
+    // decode/inference leg (saving the main-stream NVDEC cost — the
+    // single decoder is the 16-camera ceiling), the main stream is
+    // relayed untouched. Detections are published normalised, so they
+    // remain valid for main-stream overlays as long as the two
+    // streams share an aspect ratio — warn loudly when they don't.
     for (auto& s : sources_) {
         std::string url = s->cam.url;
         if (s->cam.mtx_proxy) url = "rtsp://mediamtx:8554/proxy_" + s->cam.id;
@@ -842,6 +852,27 @@ GstElement* GroupPipeline::BuildPipeline() {
         std::cerr << "group[" << group_id_ << "]: member " << s->cam.id
                   << " codec=" << s->codec << " size=" << probe.width
                   << "x" << probe.height << "\n";
+        if (!s->cam.substream_url.empty()) {
+            auto sp = ProbeRtsp(s->cam.substream_url);
+            s->sub_codec = sp.codec.empty() ? "h264" : sp.codec;
+            s->sub_w = sp.width;
+            s->sub_h = sp.height;
+            std::cerr << "group[" << group_id_ << "]: member " << s->cam.id
+                      << " substream codec=" << s->sub_codec << " size="
+                      << sp.width << "x" << sp.height << "\n";
+            if (s->probed_w > 0 && s->probed_h > 0 && sp.width > 0 &&
+                sp.height > 0) {
+                const double ar_main = double(s->probed_w) / s->probed_h;
+                const double ar_sub  = double(sp.width) / sp.height;
+                if (std::abs(ar_main - ar_sub) / ar_main > 0.01) {
+                    std::cerr << "group[" << group_id_ << "]: WARNING member "
+                              << s->cam.id << " main/substream aspect differs ("
+                              << ar_main << " vs " << ar_sub
+                              << ") — normalised bboxes will be offset on "
+                                 "main-stream overlays\n";
+                }
+            }
+        }
     }
 
     std::ostringstream p;
@@ -920,7 +951,15 @@ GstElement* GroupPipeline::BuildPipeline() {
         // Canvas: single member keeps its native dims (no letterbox);
         // multi-member groups share a fixed canvas and the probes
         // invert the letterbox per source.
-        if (solo && sources_[0]->probed_w > 0 && sources_[0]->probed_h > 0) {
+        const bool solo_sub = solo && use_deepstream_ &&
+                              !c0.substream_url.empty();
+        if (solo_sub && sources_[0]->sub_w > 0 && sources_[0]->sub_h > 0) {
+            // Substream feeds the mux — canvas at substream size keeps
+            // it aspect-exact with zero letterbox (and zero upscale).
+            mux_w_ = sources_[0]->sub_w;
+            mux_h_ = sources_[0]->sub_h;
+        } else if (solo && !solo_sub && sources_[0]->probed_w > 0 &&
+                   sources_[0]->probed_h > 0) {
             mux_w_ = sources_[0]->probed_w;
             mux_h_ = sources_[0]->probed_h;
         } else {
@@ -933,6 +972,39 @@ GstElement* GroupPipeline::BuildPipeline() {
             if (s->cam.mtx_proxy) url = "rtsp://mediamtx:8554/proxy_" + s->cam.id;
             const char* depay = s->codec == "h265" ? "rtph265depay" : "rtph264depay";
             const char* parse = s->codec == "h265" ? "h265parse" : "h264parse";
+            const bool use_sub =
+                use_deepstream_ && !s->cam.substream_url.empty();
+            if (use_sub) {
+                // Substream inference: the main stream never touches
+                // the decoder — straight relay to MediaMTX (the qp
+                // leaky queue keeps the push-health watchdog's
+                // decoupling), while a second rtspsrc decodes the low
+                // -res substream into the mux.
+                p << "rtspsrc name=src_" << i << " location=" << url
+                  << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3 ! "
+                  << depay << " name=depay_" << i << " ! "
+                  << "queue name=qp_" << i
+                  << " max-size-buffers=200 leaky=downstream ! "
+                  << parse << " name=pp_" << i << " config-interval=-1 ! "
+                  << "rtspclientsink name=push_" << i
+                  << " latency=200 location=rtsp://mediamtx:8554/live_" << s->cam.id
+                  << " protocols=tcp ";
+                const char* sdepay =
+                    s->sub_codec == "h265" ? "rtph265depay" : "rtph264depay";
+                const char* sparse =
+                    s->sub_codec == "h265" ? "h265parse" : "h264parse";
+                p << "rtspsrc name=src_sub_" << i << " location="
+                  << s->cam.substream_url
+                  << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3 ! "
+                  << sdepay << " name=depay_sub_" << i << " ! "
+                  << sparse << " name=parse_sub_" << i << " config-interval=1 ! "
+                  << "queue name=qi_" << i
+                  << " max-size-buffers=8 leaky=downstream ! "
+                  << "nvv4l2decoder name=dec_" << i << " ! "
+                  << "queue name=qm_" << i << " max-size-buffers=4 leaky=downstream ! "
+                  << "mux.sink_" << i << " ";
+                continue;
+            }
             p << "rtspsrc name=src_" << i << " location=" << url
               << " latency=200 protocols=tcp tcp-timeout=15000000 retry=3 ! "
               << depay << " name=depay_" << i << " ! "

@@ -299,18 +299,21 @@ function BasicsEditor({ camera }: { camera: Camera }) {
   const qc = useQueryClient();
   const [name, setName] = useState(camera.name);
   const [url, setUrl] = useState(camera.url);
+  const [substream, setSubstream] = useState(camera.substream ?? "");
   const [err, setErr] = useState<string | null>(null);
   // Reset local state when the upstream camera row changes (e.g. another
   // client edits it, or an unrelated invalidate refetches).
   useEffect(() => {
     setName(camera.name);
     setUrl(camera.url);
-  }, [camera.name, camera.url]);
+    setSubstream(camera.substream ?? "");
+  }, [camera.name, camera.url, camera.substream]);
   const save = useMutation({
     mutationFn: () => {
-      const body: { name?: string; url?: string } = {};
+      const body: { name?: string; url?: string; substream?: string } = {};
       if (name !== camera.name) body.name = name;
       if (url !== camera.url) body.url = url;
+      if (substream !== (camera.substream ?? "")) body.substream = substream;
       return api.updateCameraBasics(camera.id, body);
     },
     onSuccess: () => {
@@ -319,7 +322,10 @@ function BasicsEditor({ camera }: { camera: Camera }) {
     },
     onError: (e) => setErr((e as Error)?.message ?? "save failed"),
   });
-  const dirty = name !== camera.name || url !== camera.url;
+  const dirty =
+    name !== camera.name ||
+    url !== camera.url ||
+    substream !== (camera.substream ?? "");
   return (
     <div className="pl-3 border-l-2 border-neutral-800 space-y-1">
       <div className="text-xs text-neutral-400 mb-1">Basics</div>
@@ -342,6 +348,21 @@ function BasicsEditor({ camera }: { camera: Camera }) {
             disabled={save.isPending}
           />
         </label>
+        {/* Substream: when set, detection decodes THIS (low-res) stream
+            and the main stream is relayed to live/recordings untouched —
+            the single NVDEC is the 16-camera ceiling, and substream
+            inference is how we stay under it. Same aspect ratio as the
+            main stream or overlays will be offset. */}
+        <label className="flex items-center gap-2">
+          <span className="w-10 text-neutral-500">sub</span>
+          <input
+            className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 font-mono"
+            placeholder="optional substream url for detection (low-res, same aspect)"
+            value={substream}
+            onChange={(e) => setSubstream(e.target.value)}
+            disabled={save.isPending}
+          />
+        </label>
         <div className="flex items-center gap-2 pt-1">
           <button
             type="button"
@@ -358,6 +379,7 @@ function BasicsEditor({ camera }: { camera: Camera }) {
               onClick={() => {
                 setName(camera.name);
                 setUrl(camera.url);
+                setSubstream(camera.substream ?? "");
                 setErr(null);
               }}
             >

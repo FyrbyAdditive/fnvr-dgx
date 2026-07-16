@@ -322,7 +322,7 @@ func (s *Store) SetEnabled(ctx context.Context, id string, enabled bool) error {
 // Fields passed as nil are left alone. Trims whitespace and rejects
 // empty strings on either field to avoid blanking a row by accident.
 // Returns ErrNotFound if no row matches.
-func (s *Store) UpdateBasics(ctx context.Context, id string, name *string, url *string) error {
+func (s *Store) UpdateBasics(ctx context.Context, id string, name *string, url *string, substream *string) error {
 	if name != nil {
 		trimmed := strings.TrimSpace(*name)
 		if trimmed == "" {
@@ -337,15 +337,22 @@ func (s *Store) UpdateBasics(ctx context.Context, id string, name *string, url *
 		}
 		url = &trimmed
 	}
-	if name == nil && url == nil {
-		return fmt.Errorf("name or url required")
+	if substream != nil {
+		// Empty string is meaningful: it CLEARS the substream (back to
+		// main-stream inference).
+		trimmed := strings.TrimSpace(*substream)
+		substream = &trimmed
+	}
+	if name == nil && url == nil && substream == nil {
+		return fmt.Errorf("name, url or substream required")
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE cameras
 		   SET name = COALESCE($2, name),
 		       url  = COALESCE($3, url),
+		       substream = COALESCE($4, substream),
 		       updated_at = NOW()
-		 WHERE id = $1`, id, name, url)
+		 WHERE id = $1`, id, name, url, substream)
 	if err != nil {
 		return err
 	}

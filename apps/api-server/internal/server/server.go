@@ -597,15 +597,16 @@ func (s *Server) handleDeleteCamera(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateCameraBasics(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name *string `json:"name,omitempty"`
-		URL  *string `json:"url,omitempty"`
+		Name      *string `json:"name,omitempty"`
+		URL       *string `json:"url,omitempty"`
+		Substream *string `json:"substream,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	id := r.PathValue("id")
-	err := s.cameras.UpdateBasics(r.Context(), id, body.Name, body.URL)
+	err := s.cameras.UpdateBasics(r.Context(), id, body.Name, body.URL, body.Substream)
 	if errors.Is(err, camera.ErrNotFound) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
