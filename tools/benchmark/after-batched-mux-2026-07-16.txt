@@ -1,0 +1,74 @@
+fnvr-dgx capture — label=after-batched-mux — 2026-07-16T14:29:23Z
+host=shodan kernel=6.17.0-1026-nvidia driver=580.159.03
+
+================================================================================
+SECTION 1 — GPU engine load (nvidia-smi dmon, 60s @ 1Hz)
+columns: gpu sm mem enc dec jpg ofa (percent)
+  SM   mean 64.2%  max 86%
+  MEM  mean 0.0%
+  ENC  mean 1.5%
+  DEC  mean 15.6%  max 21%
+
+  power/temp snapshot:
+    51.12 W, 78, 2385 MHz
+
+================================================================================
+SECTION 2 — system memory + pipeline processes
+                 total        used        free      shared  buff/cache   available
+  Mem:             121           9          32           0          80         112
+  Swap:             15           0          15
+
+  pipeline worker processes:
+        303 1262552 /usr/local/bin/pipeline-supervisor --worker-group face+object-0 cam-house-side,cam-house-side-wide,cam-makershop
+        220 1244004 /usr/local/bin/pipeline-supervisor --worker-group all-0 cam-house-back,cam-house-back-wide
+        313 386712 /usr/local/bin/pipeline-supervisor --worker-group solo-cam-makershop-prusa-xl cam-makershop-prusa-xl
+        327 36956 /usr/local/bin/pipeline-supervisor --worker-group solo-cam-office-prusa-indx cam-office-prusa-indx
+          1 28748 /usr/local/bin/pipeline-supervisor
+
+================================================================================
+SECTION 3 — per-camera pipeline buffer rate (latest probe heartbeats)
+  probe[all-0]: buffers=11750 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=11000 batch_null=0 frames_with_obj=12613 objects=22138 published=22138
+  probe[all-0]: buffers=12000 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=11250 batch_null=0 frames_with_obj=13019 objects=22756 published=22756
+  probe[all-0]: buffers=12250 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=11500 batch_null=0 frames_with_obj=13407 objects=23334 published=23334
+  probe[all-0]: buffers=12500 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=11750 batch_null=0 frames_with_obj=13751 objects=23898 published=23898
+  probe[all-0]: buffers=12750 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=12000 batch_null=0 frames_with_obj=14147 objects=24543 published=24543
+  probe[all-0]: buffers=13000 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=12250 batch_null=0 frames_with_obj=14549 objects=25162 published=25162
+  probe[all-0]: buffers=13250 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=12500 batch_null=0 frames_with_obj=14897 objects=25742 published=25742
+  probe[all-0]: buffers=13500 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=12750 batch_null=0 frames_with_obj=15179 objects=26245 published=26245
+  probe[all-0]: buffers=13750 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=13000 batch_null=0 frames_with_obj=15516 objects=26784 published=26784
+  probe[all-0]: buffers=14000 batch_null=0 frames_with_obj=171 objects=191 published=191
+  probe[face+object-0]: buffers=13250 batch_null=0 frames_with_obj=15888 objects=27448 published=27448
+
+================================================================================
+SECTION 4 — detection throughput
+  detections rows by camera, last 10 min:
+    cam-makershop|23610
+    cam-house-side|4668
+    cam-house-back|151
+    cam-house-back-wide|40
+  insert rate (rows/sec over last 5 min):
+    53.2
+
+================================================================================
+SECTION 5 — camera config snapshot
+  cam-house-back|t||0|f
+  cam-house-back-wide|t||0|f
+  cam-house-side|t|object+face|0|f
+  cam-house-side-wide|t|object+face|0|f
+  cam-makershop|t|face+object|0|f
+  cam-makershop-prusa-xl|t|none|180|f
+  cam-office-prusa-indx|t|none|0|f
+
+================================================================================
+SECTION 6 — engine cache
+  -rw-r--r-- 1 root root 114357524 Jul 16 11:04 yolo26x.onnx_b1_gpu0_fp16.engine
+  -rw-r--r-- 1 root root 114185348 Jul 16 14:10 yolo26x.onnx_b8_gpu0_fp16.engine

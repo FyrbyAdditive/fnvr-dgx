@@ -1,30 +1,34 @@
 # Pipeline
 
-The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX Spark), one child per camera. A supervisor parent launches, watches, and restarts children. Each camera is isolated: a single bad RTSP feed cannot take the stack down.
+The pipeline is a C++ / DeepStream 9.1 GStreamer process (SBSA container on DGX Spark), one child per camera **group**. Cameras whose graphs have the same shape (same detector set, no transcode) share a worker process with one batched `nvstreammux` and one TensorRT engine; bespoke shapes (record-only, rotation/mtx_proxy transcode) stay solo. A supervisor parent plans groups from the DB ([grouping.cpp](../../apps/pipeline-supervisor/src/grouping.cpp)), launches, watches, and restarts children, and quarantines individual members whose source chains fault so one broken camera cannot keep restarting its healthy siblings.
 
-## Per-camera GStreamer graph
+## Group GStreamer graph (batched-mux)
 
 ```
-  rtspsrc (camera RTSP)
-    → rtp{h264,h265}depay
-    → {h264,h265}parse  (codec auto-detected by an ffprobe preamble)
-    → tee
-        ├─ queue → nvv4l2decoder → nvstreammux (batch 1)
-        │                        → nvinfer  pgie   (yolo26 detector)
-        │                        → nvtracker  (NvDCF, IDs + bbox smoothing)
-        │                        → nvinfer  lpdnet  (plate detector SGIE, optional)
-        │                        → nvinfer  lprnet  (plate OCR SGIE, optional)
-        │                        → nvinfer  scrfd   (face detector SGIE, optional)
-        │                        → nvinfer  arcface (face embedder SGIE, optional)
-        │                        → fakesink                                (probe taps here)
-        │                        (a pad probe on pgie.src — see preview_probe.cpp — taps the in-flight
-        │                         decoded NVMM frame at 1 fps, scales to 480×270 on the GPU and writes
-        │                         the JPEG ring at /var/lib/fnvr/live/<cam>.<n>.jpg. No second decode.)
-        └─ queue → {h264,h265}parse config-interval=-1
-                → rtspclientsink → rtsp://mediamtx:8554/live_<cam>          (RECORD + WebRTC)
+  per member i (codec auto-detected per camera by an ffprobe preamble):
+  rtspsrc (camera i) → rtp{h264,h265}depay → {h264,h265}parse → tee t_i
+        ├─ queue (8, leaky) → nvv4l2decoder → queue → mux.sink_i
+        └─ queue (200, leaky) → {h264,h265}parse config-interval=-1
+                → rtspclientsink → rtsp://mediamtx:8554/live_<cam_i>   (RECORD + WebRTC)
+
+  shared, once per group:
+  nvstreammux (batch-size=N, canvas 1920×1080, enable-padding=1)
+    → nvinfer  pgie   (yolo26, one b$BATCH engine shared by the group)
+    → nvtracker  (NvDCF; per-source track state is native)
+    → nvinfer  lpdnet/lprnet   (plate SGIEs, optional — group shape)
+    → nvinfer  scrfd/arcface   (face SGIEs, optional — group shape)
+    → fakesink                                  (detection probe taps here)
+  (a pad probe on pgie.src — see preview_probe.cpp — walks the batch and
+   writes each member's 1 fps 480×270 JPEG ring. No second decode.)
 ```
 
-Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp). The codec auto-detection runs once before the pipeline is built, so H.264 *and* H.265 sources both work without configuration.
+Actual construction lives in [apps/pipeline-supervisor/src/pipeline.cpp](../../apps/pipeline-supervisor/src/pipeline.cpp) (`GroupPipeline`). Mixed codecs within one group are fine — depay/parse are per-member; only the decoded NVMM surfaces meet at the mux.
+
+**Letterbox + bbox mapping.** A single-member group keeps its native resolution as the mux canvas (no letterbox). Multi-member groups share a fixed 1920×1080 canvas: each source is aspect-preserving scaled and padded. Empirically verified on DS 9.1 (a 4608×1728 panorama scaled to 1920×720): the legacy mux anchors content **top-left and pads bottom/right** — `kMuxPadsCentered=false` in pipeline.cpp encodes this; the detection probe inverts the mapping so published bboxes are normalised to SOURCE space, and GPU crops use canvas space (the batched surface). Object metadata is attributed to members via `frame_meta->pad_index`.
+
+**Group restart semantics.** Editing a member's restart-relevant config (url, detectors, rotation, mtx_proxy) — or **adding a new camera that plans into an existing group** — restarts that group (~5–10 s blip for its members). Solo/bespoke cameras never affect others.
+
+**Member-fault quarantine.** A bus ERROR attributable to one member's source chain (elements are named `src_i/dec_i/…`) makes the child publish that camera's `failed`, write a fault marker, and exit rc=4; the supervisor quarantines the member (60 s backoff doubling to 10 min) and respawns the group WITHOUT it. On expiry the camera is re-admitted through a solo **probation** group; it graduates back into its natural group only after the child writes its healthy marker (PLAYING + frames flowing — uptime alone is not a health signal). The quarantine map is in-memory: a pipeline-container restart forgets it and re-learns within one fault cycle (~20 s). A member whose stream merely goes SILENT (publisher vanished but transport stays up) doesn't error the group at all — the per-member heartbeat flips it to `failed` while its siblings keep running.
 
 Per-camera choices baked into the graph:
 - **Codec passthrough.** The recording branch pushes the source elementary stream into MediaMTX unchanged. We do **not** transcode H.265 → H.264 anymore — saves ~40% NVENC and lets MediaMTX hand the same elementary stream to both fMP4 recording and the WebRTC live view.
@@ -53,7 +57,7 @@ Per-browser playback loaders live in [apps/web/src/routes/timeline/Timeline.tsx]
 
 ## Camera health heartbeat
 
-Every worker publishes `{"camera_id":"...","state":"running"}` to `fnvr.state.camera.<id>` on a 30 s loop once the pipeline reaches `GST_STATE_PLAYING`. The api-server stores these in a JetStream last-value stream (`FNVR_CAMERA_STATE`, `MaxMsgsPerSubject=1`) so a restart replays the latest state per camera immediately instead of waiting for the next heartbeat.
+Every group worker publishes per-member `{"camera_id":"...","state":"running"}` to `fnvr.state.camera.<id>` on a 30 s loop once the pipeline reaches `GST_STATE_PLAYING` **and that member's frames are advancing** (the detection probe bumps a per-source counter). A member stalled >60 s while the group plays gets `failed` — its siblings stay `running`. The api-server stores these in a JetStream last-value stream (`FNVR_CAMERA_STATE`, `MaxMsgsPerSubject=1`) so a restart replays the latest state per camera immediately instead of waiting for the next heartbeat.
 
 Stale-heartbeat windows:
 - `running`: 10 min
@@ -71,19 +75,9 @@ The pipeline uses the `nats-c` library. The default reconnect behaviour gives up
 
 Without this, the detection *and* heartbeat publish paths can silently die without the process noticing — we've hit that in production and spent hours diagnosing it.
 
-## Hourly segment rotation (legacy — scheduled for removal)
+## Hourly segment rotation (removed)
 
-Each worker is restarted at the top of every hour. This predates the move to MediaMTX-side recording (which segments on its own `MTX_RECORDSEGMENTDURATION=1h` clock) — the original rationale, per-hour `rec.mp4` directories written by the supervisor, no longer exists. The restart churn is pure downside now and is slated for deletion with the batched-mux rework.
-
-The rotation is **silent** from the UI's perspective:
-
-- The supervisor passes `--rotation` to the respawned `--worker` child. The child skips its `{"state":"starting"}` publish, so the JetStream last-value stream continues to return the pre-rotation `{"state":"running"}` message until the new worker itself reaches `GST_STATE_PLAYING` and publishes a fresh `running`.
-- The api-server's `running` freshness window is 10 minutes; the rotation gap is ~30 s, so `state=running` is honoured continuously.
-- Rotation is staggered per-camera — up to 120 s after HH:00, deterministic by `hash(camera_id)` — so even if the silent-publish path regresses, cameras flash individually rather than simultaneously.
-
-Log trail: `docker logs fnvr-pipeline-1 | grep rotation` yields lines of the form `worker[<id>]: hourly rotation — rolled (silent; prior state retained) pid N`. If you see `hourly rotation — restarting pid N` instead, that's the pre-silent-rotation log format and the build is out of date.
-
-A genuine `Start()` failure during rotation still publishes `{"state":"failed"}` — a busted rotation flips the UI red as it should.
+The Orin build restarted every worker hourly so recordings landed in per-hour `rec.mp4` directories. Recording moved to MediaMTX (which segments on its own `MTX_RECORDSEGMENTDURATION=1h` clock) long ago, so the batched-mux rework deleted the rotation entirely — group workers run until a fault or a config change stops them.
 
 ## Detector backend
 

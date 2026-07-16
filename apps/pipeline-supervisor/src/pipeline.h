@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <gst/gst.h>
 
@@ -15,67 +16,89 @@ namespace fnvr {
 // Set the grace window (seconds) used by the bus-error hard-exit path
 // to suppress its "failed" NATS publish. Called by the worker child
 // process at startup with the value from settings.pipeline.startup_grace_sec.
-// Without this, a slow-to-connect source (MediaMTX-proxied, cold-boot
-// TLS, etc.) fires `failed` in the UI on its first warmup exit even
-// though the supervisor is about to respawn and succeed.
 void SetWorkerStartupGraceSec(int sec);
 
-// SingleCameraPipeline is the M2 shape: one camera in, push to MediaMTX
-// + (if DeepStream is available) detect. MediaMTX handles recording
-// (its built-in fMP4 recorder) and live WebRTC. One pipeline per camera
-// keeps the M2 blast-radius tiny; M3 replaces this with batched
-// nvstreammux across a group of cameras.
-class SingleCameraPipeline {
+// Per-member runtime state inside a group pipeline. Owned by
+// GroupPipeline; referenced (never owned) by the pad probes.
+struct SourceRuntime {
+    CameraConfig cam;
+    // Codec carried on this member's tee ("h264"/"h265"); probed
+    // before graph construction, drives depay/parse element choice.
+    std::string codec = "h264";
+    // Probed source dimensions (0 = unknown).
+    int probed_w = 0, probed_h = 0;
+    // Frames observed for this source at the detection probe. The
+    // heartbeat thread derives per-camera running/stalled from this;
+    // the flow watchdog sums across sources.
+    std::atomic<std::uint64_t> frames{0};
+};
+
+// GroupPipeline — the batched-mux shape. N member cameras share one
+// process: per-member rtspsrc → depay → parse → tee with (a) a decode
+// leg into nvstreammux sink_i and (b) a push leg to MediaMTX; one
+// nvstreammux batch-size=N → nvinfer → nvtracker → optional SGIEs →
+// fakesink, with the detection/preview probes walking the batch and
+// attributing frames to members via frame_meta->pad_index.
+//
+// N==1 degenerates to the old SingleCameraPipeline shape, including
+// the bespoke solo graphs (record-only "none" cameras and
+// rotation/mtx_proxy transcode cameras — the planner never batches
+// those).
+class GroupPipeline {
 public:
-    SingleCameraPipeline(CameraConfig cam, std::string recordings_dir,
-                         std::string infer_config, bool use_deepstream,
-                         bool use_anpr, bool use_face_id,
-                         NatsPublisher* nats);
-    ~SingleCameraPipeline();
+    GroupPipeline(std::string group_id, std::vector<CameraConfig> members,
+                  std::string recordings_dir, std::string infer_config,
+                  bool use_deepstream, bool use_anpr, bool use_face_id,
+                  NatsPublisher* nats);
+    ~GroupPipeline();
 
     bool Start();
     void Stop();
 
+    size_t MemberCount() const { return sources_.size(); }
+    const CameraConfig& Member(size_t i) const { return sources_[i]->cam; }
+    std::uint64_t FramesForSource(size_t i) const {
+        return sources_[i]->frames.load(std::memory_order_relaxed);
+    }
+    std::uint64_t TotalFrames() const {
+        std::uint64_t t = 0;
+        for (const auto& s : sources_) t += s->frames.load(std::memory_order_relaxed);
+        return t;
+    }
+    // True when the graph contains an inference branch (frames counters
+    // advance). Record-only solo graphs have no counters to watch.
+    bool HasInference() const { return has_inference_; }
+
+    bool Faulted() const { return faulted_.load(); }
+    bool Playing() const { return playing_.load(); }
+    void Fault() { faulted_.store(true); }
+
 private:
     GstElement* BuildPipeline();
+    // Builds the per-member source string (rtspsrc → ... → tee legs)
+    // for member i, appending to `p`. Solo bespoke shapes are handled
+    // inside BuildPipeline directly.
     static gboolean BusHandler(GstBus*, GstMessage*, gpointer user_data);
 
-    CameraConfig     cam_;
+    std::string      group_id_;
+    std::vector<std::unique_ptr<SourceRuntime>> sources_;
     std::string      recordings_dir_;
     std::string      infer_config_;
     bool             use_deepstream_;
     bool             use_anpr_ = false;
     bool             use_face_id_ = false;
+    bool             has_inference_ = false;
     NatsPublisher*   nats_ = nullptr;
     GstElement*      pipeline_ = nullptr;
     guint            bus_watch_id_ = 0;
     std::atomic<bool> faulted_{false};
-    // Flips true the first time the bus reports GST_STATE_PLAYING.
-    // Used by main.cpp's watchdog to detect "pipeline never rolled"
-    // — e.g. rtspsrc hung between TCP connect and SETUP reply.
     std::atomic<bool> playing_{false};
-    // Reserved for a re-introduced flow watchdog (the previous one
-    // monitored a recparse element that no longer exists; tracked
-    // for revival on a still-flowing pad such as tracker.src or the
-    // rtspclientsink request pad).
-    std::atomic<std::uint64_t> buffersPassed_{0};
 
-    // Target dimensions for the inference branch. Zero until
-    // BuildPipeline has probed the source; caps for nvstreammux key
-    // off these so aspect is preserved end-to-end.
-    int rec_width_ = 0;
-    int rec_height_ = 0;
-    // Codec carried on the gst tee — "h264" or "h265". Drives the
-    // rtspclientsink branch's parser choice so MediaMTX receives a
-    // clean elementary stream.
-    std::string pipeline_codec_ = "h264";
-
-public:
-    bool Faulted() const { return faulted_.load(); }
-    bool Playing() const { return playing_.load(); }
-    void Fault() { faulted_.store(true); }
-    // Sampled by the (currently disabled) flow watchdog.
-    std::uint64_t BuffersPassed() const { return buffersPassed_.load(); }
+    // Mux canvas. N==1: probed source dims (aspect-exact, no
+    // letterbox). N>1: fixed canvas; sources letterbox into it and the
+    // probes invert the mapping when normalising bboxes.
+    int mux_w_ = 0;
+    int mux_h_ = 0;
 };
 
 }  // namespace fnvr

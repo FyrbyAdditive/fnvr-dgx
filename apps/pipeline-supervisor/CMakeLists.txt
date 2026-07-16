@@ -31,6 +31,7 @@ add_executable(pipeline-supervisor
   src/nats_publisher.cpp
   src/config.cpp
   src/db_reconciler.cpp
+  src/grouping.cpp
   src/rtsp_probe.cpp
   src/surface_alloc.cpp
   src/preview_probe.cpp

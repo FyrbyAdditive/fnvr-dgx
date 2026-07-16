@@ -242,6 +242,9 @@ services:
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
       FNVR_USE_DEEPSTREAM: "${FNVR_USE_DEEPSTREAM:-1}"
       FNVR_RECONCILE_SEC: "${FNVR_RECONCILE_SEC:-5}"
+      # Max cameras per batched-mux worker group; also sizes the shared
+      # TRT engine's max batch ($BATCH in the nvinfer template).
+      FNVR_GROUP_MAX: "${FNVR_GROUP_MAX:-8}"
       # Some GStreamer elements g_assert on non-fatal conditions. Unset
       # G_DEBUG so fatal-warnings are off — without this, one bad camera
       # can crash-kill all the others sharing the supervisor process.

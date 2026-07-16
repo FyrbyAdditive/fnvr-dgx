@@ -10,12 +10,15 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <sys/stat.h>
 
 #if __has_include(<nvbufsurface.h>)
 #include <nvbufsurface.h>
 #include <nvbufsurftransform.h>
+#include <gstnvdsmeta.h>
+#include <nvdsmeta.h>
 #define FNVR_HAS_DEEPSTREAM 1
 #else
 #define FNVR_HAS_DEEPSTREAM 0
@@ -24,50 +27,45 @@
 namespace fnvr {
 
 namespace {
-// Output thumbnail dimensions. 480×270 is 16:9; non-16:9 sources are
-// scaled-fit (no letterbox) since this image is only used as a tile
-// fallback / snapshot — no bbox alignment needs preserving.
+// Output thumbnail dimensions. 480×270 is 16:9; non-16:9 content is
+// scaled-fit — this image is only a tile fallback / snapshot.
 constexpr int kOutW = 480;
 constexpr int kOutH = 270;
 constexpr int kQuality = 75;
 
-// Ring depth — matches the historical multifilesink max-files=4
-// contract. The api-server snapshot reader globs <id>.*.jpg and picks
-// the second-newest mtime (snapshot.go:99-141), so the ring needs at
-// least 2 entries to never serve a half-written file. We keep 4 for
-// belt-and-braces; with our atomic tmp+rename writes any of the 4 is
-// always a complete JPEG.
+// Ring depth — the api-server snapshot reader picks the second-newest
+// entry, so ≥2 entries are needed; 4 is belt-and-braces.
 constexpr int kRingSize = 4;
 
-// 1 fps cadence. The first eligible frame fires immediately so the
-// snapshot endpoint has something to serve as soon as the pipeline
-// reaches PLAYING.
+// 1 fps cadence per camera.
 constexpr auto kInterval = std::chrono::milliseconds(1000);
 }  // namespace
 
-struct PreviewProbeCtx {
+struct PreviewSource {
     std::string camera_id;
+    std::chrono::steady_clock::time_point last_emit{};  // 0 = never
+    int ring_idx = 0;
+};
+
+struct PreviewProbeCtx {
     std::string live_dir;
-    int         source_width  = 0;
-    int         source_height = 0;
+    std::vector<PreviewSource> sources;  // ordered by pad index
 
-    std::mutex                            ctx_mu;        // serialises the slow path
-    std::chrono::steady_clock::time_point last_emit{};   // 0 = never
-    int                                   ring_idx = 0;  // 0..kRingSize-1
-
+    std::mutex ctx_mu;  // serialises the transform+encode slow path
 #if FNVR_HAS_DEEPSTREAM
-    NvBufSurface* dst_surf = nullptr;
+    NvBufSurface* dst_surf = nullptr;  // shared, reused across members
 #endif
 };
 
-PreviewProbeCtx* preview_probe_ctx_new(std::string camera_id,
-                                       std::string live_dir,
-                                       int src_w, int src_h) {
+PreviewProbeCtx* preview_probe_ctx_new(std::vector<std::string> camera_ids,
+                                       std::string live_dir) {
     auto* ctx = new PreviewProbeCtx;
-    ctx->camera_id     = std::move(camera_id);
-    ctx->live_dir      = std::move(live_dir);
-    ctx->source_width  = src_w  > 0 ? src_w  : 1920;
-    ctx->source_height = src_h > 0 ? src_h : 1080;
+    ctx->live_dir = std::move(live_dir);
+    for (auto& id : camera_ids) {
+        PreviewSource s;
+        s.camera_id = std::move(id);
+        ctx->sources.push_back(std::move(s));
+    }
     return ctx;
 }
 
@@ -87,27 +85,24 @@ void preview_probe_ctx_free(PreviewProbeCtx* ctx) {
 namespace {
 
 // Lazily allocate the reusable RGBA destination at the gpuId of the
-// first observed input surface. The surface is reused across every
-// encode, so the cost is paid once per worker. memType decision
-// (CUDA_UNIFIED on GB10) lives in surface_alloc.cpp.
+// first observed input surface. memType decision (CUDA_UNIFIED on
+// GB10) lives in surface_alloc.cpp.
 bool ensureDstSurface(PreviewProbeCtx* ctx, NvBufSurface* in_surf) {
     if (ctx->dst_surf) return true;
-
     if (!AllocCpuReadableRGBA(&ctx->dst_surf, kOutW, kOutH, in_surf->gpuId)) {
-        std::cerr << "preview_probe[" << ctx->camera_id
-                  << "]: AllocCpuReadableRGBA failed\n";
+        std::cerr << "preview_probe: AllocCpuReadableRGBA failed\n";
         ctx->dst_surf = nullptr;
         return false;
     }
     return true;
 }
 
-// Encode the dst_surf to the next ring slot using tmp + rename so the
-// api-server reader (which sorts by mtime) never sees a partial file.
-bool writeRingEntry(PreviewProbeCtx* ctx) {
+// Encode dst_surf into the member's next ring slot (tmp + rename so a
+// partial JPEG is never observable).
+bool writeRingEntry(PreviewProbeCtx* ctx, PreviewSource& src) {
     NvBufSurfaceParams& dp = ctx->dst_surf->surfaceList[0];
     if (NvBufSurfaceMap(ctx->dst_surf, 0, 0, NVBUF_MAP_READ) != 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << src.camera_id
                   << "]: NvBufSurfaceMap failed\n";
         return false;
     }
@@ -117,34 +112,30 @@ bool writeRingEntry(PreviewProbeCtx* ctx) {
         static_cast<const std::uint8_t*>(dp.mappedAddr.addr[0]);
     const int stride = static_cast<int>(dp.pitch);
 
-    // Build paths: live_dir/<id>.<n>.jpg.tmp → live_dir/<id>.<n>.jpg
     char tmp_path[512];
     char out_path[512];
     std::snprintf(tmp_path, sizeof(tmp_path), "%s/%s.%d.jpg.tmp",
-                  ctx->live_dir.c_str(), ctx->camera_id.c_str(), ctx->ring_idx);
+                  ctx->live_dir.c_str(), src.camera_id.c_str(), src.ring_idx);
     std::snprintf(out_path, sizeof(out_path), "%s/%s.%d.jpg",
-                  ctx->live_dir.c_str(), ctx->camera_id.c_str(), ctx->ring_idx);
+                  ctx->live_dir.c_str(), src.camera_id.c_str(), src.ring_idx);
 
     bool ok = encodeJpegRGBA(rgba, stride, 0, 0, kOutW, kOutH, kQuality,
                              tmp_path);
     NvBufSurfaceUnMap(ctx->dst_surf, 0, 0);
 
     if (!ok) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << src.camera_id
                   << "]: encodeJpegRGBA failed\n";
         std::remove(tmp_path);
         return false;
     }
-
     if (std::rename(tmp_path, out_path) != 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
-                  << "]: rename(" << tmp_path << " -> " << out_path
-                  << ") failed: " << std::strerror(errno) << "\n";
+        std::cerr << "preview_probe[" << src.camera_id
+                  << "]: rename failed: " << std::strerror(errno) << "\n";
         std::remove(tmp_path);
         return false;
     }
-
-    ctx->ring_idx = (ctx->ring_idx + 1) % kRingSize;
+    src.ring_idx = (src.ring_idx + 1) % kRingSize;
     return true;
 }
 
@@ -157,27 +148,27 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
     auto* ctx = static_cast<PreviewProbeCtx*>(user);
     if (!ctx) return GST_PAD_PROBE_OK;
 
-    // Rate-limit BEFORE touching the buffer so the hot path is two
-    // atomic loads and a compare. Branch is unpredictable at startup
-    // (last_emit == 0) but cheap at steady state.
-    const auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lock(ctx->ctx_mu);
-        if (ctx->last_emit.time_since_epoch().count() != 0 &&
-            now - ctx->last_emit < kInterval) {
-            return GST_PAD_PROBE_OK;
-        }
-        // Optimistically advance last_emit BEFORE doing the work — if
-        // the work fails, we still wait the full interval before the
-        // next attempt rather than retrying every frame.
-        ctx->last_emit = now;
-    }
-
 #if !FNVR_HAS_DEEPSTREAM
+    (void)info;
     return GST_PAD_PROBE_OK;
 #else
     GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
     if (!buf) return GST_PAD_PROBE_OK;
+
+    NvDsBatchMeta* batch = gst_buffer_get_nvds_batch_meta(buf);
+    if (!batch) return GST_PAD_PROBE_OK;
+
+    // Cheap pre-check without the lock: does ANY member want a frame?
+    const auto now = std::chrono::steady_clock::now();
+    bool any_due = false;
+    for (const auto& s : ctx->sources) {
+        if (s.last_emit.time_since_epoch().count() == 0 ||
+            now - s.last_emit >= kInterval) {
+            any_due = true;
+            break;
+        }
+    }
+    if (!any_due) return GST_PAD_PROBE_OK;
 
     // GPU transform session for this streaming thread (no VIC on GB10).
     EnsureGpuTransformSession();
@@ -191,62 +182,67 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
     }
 
     std::lock_guard<std::mutex> lock(ctx->ctx_mu);
-
     if (!ensureDstSurface(ctx, in_surf)) {
         gst_buffer_unmap(buf, &map);
         return GST_PAD_PROBE_OK;
     }
 
-    // First populated frame in the batch is the camera's frame.
-    // nvstreammux with batch-size=1 always sets numFilled to 1.
-    if (in_surf->numFilled == 0) {
-        gst_buffer_unmap(buf, &map);
-        return GST_PAD_PROBE_OK;
+    for (NvDsMetaList* fl = batch->frame_meta_list; fl; fl = fl->next) {
+        auto* frame = static_cast<NvDsFrameMeta*>(fl->data);
+        if (!frame) continue;
+        const guint idx = frame->pad_index;
+        if (idx >= ctx->sources.size()) continue;
+        PreviewSource& src = ctx->sources[idx];
+        if (src.last_emit.time_since_epoch().count() != 0 &&
+            now - src.last_emit < kInterval) {
+            continue;
+        }
+        // Advance the clock BEFORE the work so failures still wait a
+        // full interval instead of retrying every batch.
+        src.last_emit = now;
+
+        if (frame->batch_id >= in_surf->numFilled) continue;
+        NvBufSurfaceParams& in_p = in_surf->surfaceList[frame->batch_id];
+
+        NvBufSurfTransformRect src_rect {
+            0, 0, guint(in_p.width), guint(in_p.height)
+        };
+        NvBufSurfTransformRect dst_rect {
+            0, 0, guint(kOutW), guint(kOutH)
+        };
+        NvBufSurfTransformParams tp{};
+        tp.src_rect = &src_rect;
+        tp.dst_rect = &dst_rect;
+        tp.transform_flag =
+            NVBUFSURF_TRANSFORM_FILTER |
+            NVBUFSURF_TRANSFORM_CROP_SRC |
+            NVBUFSURF_TRANSFORM_CROP_DST;
+        tp.transform_filter = NvBufSurfTransformInter_Default;
+
+        NvBufSurface tmp_in = *in_surf;
+        tmp_in.surfaceList = &in_surf->surfaceList[frame->batch_id];
+        tmp_in.numFilled   = 1;
+        tmp_in.batchSize   = 1;
+
+        if (NvBufSurfTransform(&tmp_in, ctx->dst_surf, &tp)
+            != NvBufSurfTransformError_Success) {
+            std::cerr << "preview_probe[" << src.camera_id
+                      << "]: NvBufSurfTransform failed\n";
+            continue;
+        }
+        // Drain this thread's transform stream before writeRingEntry
+        // maps the destination for CPU reads.
+        SyncGpuTransformStream();
+
+        bool ok = writeRingEntry(ctx, src);
+        static std::atomic<int> first_ok{0};
+        if (ok && first_ok.exchange(1) == 0) {
+            std::cerr << "preview_probe[" << src.camera_id
+                      << "]: first JPEG ring entry written\n";
+        }
     }
-    NvBufSurfaceParams& in_p = in_surf->surfaceList[0];
 
-    NvBufSurfTransformRect src_rect {
-        0, 0, guint(in_p.width), guint(in_p.height)
-    };
-    NvBufSurfTransformRect dst_rect {
-        0, 0, guint(kOutW), guint(kOutH)
-    };
-    NvBufSurfTransformParams tp{};
-    tp.src_rect = &src_rect;
-    tp.dst_rect = &dst_rect;
-    tp.transform_flag =
-        NVBUFSURF_TRANSFORM_FILTER |
-        NVBUFSURF_TRANSFORM_CROP_SRC |
-        NVBUFSURF_TRANSFORM_CROP_DST;
-    tp.transform_filter = NvBufSurfTransformInter_Default;
-
-    NvBufSurface tmp_in = *in_surf;
-    tmp_in.surfaceList = &in_surf->surfaceList[0];
-    tmp_in.numFilled   = 1;
-    tmp_in.batchSize   = 1;
-
-    if (NvBufSurfTransform(&tmp_in, ctx->dst_surf, &tp)
-        != NvBufSurfTransformError_Success) {
-        std::cerr << "preview_probe[" << ctx->camera_id
-                  << "]: NvBufSurfTransform failed\n";
-        gst_buffer_unmap(buf, &map);
-        return GST_PAD_PROBE_OK;
-    }
-    // Drain this thread's transform stream before writeRingEntry maps
-    // the destination for CPU reads.
-    SyncGpuTransformStream();
-
-    bool ok = writeRingEntry(ctx);
     gst_buffer_unmap(buf, &map);
-
-    // One-shot liveness log on first successful write so the operator
-    // can confirm the probe is engaged; silent thereafter.
-    static std::atomic<int> first_ok{0};
-    if (ok && first_ok.exchange(1) == 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
-                  << "]: first JPEG ring entry written\n";
-    }
-
     return GST_PAD_PROBE_OK;
 #endif
 }

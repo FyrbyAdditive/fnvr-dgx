@@ -85,6 +85,10 @@ fi
 
 VARIANT="${FNVR_YOLO_VARIANT:-yolo26x}"
 PRECISION="${FNVR_YOLO_PRECISION:-fp16}"
+# Max nvinfer batch = max batched-mux group size. The supervisor chunks
+# camera groups at FNVR_GROUP_MAX members; the (dynamic-batch) engine is
+# built once at this max and serves every group size below it.
+BATCH="${FNVR_GROUP_MAX:-8}"
 
 SETTINGS_URL="${FNVR_SETTINGS_URL:-http://api:8081/api/v1/internal/detector}"
 if command -v curl >/dev/null 2>&1; then
@@ -258,7 +262,7 @@ if [ "$PRECISION" = "int8" ]; then
     INT8_LINE="int8-calib-file=$YOLO_DEST/${VARIANT}.calib.table"
 fi
 
-ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
+ENGINE_FILE="$YOLO_DEST/${VARIANT}.onnx_b${BATCH}_gpu0_${ENGINE_SUFFIX}.engine"
 ONNX_FILE="$YOLO_DEST/${VARIANT}.onnx"
 
 # Detect stale / corrupt engines so they get rebuilt on next startup:
@@ -313,14 +317,16 @@ echo "entrypoint: num-detected-classes=$NUM_CLASSES"
 # mounted read-only from the host's deploy/config, so put the rendered
 # file on the fnvr-data volume next to the models.
 export MODEL="$VARIANT"
-export NETWORK_MODE ENGINE_SUFFIX INT8_LINE NUM_CLASSES
+export BATCH NETWORK_MODE ENGINE_SUFFIX INT8_LINE NUM_CLASSES
 EFFECTIVE_CFG="$YOLO_DEST/yolo26.effective.txt"
 if command -v envsubst >/dev/null 2>&1; then
-    envsubst '$MODEL $NETWORK_MODE $ENGINE_SUFFIX $INT8_LINE $NUM_CLASSES' \
+    envsubst '$MODEL $BATCH $NETWORK_MODE $ENGINE_SUFFIX $INT8_LINE $NUM_CLASSES' \
         < /etc/fnvr/nvinfer/yolo26.txt.template \
         > "$EFFECTIVE_CFG"
 else
     sed \
+        -e "s|\${BATCH}|$BATCH|g" \
+        -e "s|\$BATCH|$BATCH|g" \
         -e "s|\$MODEL|$MODEL|g" \
         -e "s|\$NETWORK_MODE|$NETWORK_MODE|g" \
         -e "s|\$ENGINE_SUFFIX|$ENGINE_SUFFIX|g" \
@@ -355,7 +361,7 @@ echo "entrypoint: FNVR_INFER_CONFIG=$FNVR_INFER_CONFIG"
 #     renamed file survives container recreate.
 #   - We rename (not copy) so the watcher exits as soon as the work
 #     is done; no growing process count.
-EXPECTED_ENGINE="$YOLO_DEST/${VARIANT}.onnx_b1_gpu0_${ENGINE_SUFFIX}.engine"
+EXPECTED_ENGINE="$YOLO_DEST/${VARIANT}.onnx_b${BATCH}_gpu0_${ENGINE_SUFFIX}.engine"
 if [ ! -f "$EXPECTED_ENGINE" ]; then
     (
         # Workers build into PWD which is /src/apps/pipeline-supervisor
@@ -363,8 +369,8 @@ if [ ! -f "$EXPECTED_ENGINE" ]; then
         # location in case of layout drift.
         for _ in $(seq 1 600); do  # up to 10 min
             for stray in \
-                /src/apps/pipeline-supervisor/model_b1_gpu0_${ENGINE_SUFFIX}.engine \
-                ./model_b1_gpu0_${ENGINE_SUFFIX}.engine \
+                /src/apps/pipeline-supervisor/model_b${BATCH}_gpu0_${ENGINE_SUFFIX}.engine \
+                ./model_b${BATCH}_gpu0_${ENGINE_SUFFIX}.engine \
                 ; do
                 if [ -f "$stray" ] && [ ! -f "$EXPECTED_ENGINE" ]; then
                     sleep 2  # tiny grace so the writer has flushed

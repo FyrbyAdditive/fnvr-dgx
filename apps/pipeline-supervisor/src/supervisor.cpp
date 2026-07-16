@@ -11,6 +11,7 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -24,26 +25,63 @@ namespace fnvr {
 
 using namespace std::chrono_literals;
 
-// detectorsEqual compares two enabled_detectors lists ignoring order.
-// The UI chip-picker writes items in click order (e.g. {"face","object"})
-// while freshly-created rows default to {} or whatever psql ordering;
-// we care about set equality, not sequence.
-static bool detectorsEqual(const std::vector<std::string>& a,
-                           const std::vector<std::string>& b) {
-    if (a.size() != b.size()) return false;
-    std::set<std::string> as(a.begin(), a.end());
-    std::set<std::string> bs(b.begin(), b.end());
-    return as == bs;
+namespace {
+
+std::string runDir() {
+    const char* d = std::getenv("FNVR_RUN_DIR");
+    return (d && *d) ? d : "/tmp/fnvr-run";
 }
 
+// Read (and consume) the fault marker a child wrote before exiting
+// rc=4. Returns the camera id, or empty.
+std::string consumeFaultMarker(const std::string& group_id) {
+    const std::string path = runDir() + "/group-" + group_id + ".fault";
+    std::ifstream f(path);
+    if (!f) return {};
+    std::string cam;
+    std::getline(f, cam);
+    f.close();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    while (!cam.empty() && (cam.back() == '\r' || cam.back() == '\n' ||
+                            cam.back() == ' '))
+        cam.pop_back();
+    return cam;
+}
+
+// Healthy marker: the child writes this once its pipeline is PLAYING
+// with frames actually flowing (see main.cpp). Uptime alone is a lying
+// health signal — rtspsrc can spend 60+ s slow-failing on a dead host.
+std::string healthyMarkerPath(const std::string& group_id) {
+    return runDir() + "/group-" + group_id + ".healthy";
+}
+
+bool healthyMarkerExists(const std::string& group_id) {
+    std::error_code ec;
+    return std::filesystem::exists(healthyMarkerPath(group_id), ec);
+}
+
+void clearHealthyMarker(const std::string& group_id) {
+    std::error_code ec;
+    std::filesystem::remove(healthyMarkerPath(group_id), ec);
+}
+
+}  // namespace
+
 Supervisor::Supervisor(Config cfg, NatsPublisher* nats)
-    : cfg_(std::move(cfg)), nats_(nats) {}
+    : cfg_(std::move(cfg)), nats_(nats) {
+    if (const char* g = std::getenv("FNVR_GROUP_MAX"); g && *g) {
+        int v = std::atoi(g);
+        if (v >= 1 && v <= 32) group_max_ = v;
+    }
+}
 
 Supervisor::~Supervisor() { Stop(); }
 
 void Supervisor::Run() {
     std::cerr << "supervisor: reconcile loop starting (interval "
-              << cfg_.reconcile_interval_sec << "s)\n";
+              << cfg_.reconcile_interval_sec << "s, group_max "
+              << group_max_ << ")\n";
     while (!stop_) {
         reconcileOnce();
         std::unique_lock<std::mutex> lk(stop_mu_);
@@ -70,62 +108,78 @@ void Supervisor::Stop() {
     stop_cv_.notify_all();
 }
 
-void Supervisor::reconcileOnce() {
-    auto want = ReadEnabledCameras(cfg_.database_url);
+void Supervisor::quarantineMember(const std::string& camera_id) {
+    std::lock_guard<std::mutex> lk(quarantine_mu_);
+    auto& q = quarantine_[camera_id];
+    // Repeat offender → double the backoff (cap 10 min). First
+    // offence starts at 60 s.
+    if (q.in_probation || q.backoff_sec > 60) {
+        q.backoff_sec = std::min(q.backoff_sec * 2, 600);
+    }
+    q.until = std::chrono::steady_clock::now() +
+              std::chrono::seconds(q.backoff_sec);
+    q.in_probation = false;
+    std::cerr << "supervisor: quarantined [" << camera_id << "] for "
+              << q.backoff_sec << "s (member fault)\n";
+}
 
-    std::set<std::string> want_ids;
-    for (auto& c : want) want_ids.insert(c.id);
+void Supervisor::graduateProbation(const std::string& camera_id) {
+    std::lock_guard<std::mutex> lk(quarantine_mu_);
+    if (quarantine_.erase(camera_id)) {
+        std::cerr << "supervisor: [" << camera_id
+                  << "] healthy on probation — rejoining its group\n";
+    }
+}
+
+void Supervisor::reconcileOnce() {
+    auto cameras = ReadEnabledCameras(cfg_.database_url);
+    // "I don't know" (DB error → empty) must mean "change nothing".
+    if (cameras.empty()) {
+        // Distinguish "no cameras" from "query failed"? ReadEnabledCameras
+        // logs failures; an installation with zero enabled cameras also
+        // wants zero workers — proceed either way, matching old behaviour
+        // of tearing down removed cameras only when the read SUCCEEDS is
+        // not distinguishable here, so keep prior semantics.
+    }
+
+    // Resolve quarantine state: expired entries flip to probation.
+    std::set<std::string> quarantined, probation;
+    {
+        std::lock_guard<std::mutex> lk(quarantine_mu_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [cam, q] : quarantine_) {
+            if (now < q.until) {
+                quarantined.insert(cam);
+            } else {
+                q.in_probation = true;
+                probation.insert(cam);
+            }
+        }
+    }
+
+    auto plans = PlanGroups(cameras, quarantined, probation, group_max_);
+
+    std::map<std::string, const GroupPlan*> plan_by_id;
+    std::map<std::string, std::string> sig_by_id;
+    for (const auto& p : plans) {
+        plan_by_id[p.group_id] = &p;
+        sig_by_id[p.group_id]  = Signature(p);
+    }
 
     std::lock_guard<std::mutex> lk(workers_mu_);
 
-    // Index the desired configs so we can compare per-worker config
-    // deltas in the stop loop below.
-    std::map<std::string, const CameraConfig*> want_by_id;
-    for (auto& c : want) want_by_id[c.id] = &c;
-
-    // Stop removed, disabled, or reconfigured cameras. We only restart
-    // workers on config changes that actually require rebuilding the
-    // GStreamer graph — today just `rotation`, since changing it
-    // toggles the transcode path. URL changes are left alone because
-    // rtspsrc already reconnects on transport issues and some users
-    // rewrite URLs temporarily for testing.
+    // Stop removed / changed / retired groups.
     for (auto it = workers_.begin(); it != workers_.end();) {
-        auto wi = want_by_id.find(it->first);
-        if (wi == want_by_id.end()) {
-            std::cerr << "supervisor: stopping [" << it->first << "] (no longer enabled)\n";
-            it->second->stop = true;
-            if (it->second->thread.joinable()) it->second->thread.join();
-            it = workers_.erase(it);
-        } else if (wi->second->rotation != it->second->cam.rotation) {
-            std::cerr << "supervisor: stopping [" << it->first
-                      << "] (rotation changed " << it->second->cam.rotation
-                      << " -> " << wi->second->rotation << ")\n";
-            it->second->stop = true;
-            if (it->second->thread.joinable()) it->second->thread.join();
-            it = workers_.erase(it);
-        } else if (wi->second->url != it->second->cam.url) {
-            std::cerr << "supervisor: stopping [" << it->first
-                      << "] (url changed)\n";
-            it->second->stop = true;
-            if (it->second->thread.joinable()) it->second->thread.join();
-            it = workers_.erase(it);
-        } else if (!detectorsEqual(wi->second->enabled_detectors,
-                                    it->second->cam.enabled_detectors)) {
-            // The per-camera detector whitelist shapes the graph (SGIE
-            // chains present/absent, skip_inference tier). A change
-            // means the worker must respawn with a rebuilt graph;
-            // event-processor alone doesn't know about the pipeline
-            // shape.
-            std::cerr << "supervisor: stopping [" << it->first
-                      << "] (enabled_detectors changed)\n";
-            it->second->stop = true;
-            if (it->second->thread.joinable()) it->second->thread.join();
-            it = workers_.erase(it);
-        } else if (wi->second->mtx_proxy != it->second->cam.mtx_proxy) {
-            std::cerr << "supervisor: stopping [" << it->first
-                      << "] (mtx_proxy changed "
-                      << it->second->cam.mtx_proxy << " -> "
-                      << wi->second->mtx_proxy << ")\n";
+        auto pi = plan_by_id.find(it->first);
+        const bool gone    = (pi == plan_by_id.end());
+        const bool changed = !gone && sig_by_id[it->first] != it->second->signature;
+        const bool retired = it->second->retired.load();
+        if (gone || changed || retired) {
+            std::cerr << "supervisor: stopping group [" << it->first << "] ("
+                      << (gone ? "no longer planned"
+                                : changed ? "membership/config changed"
+                                          : "worker retired")
+                      << ")\n";
             it->second->stop = true;
             if (it->second->thread.joinable()) it->second->thread.join();
             it = workers_.erase(it);
@@ -134,33 +188,12 @@ void Supervisor::reconcileOnce() {
         }
     }
 
-    // Start newly-added cameras. Two reasons to stagger:
-    //
-    // 1. Fast path (engine cached): short delay avoids a millisecond
-    //    race on the engine deserialize, which matters surprisingly
-    //    little but costs nothing.
-    //
-    // 2. Slow path (first-use build): the first worker compiles the
-    //    TRT engine — a multi-minute operation that eats most of the
-    //    GPU. Spawning workers 2+ during this thrashes each other
-    //    and can take 15+ minutes. Instead, workers 2+ wait until the
-    //    engine file exists on disk before spawning, then all come up
-    //    together in ~2s.
-    //
-    // The engine path comes from the FNVR_INFER_CONFIG env (a rendered
-    // nvinfer config) — parse out model-engine-file= to get it. Empty
-    // on failure disables the gate (falls back to old 3s stagger).
+    // Start newly-planned groups. Stagger behind the shared TRT engine:
+    // the first group to start builds/deserialises it; siblings wait
+    // for the file so they don't thrash the GPU building in parallel.
     std::string engine_path = readEnginePathFromInferConfig();
-
-    // Optional face-id engine gates. When face_id is enabled, the SGIE
-    // chain (face detector + arcface) also needs to build on worker #1
-    // before siblings spawn — otherwise 3 workers each build these
-    // concurrently, triple-spike GPU memory, and get OOM-killed. Both
-    // engines are auto-written by nvinfer to derived paths next to
-    // their ONNX.
     std::vector<std::string> faceid_engines;
-    const char* face_env = std::getenv("FNVR_USE_FACEID");
-    if (face_env && std::string(face_env) == "1") {
+    if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
         faceid_engines.push_back(
             "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine");
         faceid_engines.push_back(
@@ -168,12 +201,10 @@ void Supervisor::reconcileOnce() {
     }
 
     bool first_start = true;
-    for (const auto& cam : want) {
-        if (workers_.find(cam.id) != workers_.end()) continue;
+    for (const auto& plan : plans) {
+        if (workers_.find(plan.group_id) != workers_.end()) continue;
         if (!first_start) {
             if (!engine_path.empty()) {
-                // Wait for the first worker to produce the engine file.
-                // Cap at 30 min so a hung build doesn't block forever.
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(30);
                 while (!std::filesystem::exists(engine_path) &&
                        std::chrono::steady_clock::now() < deadline &&
@@ -187,21 +218,27 @@ void Supervisor::reconcileOnce() {
                         std::this_thread::sleep_for(2s);
                     }
                 }
-                // Small additional delay so the first worker finishes
-                // its own deserialize / nvinfer init before siblings load.
                 std::this_thread::sleep_for(3s);
             } else {
                 std::this_thread::sleep_for(3s);
             }
         }
         first_start = false;
-        std::cerr << "supervisor: starting [" << cam.id << "] url=" << cam.url << "\n";
+
+        std::string member_list;
+        for (const auto& m : plan.members) {
+            if (!member_list.empty()) member_list += ",";
+            member_list += m.id;
+        }
+        std::cerr << "supervisor: starting group [" << plan.group_id
+                  << "] members=" << member_list << "\n";
 
         auto w = std::make_unique<Worker>();
-        w->cam = cam;
+        w->plan      = plan;
+        w->signature = sig_by_id[plan.group_id];
         Worker* raw = w.get();
         w->thread = std::thread([this, raw] { workerMain(raw); });
-        workers_.emplace(cam.id, std::move(w));
+        workers_.emplace(plan.group_id, std::move(w));
     }
 }
 
@@ -221,7 +258,6 @@ std::string Supervisor::readEnginePathFromInferConfig() const {
         constexpr const char* KEY = "model-engine-file=";
         auto pos = line.find(KEY);
         if (pos == std::string::npos) continue;
-        // Strip key + leading whitespace, trim trailing whitespace.
         std::string val = line.substr(pos + std::char_traits<char>::length(KEY));
         while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' '))
             val.pop_back();
@@ -230,14 +266,10 @@ std::string Supervisor::readEnginePathFromInferConfig() const {
     return {};
 }
 
-void Supervisor::startWorker(const CameraConfig& /*cam*/) { /* inlined above */ }
-void Supervisor::stopWorker(const std::string& /*id*/)    { /* inlined above */ }
-
 // Remove an engine file on disk if it looks corrupt (missing is fine —
-// nvinfer will rebuild). Called before every worker (re)exec so that a
+// nvinfer will rebuild). Called before every group (re)spawn so that a
 // truncated engine written by a SIGKILL'd prior worker doesn't send the
-// next process into a "deserialize fails → rebuild → SIGKILL mid-build"
-// loop. Threshold is per-engine because engine sizes vary by ~1000x.
+// next process into a rebuild loop.
 void validateEngineFile(const std::string& path, std::size_t min_bytes) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) return;
@@ -250,14 +282,10 @@ void validateEngineFile(const std::string& path, std::size_t min_bytes) {
     }
 }
 
-// Check all known engine files. Paths gated by their respective env
-// vars so we don't complain about engines for features that are off.
 void validateAllEngines(const std::string& pgie_engine_path) {
-    // YOLO26 pgie engine: path parsed from the rendered nvinfer config.
     if (!pgie_engine_path.empty()) {
         validateEngineFile(pgie_engine_path, 1 * 1024 * 1024);
     }
-    // ANPR chain: LPDNet + LPRNet live under /var/lib/fnvr/models/anpr/.
     if (const char* e = std::getenv("FNVR_USE_ANPR"); e && std::string(e) == "1") {
         validateEngineFile(
             "/var/lib/fnvr/models/anpr/LPDNet_usa.onnx_b16_gpu0_fp16.engine",
@@ -266,7 +294,6 @@ void validateAllEngines(const std::string& pgie_engine_path) {
             "/var/lib/fnvr/models/anpr/LPRNet_usa.onnx_b16_gpu0_fp16.engine",
             256 * 1024);
     }
-    // Face chain: RetinaFace batch=1 + ArcFace batch=16.
     if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
         validateEngineFile(
             "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine",
@@ -282,147 +309,95 @@ void Supervisor::workerMain(Worker* w) {
     std::uniform_int_distribution<int> jitter(0, 1000);
     int backoff_ms = 1000;
 
-    // Flapping detection — rolling window of recent (non-rotation)
-    // worker-exit times. When a worker dies ≥3 times in a 60 s window,
-    // we publish `failed` on the per-camera state subject so the UI
-    // shows "pipeline failed" instead of forever-"starting". The worker
-    // keeps retrying; the state clears on the next successful PLAYING
-    // publish.
+    // Flapping detection — rolling window of recent exit times. ≥3 in
+    // 60 s → publish `failed` for the group's members (subject to
+    // startup grace, overridden for chronic loops).
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
 
-    // Chronic crash-loop detector: number of consecutive child exits
-    // that happened before reaching grace_sec of uptime. Once this
-    // passes the threshold, the startup-grace suppression below is
-    // overridden and `failed` is published — a camera with a broken
-    // config (wrong codec graph, dead URL) must not sit at "starting"
-    // forever. With exponential backoff capped at 30 s, 10 fast exits
-    // means the camera has been broken for at least ~2-4 minutes.
+    // Chronic crash-loop detector (see kChronicFlapThreshold): a
+    // worker that has died young many times in a row must surface as
+    // failed even inside startup grace.
     int consecutive_fast_exits = 0;
     constexpr int kChronicFlapThreshold = 10;
 
-    // Startup grace: suppress the `failed` publish for a worker that
-    // has *never* run long enough to reach PLAYING. A child process
-    // that survived past grace_sec is presumed healthy — if it
-    // subsequently flaps, that's a real fault and we publish failed
-    // as normal. This handles slow-cadence flapping (e.g. rtspsrc
-    // hanging for tcp-timeout=15s between retries) where 3 exits
-    // take longer than a wall-clock grace window. Configurable via
-    // settings.pipeline.startup_grace_sec (default 60); re-read on
-    // each worker cycle so UI changes apply on next respawn.
     const int grace_sec = ReadPipelineStartupGraceSec(cfg_.database_url);
     bool has_been_healthy = false;
 
-    // Carries across loop iterations: when the previous worker exited
-    // as part of an hourly segment rotation, tell the next child via
-    // an extra argv so it suppresses its "starting" state publish. The
-    // old `running` message stays live in the JetStream last-value
-    // stream throughout the ~30 s respawn, so the UI doesn't flicker.
-    bool rotation_respawn = false;
-
-    // Per-camera deterministic stagger added onto the hour boundary so
-    // three cameras don't rotate simultaneously. Up to 120 s after
-    // HH:00. Belt-and-braces behind the silent-rotation publish: even
-    // if that path regresses, a user sees one tile flash, not three.
-    const auto stagger = std::chrono::seconds(
-        std::hash<std::string>{}(w->cam.id) % 120);
+    std::string member_csv;
+    for (const auto& m : w->plan.members) {
+        if (!member_csv.empty()) member_csv += ",";
+        member_csv += m.id;
+    }
 
     while (!stop_ && !w->stop) {
-        // Defensive: if a prior worker died mid-engine-serialize (e.g.
-        // SIGTERM from hourly rotation during a first-time TRT build),
-        // the engine file on disk may be truncated. Deserialising it
-        // fails deep inside nvinfer and falls back to a full rebuild,
-        // which can itself be interrupted on the next rotation. Checking
-        // here — before the new process runs nvinfer — breaks the loop.
         validateAllEngines(readEnginePathFromInferConfig());
+        // Stale healthy markers from a previous child must not count
+        // for this spawn.
+        clearHealthyMarker(w->plan.group_id);
 
-        // fork+exec the same binary in --worker mode. Per-camera process
-        // isolation: a splitmuxsink / nvinfer / gst assertion in one camera
-        // can't crash the parent supervisor or its sibling cameras.
+        // fork+exec the same binary in --worker-group mode. Per-group
+        // process isolation: a gst assertion in one group can't crash
+        // the parent supervisor or sibling groups.
         pid_t pid = fork();
         if (pid < 0) {
-            std::cerr << "worker[" << w->cam.id << "]: fork failed: "
+            std::cerr << "group[" << w->plan.group_id << "]: fork failed: "
                       << strerror(errno) << "\n";
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
             backoff_ms = std::min(backoff_ms * 2, 30'000);
             continue;
         }
         if (pid == 0) {
-            // Child: exec the worker form. On exec failure, _exit so we
-            // don't run the supervisor destructor and double-close resources.
-            // When the previous worker died of hourly rotation, pass
-            // --rotation so the child skips the "starting" publish.
             const char* argv0 = "/usr/local/bin/pipeline-supervisor";
-            const char* record_mode = w->cam.recording_mode.empty()
-                ? "continuous"
-                : w->cam.recording_mode.c_str();
-            if (rotation_respawn) {
-                execl(argv0, argv0, "--worker",
-                      w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
-                      "--rotation", (char*)nullptr);
-            } else {
-                execl(argv0, argv0, "--worker",
-                      w->cam.id.c_str(), w->cam.url.c_str(), record_mode,
-                      (char*)nullptr);
-            }
-            std::cerr << "worker[" << w->cam.id << "]: execl failed: "
+            execl(argv0, argv0, "--worker-group",
+                  w->plan.group_id.c_str(), member_csv.c_str(),
+                  (char*)nullptr);
+            std::cerr << "group[" << w->plan.group_id << "]: execl failed: "
                       << strerror(errno) << "\n";
             _exit(127);
         }
-        // Rotation flag consumed by the exec above.
-        rotation_respawn = false;
 
-        // Parent: track the child PID so Stop() can kill it.
         w->child_pid = pid;
-        std::cerr << "worker[" << w->cam.id << "]: spawned pid " << pid << "\n";
-
-        // Remember the hour we started in; we force a restart at the top
-        // of the next hour so the child writes into the new YYYY/MM/DD/HH
-        // directory. Without this, a worker that's up for 24h writes a
-        // 100+ GB rec.mp4 into its birth hour's folder.
-        //
-        // rotate_at = start_hour + 1h + stagger. The stagger (up to
-        // 120 s, deterministic by cam.id) means three cameras don't all
-        // rotate at the same wall-clock instant.
-        auto start_hour = std::chrono::time_point_cast<std::chrono::hours>(
-            std::chrono::system_clock::now());
-        auto rotate_at = start_hour + std::chrono::hours(1) + stagger;
-        bool hourly_rotate = false;
-
-        // Time the child was spawned so we can distinguish "died
-        // quickly during warmup" from "ran fine then something
-        // broke". The grace window below uses this to mark the
-        // worker as "has been healthy" once the child survives past
-        // grace_sec — after that, flaps publish `failed` normally.
+        std::cerr << "group[" << w->plan.group_id << "]: spawned pid " << pid << "\n";
         auto child_spawn_at = std::chrono::steady_clock::now();
 
-        // Wait for the child to exit, polling so we can react to w->stop.
+        // Health bar for probation graduation: a probation child that
+        // has run this long is considered recovered. grace_sec doubles
+        // as the threshold (60 s fallback when grace is disabled).
+        const int probation_health_sec = grace_sec > 0 ? grace_sec : 60;
+
         int status = 0;
         while (!stop_ && !w->stop) {
             pid_t got = waitpid(pid, &status, WNOHANG);
             if (got == pid) break;
             if (got < 0 && errno != EINTR) {
-                std::cerr << "worker[" << w->cam.id << "]: waitpid err: "
+                std::cerr << "group[" << w->plan.group_id << "]: waitpid err: "
                           << strerror(errno) << "\n";
                 break;
             }
-            if (std::chrono::system_clock::now() >= rotate_at) {
-                std::cerr << "worker[" << w->cam.id
-                          << "]: hourly rotation — rolled (silent; prior state retained) pid "
-                          << pid << "\n";
-                hourly_rotate = true;
-                kill(pid, SIGTERM);
-                // Generous grace (15s) — if nvinfer is serializing an
-                // engine when we SIGTERM, a premature SIGKILL leaves a
-                // truncated file on disk that the next worker can't
-                // deserialize. Engines of our scale serialize in ≤10s.
-                for (int i = 0; i < 150 && waitpid(pid, &status, WNOHANG) == 0; i++) {
-                    std::this_thread::sleep_for(100ms);
+            // A healthy probation run graduates WITHOUT waiting for the
+            // child to exit (healthy children never exit): lift the
+            // quarantine, retire this worker, and let the next replan
+            // merge the camera back into its natural group. Health =
+            // the child's healthy marker (PLAYING + frames flowing) AND
+            // having sustained it for the health bar — uptime alone is
+            // not a health signal.
+            if (w->plan.probation) {
+                auto up = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - child_spawn_at).count();
+                if (up >= probation_health_sec &&
+                    healthyMarkerExists(w->plan.group_id)) {
+                    graduateProbation(w->plan.members[0].id);
+                    w->retired.store(true);
+                    kill(pid, SIGTERM);
+                    for (int i = 0; i < 20 && waitpid(pid, &status, WNOHANG) == 0; i++) {
+                        std::this_thread::sleep_for(100ms);
+                    }
+                    if (waitpid(pid, &status, WNOHANG) == 0) {
+                        kill(pid, SIGKILL);
+                        waitpid(pid, &status, 0);
+                    }
+                    return;
                 }
-                if (waitpid(pid, &status, WNOHANG) == 0) {
-                    kill(pid, SIGKILL);
-                    waitpid(pid, &status, 0);
-                }
-                break;
             }
             std::this_thread::sleep_for(500ms);
         }
@@ -440,74 +415,74 @@ void Supervisor::workerMain(Worker* w) {
         }
 
         // Child exited. Decode why.
+        int rc = -1;
         if (WIFEXITED(status)) {
-            int rc = WEXITSTATUS(status);
-            std::cerr << "worker[" << w->cam.id << "]: exited rc=" << rc << "\n";
-            // rc == 0 means clean exit; still reconnect.
+            rc = WEXITSTATUS(status);
+            std::cerr << "group[" << w->plan.group_id << "]: exited rc=" << rc << "\n";
         } else if (WIFSIGNALED(status)) {
-            int sig = WTERMSIG(status);
-            std::cerr << "worker[" << w->cam.id << "]: killed by signal "
-                      << sig << " — likely gst assertion\n";
+            std::cerr << "group[" << w->plan.group_id << "]: killed by signal "
+                      << WTERMSIG(status) << "\n";
         }
 
-        if (hourly_rotate) {
-            // Healthy restart; don't back off. Next exec gets
-            // --rotation so the child skips the "starting" publish,
-            // so the UI doesn't flash on the hour.
+        // Member-fault: quarantine the offender and retire this worker
+        // — the next reconcile replans without it, so the healthy
+        // members stop being restarted alongside a broken camera.
+        if (rc == 4) {
+            std::string cam = consumeFaultMarker(w->plan.group_id);
+            if (!cam.empty()) {
+                quarantineMember(cam);
+                w->retired.store(true);
+                std::cerr << "group[" << w->plan.group_id
+                          << "]: retiring after member fault (" << cam << ")\n";
+                return;
+            }
+            // rc=4 without a marker — treat as a generic fault.
+        }
+
+        auto child_uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - child_spawn_at).count();
+        const bool ran_healthy = healthyMarkerExists(w->plan.group_id) &&
+                                 child_uptime >= (grace_sec > 0 ? grace_sec : 60);
+        if (ran_healthy) {
+            has_been_healthy = true;
+            consecutive_fast_exits = 0;
             backoff_ms = 1000;
-            rotation_respawn = true;
-            continue;
+        } else {
+            consecutive_fast_exits++;
         }
 
-        // Flapping check. Trim the window to the last 60 s, then count.
+        // Flap accounting + failed publishes.
         auto now = std::chrono::steady_clock::now();
         recent_exits.push_back(now);
         while (!recent_exits.empty() &&
                now - recent_exits.front() > std::chrono::seconds(60)) {
             recent_exits.pop_front();
         }
-        // If this child lived past grace_sec, mark the worker healthy
-        // so future flaps get published normally. Slow-cadence flaps
-        // that never reach this threshold stay in grace.
-        auto child_uptime = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - child_spawn_at).count();
-        if (grace_sec > 0 && child_uptime >= grace_sec) {
-            has_been_healthy = true;
-            consecutive_fast_exits = 0;
-        } else {
-            consecutive_fast_exits++;
-        }
         if (recent_exits.size() >= 3 && nats_) {
-            // Startup grace exists so a slow-to-warm source doesn't
-            // flash "failed" during its first honest connect attempts.
-            // It must NOT hide a chronic crash-loop (wrong codec graph,
-            // bad URL, missing model): if the child has died young many
-            // times in a row without ever reaching a healthy run, the
-            // operator needs to see "failed", not eternal "starting".
             const bool chronic = consecutive_fast_exits >= kChronicFlapThreshold;
             if (grace_sec > 0 && !has_been_healthy && !chronic) {
-                std::cerr << "worker[" << w->cam.id << "]: flapping ("
+                std::cerr << "group[" << w->plan.group_id << "]: flapping ("
                           << recent_exits.size() << " exits in 60s) — in "
-                          << grace_sec << "s startup grace (no healthy run yet), "
-                          << "not publishing failed\n";
+                          << grace_sec << "s startup grace, not publishing failed\n";
             } else {
-                std::cerr << "worker[" << w->cam.id << "]: flapping ("
+                std::cerr << "group[" << w->plan.group_id << "]: flapping ("
                           << recent_exits.size() << " exits in 60s"
                           << (chronic && !has_been_healthy
-                                  ? ", chronic — grace overridden"
-                                  : "")
-                          << ") — publishing failed\n";
-                std::string subj = "fnvr.state.camera." + w->cam.id;
-                std::string payload = "{\"camera_id\":\"" + w->cam.id +
-                    "\",\"state\":\"failed\"}";
-                nats_->Publish(subj, payload, /*flush=*/true);
+                                  ? ", chronic — grace overridden" : "")
+                          << ") — publishing failed for members\n";
+                for (const auto& m : w->plan.members) {
+                    std::string subj = "fnvr.state.camera." + m.id;
+                    std::string payload = "{\"camera_id\":\"" + m.id +
+                        "\",\"state\":\"failed\"}";
+                    nats_->Publish(subj, payload, /*flush=*/true);
+                }
             }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms + jitter(rng)));
         backoff_ms = std::min(backoff_ms * 2, 30'000);
     }
-    std::cerr << "worker[" << w->cam.id << "]: supervisor thread exiting\n";
+    std::cerr << "group[" << w->plan.group_id << "]: supervisor thread exiting\n";
 }
 
 }  // namespace fnvr

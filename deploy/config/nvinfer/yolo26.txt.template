@@ -6,6 +6,9 @@
 #
 # Placeholders resolved by the entrypoint:
 #   $MODEL         e.g. yolo26x / yolo26s / fnvr-v1 (custom-trained)
+#   $BATCH         max batch = FNVR_GROUP_MAX (batched-mux group size).
+#                  The ONNX is exported with dynamic batch, so one
+#                  b$BATCH engine serves every group size ≤ $BATCH.
 #   $NETWORK_MODE  2 for FP16, 1 for INT8
 #   $ENGINE_SUFFIX fp16 or int8 (in the engine filename, for cache keying)
 #   $INT8_LINE     empty line for FP16; "int8-calib-file=..." for INT8
@@ -18,9 +21,9 @@ gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
 onnx-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx
-model-engine-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx_b1_gpu0_$ENGINE_SUFFIX.engine
+model-engine-file=/var/lib/fnvr/models/yolo26/$MODEL.onnx_b${BATCH}_gpu0_$ENGINE_SUFFIX.engine
 labelfile-path=/var/lib/fnvr/models/yolo26/labels.txt
-batch-size=1
+batch-size=$BATCH
 # 4 GB workspace lets TensorRT pick its full tactic catalogue
 # during engine build. Without this nvinfer defaults to ~31 MB and
 # logs "Tactic Device request: 31MB Available: 27MB" while skipping

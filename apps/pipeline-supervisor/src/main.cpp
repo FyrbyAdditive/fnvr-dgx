@@ -1,12 +1,14 @@
-// pipeline-supervisor — M2.5 shape.
+// pipeline-supervisor — batched-mux shape.
 //
 // DB-driven reconciler. Every N seconds, reads the cameras table from
-// Postgres, diffs against a map of running per-camera threads, and starts
-// or stops workers to match. Each worker independently restarts its
-// GStreamer pipeline with exponential backoff on EOS/error.
+// Postgres, plans worker GROUPS (cameras with identical graph shapes
+// share a process with one batched nvstreammux — see grouping.h), and
+// starts or stops group workers to match. Each worker independently
+// restarts its child process with exponential backoff on faults;
+// member-attributable faults quarantine just the broken camera.
 //
 // DeepStream builds wire the nvinfer chain; GPU-less dev builds fall
-// back to pass-through record via software encoder.
+// back to record/push-only graphs.
 
 #include <chrono>
 #include <csignal>
@@ -15,8 +17,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <signal.h>   // kill()
 #include <unistd.h>   // getpid()
@@ -26,6 +30,7 @@
 
 #include "config.h"
 #include "db_reconciler.h"
+#include "grouping.h"
 #include "nats_publisher.h"
 #include "pipeline.h"
 #include "supervisor.h"
@@ -33,13 +38,215 @@
 namespace {
 volatile std::sig_atomic_t g_stop = 0;
 void HandleSignal(int) { g_stop = 1; }
+
+std::vector<std::string> splitCsv(const std::string& s) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) out.push_back(item);
+    }
+    return out;
+}
 }  // namespace
+
+// runWorkerGroup is the child-process body: build one GroupPipeline for
+// the given member cameras, run it, publish per-camera state.
+static int runWorkerGroup(const std::string& group_id,
+                          const std::vector<std::string>& member_ids) {
+    gst_init(nullptr, nullptr);
+    std::signal(SIGINT, HandleSignal);
+    std::signal(SIGTERM, HandleSignal);
+
+    auto cfg = fnvr::LoadFromEnv();
+    fnvr::NatsPublisher nats(cfg.nats_url);
+
+    // Resolve member configs from the DB. The supervisor passed ids
+    // only; url/rotation/detectors/mtx_proxy/mutes come from Postgres
+    // so the child always runs the current config.
+    auto all = fnvr::ReadEnabledCameras(cfg.database_url);
+    std::vector<fnvr::CameraConfig> members;
+    for (const auto& id : member_ids) {
+        for (auto& c : all) {
+            if (c.id == id) {
+                fnvr::CameraConfig cam = c;
+                cam.muted_classes =
+                    fnvr::ReadMutedClassesForCamera(cfg.database_url, id);
+                members.push_back(std::move(cam));
+                break;
+            }
+        }
+    }
+    if (members.empty()) {
+        std::cerr << "group[" << group_id
+                  << "]: no enabled members resolve — exiting clean\n";
+        return 0;
+    }
+
+    fnvr::SetWorkerStartupGraceSec(
+        fnvr::ReadPipelineStartupGraceSec(cfg.database_url));
+
+    fnvr::GroupPipeline p(group_id, members, cfg.recordings_dir,
+                          cfg.inference_config, cfg.use_deepstream,
+                          cfg.use_anpr, cfg.use_face_id, &nats);
+
+    // Announce "starting" for every member before Start() so the UI can
+    // show progress during the TRT engine build.
+    for (const auto& m : members) {
+        const std::string subj = "fnvr.state.camera." + m.id;
+        nats.Publish(subj, "{\"camera_id\":\"" + m.id +
+                               "\",\"state\":\"starting\"}",
+                     /*flush=*/true);
+    }
+    if (!p.Start()) {
+        for (const auto& m : members) {
+            const std::string subj = "fnvr.state.camera." + m.id;
+            nats.Publish(subj, "{\"camera_id\":\"" + m.id +
+                                   "\",\"state\":\"failed\"}",
+                         /*flush=*/true);
+        }
+        std::cerr << "group[" << group_id << "]: start failed\n";
+        return 2;
+    }
+
+    // Healthy marker: written once the pipeline is PLAYING and (when an
+    // inference branch exists) frames are actually flowing. The
+    // supervisor's probation-graduation logic keys off this file —
+    // NOT off child uptime, which lies when rtspsrc spends 60+ s
+    // slow-failing against a dead host.
+    std::thread healthy_marker([&p, &group_id] {
+        while (!g_stop && !p.Faulted()) {
+            if (p.Playing() && (!p.HasInference() || p.TotalFrames() > 0)) {
+                const char* rd = std::getenv("FNVR_RUN_DIR");
+                std::string dir = (rd && *rd) ? rd : "/tmp/fnvr-run";
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                std::ofstream mk(dir + "/group-" + group_id + ".healthy",
+                                 std::ios::trunc);
+                mk << "ok\n";
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    });
+
+    // GMainLoop on the main thread so bus watches dispatch.
+    GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
+    guint watch_id = g_timeout_add(500, [](gpointer) -> gboolean {
+        if (g_stop) {
+            return FALSE;
+        }
+        return TRUE;
+    }, nullptr);
+
+    // Startup watchdog: if the pipeline doesn't reach PLAYING within
+    // 60 s of Start(), fault so the supervisor respawns instead of
+    // wedging on a silent rtspsrc SETUP hang.
+    std::thread stop_watcher([&loop, &p, &group_id] {
+        const auto startup_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!g_stop && !p.Faulted()) {
+            if (!p.Playing() &&
+                std::chrono::steady_clock::now() > startup_deadline) {
+                std::cerr << "group[" << group_id
+                          << "]: did not reach PLAYING within 60s — faulting\n";
+                p.Fault();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        g_main_loop_quit(loop);
+    });
+
+    // Data-flow watchdog (revived from the Orin build, where it was
+    // disabled after recording moved to MediaMTX). The detection probe
+    // bumps a per-source frame counter; if the SUM stalls for 20 s
+    // while Playing(), the group is a zombie (bus silent, NvMedia/CUDA
+    // wedge) — hard-exit so the supervisor respawns. A zombie now costs
+    // every member in the group, so this matters more than ever.
+    std::thread flow_watchdog([&p, &group_id] {
+        if (!p.HasInference()) return;  // no counters to watch
+        while (!g_stop && !p.Faulted() && !p.Playing()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        std::uint64_t last_seen = p.TotalFrames();
+        auto last_progress = std::chrono::steady_clock::now();
+        const auto stall_threshold = std::chrono::seconds(20);
+        while (!g_stop && !p.Faulted()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::uint64_t now_count = p.TotalFrames();
+            if (now_count != last_seen) {
+                last_seen = now_count;
+                last_progress = std::chrono::steady_clock::now();
+                continue;
+            }
+            if (std::chrono::steady_clock::now() - last_progress > stall_threshold) {
+                std::cerr << "group[" << group_id
+                          << "]: data-flow stalled 20s — hard exit rc=3\n";
+                std::_Exit(3);
+            }
+        }
+    });
+
+    // Per-camera heartbeats: every 30 s publish `running` for members
+    // whose frame counter advanced; a member stalled >60 s while the
+    // group is PLAYING gets `failed` (its rtspsrc is retrying — the
+    // rest of the group keeps working). Groups without inference (no
+    // counters) heartbeat all members on liveness alone.
+    std::thread heartbeat([&p, &nats, &group_id] {
+        const size_t n = p.MemberCount();
+        std::vector<std::uint64_t> last_frames(n, 0);
+        std::vector<std::chrono::steady_clock::time_point> last_advance(
+            n, std::chrono::steady_clock::now());
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        while (!g_stop && !p.Faulted()) {
+            if (p.Playing()) {
+                const auto now = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < n; i++) {
+                    const std::string& id = p.Member(i).id;
+                    bool advanced = true;
+                    if (p.HasInference()) {
+                        const auto f = p.FramesForSource(i);
+                        advanced = f != last_frames[i];
+                        if (advanced) {
+                            last_frames[i] = f;
+                            last_advance[i] = now;
+                        }
+                    }
+                    const bool stalled =
+                        p.HasInference() &&
+                        now - last_advance[i] > std::chrono::seconds(60);
+                    const char* state = stalled ? "failed" : "running";
+                    if (advanced || stalled) {
+                        nats.Publish("fnvr.state.camera." + id,
+                                     "{\"camera_id\":\"" + id +
+                                         "\",\"state\":\"" + state + "\"}");
+                    }
+                }
+            }
+            for (int i = 0; i < 60 && !g_stop && !p.Faulted(); i++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+    });
+
+    g_main_loop_run(loop);
+    g_source_remove(watch_id);
+    if (stop_watcher.joinable()) stop_watcher.join();
+    if (heartbeat.joinable()) heartbeat.join();
+    if (flow_watchdog.joinable()) flow_watchdog.join();
+    if (healthy_marker.joinable()) healthy_marker.join();
+    g_main_loop_unref(loop);
+
+    p.Stop();
+    gst_deinit();
+    return p.Faulted() ? 3 : 0;
+}
 
 int main(int argc, char** argv) {
     // Lightweight publish mode — used by pipeline-entrypoint.sh to
     // announce calibrating / compiling_engine / ready states before the
-    // supervisor is actually up. Invoked as:
-    //   pipeline-supervisor --publish <subject> <payload>
+    // supervisor is actually up.
     if (argc >= 4 && std::string(argv[1]) == "--publish") {
         auto cfg = fnvr::LoadFromEnv();
         fnvr::NatsPublisher nats(cfg.nats_url);
@@ -48,211 +255,17 @@ int main(int argc, char** argv) {
         return ok ? 0 : 2;
     }
 
-    // Worker mode: one subprocess per camera. Isolates splitmuxsink / nvinfer
-    // asserts so a single bad camera can't crash the whole supervisor.
-    // Invoked as: pipeline-supervisor --worker <camera_id> <url> <record_mode>
-    //   [--rotation]
-    // The optional --rotation flag signals an hourly segment-rotation
-    // respawn: the previous worker was `running` seconds ago and the
-    // operator shouldn't see the "starting" state flash in between.
-    if (argc >= 5 && std::string(argv[1]) == "--worker") {
-        gst_init(nullptr, nullptr);
-        std::signal(SIGINT, HandleSignal);
-        std::signal(SIGTERM, HandleSignal);
+    // Group-worker mode: one subprocess per camera GROUP.
+    // Invoked as: pipeline-supervisor --worker-group <group_id> <cam1,cam2,...>
+    if (argc >= 4 && std::string(argv[1]) == "--worker-group") {
+        return runWorkerGroup(argv[2], splitCsv(argv[3]));
+    }
 
-        auto cfg = fnvr::LoadFromEnv();
-        fnvr::NatsPublisher nats(cfg.nats_url);
-
-        fnvr::CameraConfig cam;
-        cam.id = argv[2];
-        cam.url = argv[3];
-        cam.recording_mode = argv[4];
-        const bool rotation = (argc >= 6 && std::string(argv[5]) == "--rotation");
-        // Resolve the effective mute set from Postgres before the
-        // pipeline builds — gives the InferSrcProbe a point-in-time
-        // snapshot that persists for the life of this worker. Operators
-        // restart the pipeline to apply changes (matches Settings UI).
-        cam.muted_classes = fnvr::ReadMutedClassesForCamera(cfg.database_url, cam.id);
-        if (!cam.muted_classes.empty()) {
-            std::cerr << "worker[" << cam.id << "]: muting "
-                      << cam.muted_classes.size() << " class(es) at pipeline\n";
-        }
-        cam.rotation = fnvr::ReadRotationForCamera(cfg.database_url, cam.id);
-        if (cam.rotation != 0) {
-            std::cerr << "worker[" << cam.id << "]: rotation=" << cam.rotation
-                      << " (forces transcode path)\n";
-        }
-        cam.enabled_detectors = fnvr::ReadEnabledDetectorsForCamera(
-            cfg.database_url, cam.id);
-        if (!cam.enabled_detectors.empty()) {
-            std::string joined;
-            for (const auto& d : cam.enabled_detectors) {
-                if (!joined.empty()) joined += ",";
-                joined += d;
-            }
-            std::cerr << "worker[" << cam.id << "]: detectors=" << joined << "\n";
-        }
-        cam.mtx_proxy = fnvr::ReadMtxProxyForCamera(cfg.database_url, cam.id);
-        if (cam.mtx_proxy) {
-            std::cerr << "worker[" << cam.id << "]: mtx_proxy=on\n";
-        }
-        // Inform pipeline's bus-error path of the startup grace window
-        // so transient faults during warmup don't publish `failed` to
-        // the UI. Reads from the same settings key the supervisor uses.
-        fnvr::SetWorkerStartupGraceSec(
-            fnvr::ReadPipelineStartupGraceSec(cfg.database_url));
-
-        fnvr::SingleCameraPipeline p(cam, cfg.recordings_dir, cfg.inference_config,
-                                      cfg.use_deepstream, cfg.use_anpr, cfg.use_face_id,
-                                      &nats);
-
-        // Announce "starting" before Start() so the UI can show progress
-        // during the TRT engine build (first run after cache wipe: 60-90s).
-        // Pipeline will publish "running" itself on reaching PLAYING.
-        //
-        // Subject: fnvr.state.camera.<id>. This is a JetStream-backed
-        // last-value stream (declared by api-server) so a fresh api-server
-        // subscriber immediately sees the current state for every camera,
-        // instead of being stuck at "unknown" until a worker happens to
-        // (re)start.
-        //
-        // EXCEPT during an hourly segment rotation (`--rotation`). The
-        // previous worker was `running` a few seconds ago; the old
-        // message is still valid in the last-value stream. Publishing
-        // `starting` here would flip every tile to the amber
-        // "starting…" pulse every hour, which is not what the operator
-        // wants to see. The new worker's own `running` publish on
-        // reaching PLAYING wraps up the transition silently.
-        const std::string subj = "fnvr.state.camera." + cam.id;
-        if (!rotation) {
-            std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"starting\"}";
-            nats.Publish(subj, payload, /*flush=*/true);
-        }
-        if (!p.Start()) {
-            // A failed Start() during rotation is still a real failure
-            // — publish `failed` so the UI flips red.
-            std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"failed\"}";
-            nats.Publish(subj, payload, /*flush=*/true);
-            std::cerr << "worker[" << cam.id << "]: start failed\n";
-            return 2;
-        }
-
-        // Run a GMainLoop on the main thread. GStreamer bus watches
-        // (added via gst_bus_add_watch) dispatch only when the main
-        // context iterates. Without this the pipeline starves on state-
-        // change messages and never emits buffers past nvinfer — which
-        // is exactly what was making USB cams hang while standalone
-        // gst-launch (which auto-iterates) worked fine.
-        GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
-        guint watch_id = g_timeout_add(500, [](gpointer) -> gboolean {
-            if (g_stop) {
-                return FALSE;
-            }
-            return TRUE;
-        }, nullptr);
-        // Watchdog + fault-latch. If the pipeline doesn't reach PLAYING
-        // within 60 s of Start(), we fault the pipeline ourselves so the
-        // supervisor respawns instead of wedging on a silent rtspsrc
-        // SETUP hang. rtspsrc with tcp-timeout=15s normally errors out
-        // long before 60 s; this is belt-and-braces for cases where the
-        // element doesn't surface the failure on the bus.
-        std::thread stop_watcher([&loop, &p, &cam, subj, &nats] {
-            const auto startup_deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(60);
-            while (!g_stop && !p.Faulted()) {
-                if (!p.Playing() &&
-                    std::chrono::steady_clock::now() > startup_deadline) {
-                    std::cerr << "worker[" << cam.id
-                              << "]: did not reach PLAYING within 60s — faulting\n";
-                    std::string payload = "{\"camera_id\":\"" + cam.id +
-                        "\",\"state\":\"failed\"}";
-                    nats.Publish(subj, payload, /*flush=*/true);
-                    p.Fault();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            g_main_loop_quit(loop);
-        });
-
-        // Data-flow watchdog. Catches silent stalls where the GStreamer
-        // bus never fires ERROR — typical cause is an NvMedia element
-        // wedged inside a kernel syscall (VIC transform, decoder)
-        // where the GStreamer pipeline thinks it's still PLAYING but
-        // no buffers actually flow. We saw this in the wild: house-side
-        // sat as a zombie for 37 min until an operator SIGKILL'd it.
-        //
-        // Samples BuffersPassed() every 5 s; if the count hasn't
-        // advanced for 20 s WHILE Playing() is true, publish failed +
-        // _exit(3) directly. We bypass the bus handler here because the
-        // whole point is that the bus is silent.
-        std::thread flow_watchdog([&p, &cam, subj, &nats] {
-            // Disabled: the flow counter used to be attached to the
-            // recording branch's recparse element. Recording moved
-            // out of pipeline-supervisor (commit XXXXXXX) — MediaMTX
-            // records via RTSP — so BuffersPassed() never advances,
-            // and the watchdog hard-exits every 20 s. Bus errors and
-            // the bus-handler still catch real pipeline faults; this
-            // watchdog needs a new pad to monitor (e.g. pgie.src or
-            // the rtspclientsink request pad) before being re-enabled.
-            (void)p; (void)cam; (void)subj; (void)nats;
-            return;
-            while (!g_stop && !p.Faulted() && !p.Playing()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-            std::uint64_t last_seen = p.BuffersPassed();
-            auto last_progress = std::chrono::steady_clock::now();
-            const auto stall_threshold = std::chrono::seconds(20);
-            while (!g_stop && !p.Faulted()) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                std::uint64_t now_count = p.BuffersPassed();
-                if (now_count != last_seen) {
-                    last_seen = now_count;
-                    last_progress = std::chrono::steady_clock::now();
-                    continue;
-                }
-                if (std::chrono::steady_clock::now() - last_progress > stall_threshold) {
-                    std::cerr << "worker[" << cam.id
-                              << "]: data-flow stalled 20s — hard exit rc=3\n";
-                    std::string payload = "{\"camera_id\":\"" + cam.id +
-                        "\",\"state\":\"failed\"}";
-                    nats.Publish(subj, payload, /*flush=*/true);
-                    std::_Exit(3);
-                }
-            }
-        });
-
-        // Heartbeat: republish "running" every 30s so the api-server's
-        // per-camera state stays fresh in the 10-minute window. The
-        // initial "running" publish in pipeline.cpp on GST_STATE_PLAYING
-        // kicks off the heartbeat loop; if the pipeline faults we stop
-        // heartbeating so the state naturally expires to "unknown".
-        std::thread heartbeat([&p, &nats, &cam, subj] {
-            // Wait briefly for the pipeline to reach PLAYING before the
-            // first heartbeat (the state-change publish will have fired).
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            while (!g_stop && !p.Faulted()) {
-                std::string payload = "{\"camera_id\":\"" + cam.id + "\",\"state\":\"running\"}";
-                nats.Publish(subj, payload);
-                for (int i = 0; i < 60 && !g_stop && !p.Faulted(); i++) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                }
-            }
-        });
-        g_main_loop_run(loop);
-        g_source_remove(watch_id);
-        if (stop_watcher.joinable()) stop_watcher.join();
-        if (heartbeat.joinable()) heartbeat.join();
-        if (flow_watchdog.joinable()) flow_watchdog.join();
-        g_main_loop_unref(loop);
-
-        // Clean exit path (operator stopped the supervisor). For
-        // fault paths we hard-exit from the bus handler / watchdog
-        // threads directly; this is only reached on SIGTERM-to-stop
-        // or a voluntary Faulted() that we set elsewhere.
-        p.Stop();
-        gst_deinit();
-        return p.Faulted() ? 3 : 0;
+    // Legacy single-camera worker form — kept as an alias for manual
+    // debugging: pipeline-supervisor --worker <camera_id> <url> <mode>
+    // (url/mode are re-read from the DB like any group member).
+    if (argc >= 3 && std::string(argv[1]) == "--worker") {
+        return runWorkerGroup(std::string("solo-") + argv[2], {argv[2]});
     }
 
     // Parent (supervisor) mode.
@@ -273,10 +286,7 @@ int main(int argc, char** argv) {
     }
 
     // Subscribe to the restart signal published by api-server when the
-    // operator picks a new YOLO variant / precision. On receipt, set the
-    // stop flag — docker compose's restart=unless-stopped brings us back
-    // up, and the entrypoint re-reads settings from the DB before the
-    // supervisor starts.
+    // operator changes detector settings.
     natsConnection* restart_conn = nullptr;
     natsSubscription* restart_sub = nullptr;
     if (nats.Connected()) {
@@ -287,11 +297,6 @@ int main(int argc, char** argv) {
                 [](natsConnection*, natsSubscription*, natsMsg* msg, void*) {
                     std::cerr << "pipeline-supervisor: received restart signal\n";
                     g_stop = 1;
-                    // Main thread is parked in pause(); poke it with a
-                    // process-level signal so its pause() returns and the
-                    // loop notices g_stop. std::raise() only signals the
-                    // calling thread; kill(getpid(), ...) signals the
-                    // process which wakes whichever thread is in pause().
                     kill(getpid(), SIGTERM);
                     natsMsg_Destroy(msg);
                 }, nullptr);
@@ -301,12 +306,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Announce ready to the pipeline-state stream, once the engine
-    // exists. If it already exists at startup, publish immediately.
-    // Otherwise spawn a watcher thread that polls until the first
-    // worker's nvinfer writes the engine to disk, then publishes — so
-    // the UI banner flips from "compiling_engine" to "ready" as soon as
-    // the compile actually finishes, rather than being stuck forever.
+    // Announce ready to the pipeline-state stream once the engine exists.
     auto engine_path = [&]() -> std::string {
         const char* cfg_env = std::getenv("FNVR_INFER_CONFIG");
         if (!cfg_env || !*cfg_env) return {};

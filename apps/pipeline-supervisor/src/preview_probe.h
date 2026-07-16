@@ -1,33 +1,32 @@
 #pragma once
 
-#include <gst/gst.h>
+// PreviewSnapshotProbe — batch-aware pad probe attached on pgie.src
+// that taps decoded NVMM frames already in flight on the inference
+// branch (no second decode). For each member camera it maintains a
+// 1 fps, 4-entry JPEG ring at {live_dir}/<camera_id>.<n>.jpg:
+// it walks NvDsBatchMeta, attributes each frame to its member via
+// frame_meta->pad_index, does a GPU-accelerated NV12→RGBA scale into a
+// reusable dst surface, and JPEG-encodes via face_crop_jpeg.
+//
+// The api-server's snapshot endpoint reads the second-newest ring
+// entry (see snapshot.go); writes are tmp+rename so a partially
+// written JPEG is never visible.
+
 #include <string>
+#include <vector>
+
+#include <gst/gst.h>
 
 namespace fnvr {
 
-// PreviewSnapshotProbe — pad probe that taps a decoded NVMM frame in
-// flight on the inference branch and writes a 480×270 JPEG ring at
-// /var/lib/fnvr/live/<camera_id>.<n>.jpg, replacing what used to be a
-// separate decode+jpegenc branch in the gstreamer graph. Replaces an
-// entire nvv4l2decoder per camera; see docs/architecture/pipeline.md.
-//
-// The probe is rate-limited to 1 frame/sec on a steady_clock; on the
-// fast path it returns GST_PAD_PROBE_OK immediately. On the slow path
-// it does GPU-accelerated NV12→RGBA scale to a reusable dst surface,
-// maps it for CPU read, and uses face_crop_jpeg's encodeJpegRGBA
-// helper to write the ring slot atomically (tmp + rename).
-//
-// One ctx per camera; lifetime is owned by the caller (the SingleCamera
-// pipeline frees it in its destructor). The probe is pure pass-through:
-// it never modifies or drops the buffer.
+struct PreviewProbeCtx;
 
-struct PreviewProbeCtx;  // opaque
+// camera_ids must be ordered by mux pad index (member order).
+PreviewProbeCtx* preview_probe_ctx_new(std::vector<std::string> camera_ids,
+                                       std::string live_dir);
+void preview_probe_ctx_free(PreviewProbeCtx* ctx);
 
-PreviewProbeCtx* preview_probe_ctx_new(std::string camera_id,
-                                       std::string live_dir,
-                                       int src_w, int src_h);
-void             preview_probe_ctx_free(PreviewProbeCtx*);
-
-GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo*, gpointer user_data);
+GstPadProbeReturn PreviewSnapshotProbe(GstPad* pad, GstPadProbeInfo* info,
+                                       gpointer user_data);
 
 }  // namespace fnvr
