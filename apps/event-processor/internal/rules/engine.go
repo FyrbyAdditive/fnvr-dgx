@@ -422,6 +422,32 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	_, err := e.nc.Subscribe("fnvr.events.detection.>", func(msg *nats.Msg) {
+		// The pipeline publishes ONE message per camera per frame:
+		// {"camera_id","ts","batch":[<detection>,...]} — 10-50x fewer
+		// messages than the legacy one-per-object shape under daytime
+		// load. The legacy shape (a bare detection object) is still
+		// accepted so mixed pipeline/processor versions interoperate
+		// during a rolling deploy. Per-object handling stays inside
+		// onDetection unchanged (insert/rules/thumbnail ordering is
+		// intertwined; at our measured rates the per-row insert is
+		// microseconds — the message fan-in was the real cost).
+		var envelope struct {
+			Batch []json.RawMessage `json:"batch"`
+		}
+		if err := json.Unmarshal(msg.Data, &envelope); err == nil &&
+			len(envelope.Batch) > 0 {
+			for _, raw := range envelope.Batch {
+				var d Detection
+				if err := json.Unmarshal(raw, &d); err != nil {
+					slog.Warn("bad detection in batch", "err", err)
+					continue
+				}
+				if err := e.onDetection(ctx, d); err != nil {
+					slog.Warn("rule eval", "err", err, "cam", d.CameraID)
+				}
+			}
+			return
+		}
 		var d Detection
 		if err := json.Unmarshal(msg.Data, &d); err != nil {
 			slog.Warn("bad detection", "err", err)

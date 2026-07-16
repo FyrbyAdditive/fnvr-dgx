@@ -144,12 +144,14 @@ if command -v curl >/dev/null 2>&1; then
         P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
         MF=$(echo "$SETTINGS_JSON" | sed -n 's/.*"model_family":"\([^"]*\)".*/\1/p')
         RV=$(echo "$SETTINGS_JSON" | sed -n 's/.*"rfdetr_variant":"\([^"]*\)".*/\1/p')
+        IV=$(echo "$SETTINGS_JSON" | sed -n 's/.*"interval":\([0-9]\+\).*/\1/p')
         A=$(echo "$SETTINGS_JSON" | sed -n 's/.*"anpr_enabled":\(true\|false\).*/\1/p')
         F=$(echo "$SETTINGS_JSON" | sed -n 's/.*"face_id_enabled":\(true\|false\).*/\1/p')
         [ -n "$V" ] && VARIANT="$V"
         [ -n "$P" ] && PRECISION="$P"
         [ -n "$MF" ] && MODEL_FAMILY="$MF"
         [ -n "$RV" ] && RFDETR_VARIANT="$RV"
+        [ -n "$IV" ] && PGIE_INTERVAL="$IV"
         if [ "$A" = "true" ]; then
             export FNVR_USE_ANPR=1
         else
@@ -377,6 +379,9 @@ else
         /etc/fnvr/nvinfer/yolo26.txt.template \
         > "$EFFECTIVE_CFG"
 fi
+if [ -n "${PGIE_INTERVAL:-}" ] && [ "${PGIE_INTERVAL}" != "0" ]; then
+    sed -i "s/^interval=.*/interval=${PGIE_INTERVAL}/" "$EFFECTIVE_CFG"
+fi
 
 # ---- RF-DETR family: render its effective config from the export's
 # meta.json sidecar (dims + class count are model truths, not config).
@@ -404,6 +409,13 @@ if [ "$MODEL_FAMILY" = "rfdetr" ]; then
                 -e "s|\$RFDETR_W|$RFDETR_W|g" -e "s|\$RFDETR_H|$RFDETR_H|g" \
                 -e "s|\$NUM_CLASSES|$NUM_CLASSES|g" \
                 /etc/fnvr/nvinfer/rfdetr.txt.template > "$RFDETR_CFG"
+        fi
+        # Inference interval (settings detector.interval): skip pgie on
+        # N of every N+1 frames — the tracker bridges. The relief
+        # valve for high camera counts; 0 (default) = every frame.
+        if [ -n "${PGIE_INTERVAL:-}" ] && [ "${PGIE_INTERVAL}" != "0" ]; then
+            sed -i "s/^interval=.*/interval=${PGIE_INTERVAL}/" "$RFDETR_CFG"
+            echo "entrypoint: pgie interval=${PGIE_INTERVAL}"
         fi
         echo "entrypoint: rfdetr family — $RFDETR_MODEL ${RFDETR_W}x${RFDETR_H} classes=$RF_CLASSES"
     else

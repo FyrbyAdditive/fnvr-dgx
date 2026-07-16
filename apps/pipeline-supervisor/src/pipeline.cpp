@@ -513,6 +513,13 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         }
 
         bool frame_had_obj = false;
+        // Per-frame batch: one NATS message per camera per frame
+        // ({"camera_id","ts","batch":[obj,...]}) instead of one per
+        // object — 10-50x fewer messages under daytime load, and the
+        // consumer can multi-row INSERT. Consumers accept both the
+        // legacy single-object shape and this batch shape.
+        std::ostringstream frame_batch;
+        int frame_batch_n = 0;
 
         for (NvDsMetaList* ol = frame->obj_meta_list; ol; ol = ol->next) {
             auto* obj = static_cast<NvDsObjectMeta*>(ol->data);
@@ -612,10 +619,20 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 js << ",\"phash\":\"" << uint64ToHex16(obj_phash) << "\"";
             }
             js << "}";
-            std::string payload = js.str();
-            std::string subj = std::string("fnvr.events.detection.") + sv.camera_id;
-            if (ctx->nats && ctx->nats->Publish(subj, payload)) {
-                ctx->hb_published++;
+            if (frame_batch_n++) frame_batch << ",";
+            frame_batch << js.str();
+            ctx->hb_published++;
+        }
+        if (frame_batch_n > 0 && ctx->nats) {
+            std::string payload = "{\"camera_id\":\"" +
+                                  json_escape(sv.camera_id) +
+                                  "\",\"ts\":\"" + iso +
+                                  "\",\"batch\":[" + frame_batch.str() +
+                                  "]}";
+            std::string subj =
+                std::string("fnvr.events.detection.") + sv.camera_id;
+            if (!ctx->nats->Publish(subj, payload)) {
+                ctx->hb_published -= frame_batch_n;
             }
         }
         if (frame_had_obj) ctx->hb_frames_obj++;
@@ -665,7 +682,9 @@ int memberIndexFromName(const char* name) {
     // longer prefix gets a look.
     static const char* prefixes[] = {"src_sub_", "depay_sub_", "parse_sub_",
                                      "src_", "depay_", "parse_", "qi_",
-                                     "dec_", "qm_", "qp_", "pp_", "push_"};
+                                     "dec_", "qm_", "qp_", "pp_", "push_",
+                                     "tp_", "pq_", "pconv_", "penc_",
+                                     "ppp_", "ppush_"};
     for (const char* p : prefixes) {
         size_t n = std::strlen(p);
         if (std::strncmp(name, p, n) == 0) {
@@ -966,6 +985,36 @@ GstElement* GroupPipeline::BuildPipeline() {
             mux_w_ = 1920;
             mux_h_ = 1080;
         }
+        // NVENC live-proxy leg: tee the ALREADY-DECODED frames (zero
+        // extra NVDEC) into a small H.264 stream MediaMTX serves at
+        // lp_<cam>. The web grid plays this instead of the full
+        // passthrough stream: WebRTC-clean H.264 (no B-frames, 1 s
+        // IDR — instant joins, every browser), ~1.5 Mbps per tile
+        // instead of the camera's full bitrate, and camera encode
+        // quirks stop mattering for live view. Recordings and the
+        // expanded view keep the untouched passthrough stream.
+        auto proxy_leg = [&p](size_t idx, const std::string& cam_id,
+                              int w, int h) {
+            int pw = w > 0 ? w : 1280, ph = h > 0 ? h : 720;
+            if (ph > 540) {
+                pw = int(double(pw) * 540.0 / ph + 0.5);
+                ph = 540;
+            }
+            pw &= ~1; ph &= ~1;
+            p << "tp_" << idx << ". ! queue name=pq_" << idx
+              << " max-size-buffers=4 leaky=downstream ! "
+              << "nvvideoconvert name=pconv_" << idx << " compute-hw=1 ! "
+              << "video/x-raw(memory:NVMM),format=NV12,width=" << pw
+              << ",height=" << ph << " ! "
+              << "nvv4l2h264enc name=penc_" << idx
+              << " bitrate=1500000 insert-sps-pps=1 idrinterval=30"
+                 " iframeinterval=30 ! "
+              << "h264parse name=ppp_" << idx << " config-interval=-1 ! "
+              << "rtspclientsink name=ppush_" << idx
+              << " latency=200 location=rtsp://mediamtx:8554/lp_" << cam_id
+              << " protocols=tcp ";
+        };
+
         for (size_t i = 0; i < sources_.size(); i++) {
             auto& s = sources_[i];
             std::string url = s->cam.url;
@@ -1001,8 +1050,10 @@ GstElement* GroupPipeline::BuildPipeline() {
                   << "queue name=qi_" << i
                   << " max-size-buffers=8 leaky=downstream ! "
                   << "nvv4l2decoder name=dec_" << i << " ! "
+                  << "tee name=tp_" << i << " tp_" << i << ". ! "
                   << "queue name=qm_" << i << " max-size-buffers=4 leaky=downstream ! "
                   << "mux.sink_" << i << " ";
+                proxy_leg(i, s->cam.id, s->sub_w, s->sub_h);
                 continue;
             }
             p << "rtspsrc name=src_" << i << " location=" << url
@@ -1016,8 +1067,10 @@ GstElement* GroupPipeline::BuildPipeline() {
                 p << "t_" << i << ". ! queue name=qi_" << i
                   << " max-size-buffers=8 leaky=downstream ! "
                   << "nvv4l2decoder name=dec_" << i << " ! "
+                  << "tee name=tp_" << i << " tp_" << i << ". ! "
                   << "queue name=qm_" << i << " max-size-buffers=4 leaky=downstream ! "
                   << "mux.sink_" << i << " ";
+                proxy_leg(i, s->cam.id, s->probed_w, s->probed_h);
             } else {
                 // GPU-less dev fallback: record/push only, sink the arm.
                 p << "t_" << i << ". ! queue ! fakesink sync=false ";

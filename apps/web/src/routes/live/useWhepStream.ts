@@ -31,8 +31,14 @@ import { useEffect, useRef, useState } from "react";
 //   loop won't fire while WebRTC is broken AND the JPEG path is happy.
 // - Call `tickPreview()` once per painted frame so the watchdog stays
 //   accurate.
-export function useWhepStream(cameraId: string, opts?: { imgOk?: boolean }) {
+export function useWhepStream(
+  cameraId: string,
+  opts?: { imgOk?: boolean; pathPrefix?: string },
+) {
   const imgOk = opts?.imgOk ?? true;
+  // "live_" = full-res passthrough; "lp_" = the NVENC proxy stream
+  // (H.264, 1 s IDR, ~1.5 Mbps) the grid uses. Same WHEP mechanics.
+  const pathPrefix = opts?.pathPrefix ?? "live_";
   const videoRef = useRef<HTMLVideoElement>(null);
   const [rtcLive, setRtcLive] = useState(false);
   const [streamObj, setStreamObj] = useState<MediaStream | null>(null);
@@ -59,7 +65,7 @@ export function useWhepStream(cameraId: string, opts?: { imgOk?: boolean }) {
       return;
     }
     const mtxOrigin = `${window.location.protocol}//${window.location.hostname}:8889`;
-    const url = `${mtxOrigin}/live_${encodeURIComponent(cameraId)}/whep`;
+    const url = `${mtxOrigin}/${pathPrefix}${encodeURIComponent(cameraId)}/whep`;
     const reader = new Reader({
       url,
       onTrack: (e) => {
@@ -80,7 +86,7 @@ export function useWhepStream(cameraId: string, opts?: { imgOk?: boolean }) {
         // ignore
       }
     };
-  }, [cameraId, retryTick]);
+  }, [cameraId, pathPrefix, retryTick]);
 
   // Attach captured stream once the <video> exists. Setting srcObject
   // during onTrack didn't work because videoRef.current is null on the

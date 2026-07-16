@@ -269,76 +269,21 @@ services:
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
     environment:
-      MTX_RTSPTRANSPORTS: "tcp"
-      MTX_PATHS_TEST_SOURCE: "publisher"
-      MTX_PATHS_TEST_SOURCEONDEMAND: "no"
-      MTX_PATHS_USB0_SOURCE: "publisher"
-      MTX_PATHS_USB0_SOURCEONDEMAND: "no"
-      # Runtime config API. api-server adds/removes proxy_<camera_id>
-      # paths via this for cameras with mtx_proxy=true. Bound to the
-      # internal docker network only (no host port mapping below).
-      MTX_API: "yes"
-      MTX_APIADDRESS: ":9997"
-      # Add a second user entry that allows the config API from
-      # private docker/LAN ranges. MTX 1.17+ gates the API behind auth
-      # and the default user (_0_) only permits publish/read/playback;
-      # we keep those defaults intact and add this one for api-server.
-      # No host port binding on 9997, so this remains internal-only.
-      MTX_AUTHINTERNALUSERS_1_USER: "any"
-      MTX_AUTHINTERNALUSERS_1_IPS: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.1"
-      MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_ACTION: "api"
-      # MediaMTX accepts publishes on any path by default (the auto
-      # `all_others` catch-all has source=publisher out of the box).
-      # No per-path env vars needed beyond the explicit `test` and
-      # `usb0` entries above.
-      #
-      # Tell MediaMTX's WebRTC server to advertise this LAN IP as a
-      # host candidate alongside its own container-bridge IP. Browsers
-      # on the same LAN reach this; without it ICE only sees 172.18.x.x
-      # which is unreachable from the user's Mac at 172.16.x.x.
-      # Set FNVR_LAN_IP to the DGX Spark's LAN address (falls back to
-      # the historical dev-host IP so an un-configured bring-up still
-      # advertises *something* routable on that LAN).
+      # Static config lives in deploy/config/mediamtx.yml (mounted
+      # below) — path-pattern rules (record live_* only, never the
+      # lp_* NVENC proxies) can't be expressed as env names. Env still
+      # carries the deployment-specific WebRTC ICE hosts; env
+      # OVERRIDES yaml, and FNVR_LAN_IP comes from .env — NEVER pass
+      # it as a shell variable.
       MTX_WEBRTCADDITIONALHOSTS: "${FNVR_LAN_IP:-172.16.4.23}"
-      # Single-port UDP for ICE so we can publish exactly one UDP port
-      # through docker. Without this MediaMTX uses ephemeral UDP ports
-      # and we'd need to expose a wide range or use host networking.
-      # 8189 chosen to avoid collisions.
-      MTX_WEBRTCLOCALUDPADDRESS: ":8189"
-      # Recording. MediaMTX writes one fragmented MP4 per
-      # recordSegmentDuration window per path. fMP4 (moof+mdat) seeks
-      # mid-write — unlike progressive MP4 from qtmux, which requires
-      # a final moov for the full duration to be addressable. The
-      # timeline player can therefore play current-hour clips without
-      # the "stuck on first frame" bug.
-      #
-      # Path layout: /var/lib/fnvr/recordings/<camera>/<YYYY-MM-DD>/<HH-MM-SS>-<frac>.mp4
-      # — kept simple. storage-manager walks this and rolls fragments
-      # into per-hour segment rows in postgres.
-      MTX_RECORD: "yes"
-      MTX_RECORDPATH: "/var/lib/fnvr/recordings/%path/%Y-%m-%d_%H-%M-%S-%f"
-      MTX_RECORDFORMAT: "fmp4"
-      MTX_RECORDSEGMENTDURATION: "1h"
-      MTX_RECORDPARTDURATION: "1s"
-      MTX_RECORDDELETEAFTER: "14d"
-      # Playback HTTP server — serves stitched fMP4/MP4 clips for any
-      # path + start + duration window. Used by the timeline view to
-      # play back recordings (replaces the per-segment-MP4 endpoint
-      # in api-server which couldn't handle progressive MP4 mid-write).
-      MTX_PLAYBACK: "yes"
-      MTX_PLAYBACKADDRESS: ":9996"
     volumes:
+      - ../config/mediamtx.yml:/mediamtx.yml:ro
       # MediaMTX writes recordings here; storage-manager + api-server
       # read from the same path via the same volume.
       - fnvr-data:/var/lib/fnvr
     ports:
       - "8554:8554" # rtsp
       - "8889:8889" # webrtc (whep on /<path>/whep)
-      # WebRTC media uses ICE/UDP. Mediamtx default ICE port range is
-      # the OS-ephemeral; pin a known range here so it can be exposed
-      # cleanly. Browsers connect from the LAN, so this bridge needs to
-      # forward ICE UDP from the host to the container. Range chosen
-      # to fit a few hundred concurrent sessions without colliding.
       - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
       - "9996:9996" # playback API (timeline /get clips)
 

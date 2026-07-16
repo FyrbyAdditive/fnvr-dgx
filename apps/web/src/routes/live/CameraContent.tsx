@@ -33,6 +33,7 @@ export function CameraContent({
   onClickEmpty,
   fitTo = "video",
   onPreviewFps,
+  proxy = false,
 }: {
   cameraId: string;
   name: string;
@@ -47,6 +48,9 @@ export function CameraContent({
   fitTo?: "video" | "container";
   /** Sampled every 500ms — the parent uses this for the stats overlay. */
   onPreviewFps?: (fps: number) => void;
+  /** Play the NVENC proxy stream (lp_<cam>) instead of the full-res
+   *  passthrough — the grid uses this; the enlarged modal never does. */
+  proxy?: boolean;
 }) {
   // Flag-popover state.
   const [pickedDetection, setPickedDetection] = useState<DetectionEvent | null>(null);
@@ -83,7 +87,10 @@ export function CameraContent({
   useEffect(() => { setImgOk(true); }, [cameraId]);
 
   // WHEP plumbing + frame-stall watchdog.
-  const { videoRef, rtcLive, tickPreview, previewTicksRef } = useWhepStream(cameraId, { imgOk });
+  const { videoRef, rtcLive, tickPreview, previewTicksRef } = useWhepStream(
+    cameraId,
+    { imgOk, pathPrefix: proxy ? "lp_" : "live_" },
+  );
 
   // Push preview-FPS to the parent's stats overlay if it wants one.
   useEffect(() => {

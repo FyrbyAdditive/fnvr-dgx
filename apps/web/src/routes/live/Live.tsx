@@ -7,6 +7,18 @@ import { useMe } from "@/lib/me";
 import { CameraToggle } from "@/components/CameraToggle";
 import { CameraDetectorChips } from "@/components/CameraDetectorChips";
 import { CameraContent } from "./CameraContent";
+import type { Camera } from "@/lib/api";
+
+// A camera has an NVENC live-proxy stream (lp_<id>) when its worker
+// decodes frames for inference: detectors not "none", and not the
+// bespoke rotation/mtx_proxy transcode shape (whose passthrough stream
+// is already grid-friendly H.264). Must mirror the proxy_leg logic in
+// pipeline.cpp BuildPipeline.
+function hasProxyStream(c: Camera): boolean {
+  const det = c.enabled_detectors ?? [];
+  const none = det.length === 1 && det[0] === "none";
+  return !none && (c.rotation ?? 0) === 0 && !c.mtx_proxy;
+}
 import { EnlargedCameraModal } from "./EnlargedCameraModal";
 
 export function Live() {
@@ -139,6 +151,7 @@ export function Live() {
               id={c.id}
               name={c.name}
               enabled={c.enabled}
+              proxy={hasProxyStream(c)}
               enabledDetectors={c.enabled_detectors ?? []}
               state={c.state}
               lastHeartbeatAt={c.last_heartbeat_at ?? null}
@@ -169,10 +182,14 @@ export function Live() {
   );
 }
 
-function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin, onEnlarge }: {
+function CameraTile({ id, name, enabled, proxy, enabledDetectors, state, lastHeartbeatAt, detections, inferenceFps, showStats, focus, isAdmin, onEnlarge }: {
   id: string;
   name: string;
   enabled: boolean;
+  /** Camera has an NVENC proxy stream (lp_<id>) — the tile plays that
+   *  instead of the full-res passthrough. The enlarged modal always
+   *  plays the passthrough. */
+  proxy: boolean;
   enabledDetectors: string[];
   state?: "starting" | "running" | "failed" | "unknown";
   lastHeartbeatAt?: string | null;
@@ -223,6 +240,7 @@ function CameraTile({ id, name, enabled, enabledDetectors, state, lastHeartbeatA
         onClickEmpty={onEnlarge}
         fitTo="video"
         onPreviewFps={setPreviewFps}
+        proxy={proxy}
       />
 
       <div className="absolute bottom-2 left-2 flex items-center gap-1">

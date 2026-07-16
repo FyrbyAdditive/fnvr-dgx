@@ -109,6 +109,11 @@ type Detector struct {
 	// FaceIDEnabled toggles the SCRFD + ArcFace SGIE chain for face
 	// detect + embed. Same scaling + restart story as AnprEnabled.
 	FaceIDEnabled bool `json:"face_id_enabled"`
+	// Interval skips primary inference on N of every N+1 frames (the
+	// tracker bridges the gaps). 0 = infer every frame (default);
+	// 1 = every 2nd frame ≈ halves pgie GPU. The standard relief
+	// valve for high camera counts. Takes effect on pipeline restart.
+	Interval int `json:"interval"`
 }
 
 // GetDetector reads the detector settings, falling back to defaults if a
@@ -142,6 +147,11 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
+	if raw, err := s.Get(ctx, "detector.interval"); err == nil {
+		_ = json.Unmarshal(raw, &d.Interval)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
 	if raw, err := s.Get(ctx, "detector.face_id_enabled"); err == nil {
 		_ = json.Unmarshal(raw, &d.FaceIDEnabled)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -158,6 +168,9 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	}
 	if _, ok := validPrecisions[d.YoloPrecision]; !ok {
 		return fmt.Errorf("invalid yolo26_precision %q", d.YoloPrecision)
+	}
+	if d.Interval < 0 || d.Interval > 4 {
+		return fmt.Errorf("invalid interval %d (0-4)", d.Interval)
 	}
 	if d.ModelFamily == "" {
 		d.ModelFamily = "yolo26"
@@ -187,6 +200,10 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 		return err
 	}
 	if err := s.Set(ctx, "detector.yolo26_precision", pb); err != nil {
+		return err
+	}
+	ib, _ := json.Marshal(d.Interval)
+	if err := s.Set(ctx, "detector.interval", ib); err != nil {
 		return err
 	}
 	if err := s.Set(ctx, "detector.anpr_enabled", ab); err != nil {

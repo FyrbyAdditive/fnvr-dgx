@@ -1,0 +1,83 @@
+# MediaMTX configuration (mounted at /mediamtx.yml).
+#
+# Migrated from compose env vars when the NVENC live-proxy streams
+# landed: path-pattern rules (record live_* only) can't be expressed
+# as MTX_PATHS_* env names, so static config lives here now.
+# Deployment-specific values still come from env (env overrides yaml):
+#   MTX_WEBRTCADDITIONALHOSTS  <- FNVR_LAN_IP in deploy/docker/.env
+#
+# Recording policy: ONLY the passthrough camera streams (live_<cam>)
+# are recorded. The NVENC proxy streams (lp_<cam>) exist purely for
+# the browser grid; test/QA/sandbox paths are never recorded (the
+# old global MTX_RECORD=yes recorded every stray publish — bisect_a,
+# mkshop_test etc. all left junk on disk).
+
+rtspTransports: [tcp]
+
+# Runtime config API — api-server manages proxy_<cam> source paths for
+# cameras with mtx_proxy=true. Internal docker network only (no host
+# port mapping in compose).
+api: yes
+apiAddress: :9997
+
+authInternalUsers:
+  # Default catch-all: anyone can publish/read/playback (LAN-internal
+  # deployment; parity with the stock config + previous env setup).
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  # Config API from private ranges (api-server lives on the docker
+  # bridge; 9997 has no host binding so this stays internal-only).
+  - user: any
+    pass:
+    ips: ['172.16.0.0/12', '10.0.0.0/8', '192.168.0.0/16', '127.0.0.1']
+    permissions:
+      - action: api
+
+# Single-port UDP for ICE so exactly one UDP port is published through
+# docker. Browsers on the LAN reach the host candidate advertised via
+# MTX_WEBRTCADDITIONALHOSTS (set from FNVR_LAN_IP in .env — NEVER as a
+# shell variable).
+webrtcLocalUDPAddress: :8189
+
+# Playback HTTP server — stitched fMP4 windows for the timeline view.
+playback: yes
+playbackAddress: :9996
+
+pathDefaults:
+  # Recording defaults apply to any path that enables record: fMP4
+  # (seeks mid-write), 1 h segments, 1 s parts, 14 d hard ceiling
+  # (storage-manager applies the real per-camera retention).
+  record: no
+  recordPath: /var/lib/fnvr/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordSegmentDuration: 1h
+  recordPartDuration: 1s
+  recordDeleteAfter: 336h
+
+paths:
+  # Passthrough camera streams — the ONLY recorded paths.
+  '~^live_.*':
+    record: yes
+
+  # NVENC live-proxy streams (lp_<cam>) — browser grid only, never
+  # recorded. Explicit entry for clarity; pathDefaults already says
+  # record: no.
+  '~^lp_.*':
+    record: no
+
+  # Synthetic test source (dev/lite profiles) + USB bridge.
+  test:
+    source: publisher
+    sourceOnDemand: no
+  usb0:
+    source: publisher
+    sourceOnDemand: no
+
+  # Catch-all so arbitrary paths (proxy_<cam> API-managed sources,
+  # ad-hoc QA publishes) keep working — unrecorded.
+  all_others:
