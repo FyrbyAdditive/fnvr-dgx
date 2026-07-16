@@ -35,7 +35,6 @@ Usage (inside the fnvr-train-detector container):
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -108,18 +107,10 @@ def trim_detect_head(model: torch.nn.Module, keep: list[int]) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--target", choices=["gpu", "hailo"], default="gpu",
-                    help="Deployment target. 'gpu' → yolo26 family, "
-                         "exports through DeepStream-Yolo's export_yolo26.py "
-                         "(NMS-free head). 'hailo' → yolo11l, vanilla "
-                         "Ultralytics ONNX export (opset 11, NMS stripped). "
-                         "Drives both default --source and the export shape.")
     ap.add_argument("--source", default=None,
-                    help="pretrained .pt to trim. Defaults: yolo26l.pt for "
-                         "--target gpu, yolo11l.pt for --target hailo. yolo26 "
+                    help="pretrained .pt to trim. Default: yolo26l.pt. yolo26 "
                          "weights download from "
-                         "https://huggingface.co/Ultralytics/YOLO26 ; "
-                         "yolo11 from Ultralytics' default hub.")
+                         "https://huggingface.co/Ultralytics/YOLO26 .")
     ap.add_argument("--keep", type=int, nargs="+", required=True,
                     help="space-separated original COCO class IDs to keep, "
                          "in the order you want them in the output model "
@@ -135,11 +126,10 @@ def main() -> None:
         ap.error(f"--keep ({len(args.keep)}) and --names ({len(args.names)}) must have the same length")
 
     if args.source is None:
-        args.source = "yolo26l.pt" if args.target == "gpu" else "yolo11l.pt"
+        args.source = "yolo26l.pt"
 
     # If the .pt isn't local, fetch it. yolo26 weights live on
-    # HuggingFace (Ultralytics doesn't auto-resolve them); yolo11
-    # downloads via Ultralytics' default hub on first YOLO() call.
+    # HuggingFace (Ultralytics doesn't auto-resolve them).
     src = Path(args.source)
     if not src.exists() and src.name.startswith("yolo26"):
         url = f"https://huggingface.co/Ultralytics/YOLO26/resolve/main/{src.name}"
@@ -183,41 +173,20 @@ def main() -> None:
     torch.save(yolo.ckpt, pt_path)
 
     onnx_path = out_dir / "best.onnx"
-    if args.target == "gpu":
-        # Export via DeepStream-Yolo's export_yolo26.py — that's what
-        # the production pipeline uses, so the resulting ONNX is
-        # byte-shape-compatible with NvDsInferParseYolo.
-        print("=== exporting via export_yolo26.py (DeepStream-Yolo path) ===")
-        rc = subprocess.run(
-            ["python3", "/usr/local/bin/export_yolo26.py",
-             "-w", str(pt_path.resolve()),
-             "-s", str(args.imgsz),
-             "--simplify"],
-            cwd=out_dir,
-            check=False,
-        ).returncode
-        if rc != 0:
-            sys.exit(f"export_yolo26.py failed with rc={rc}")
-    else:  # hailo
-        # Vanilla Ultralytics export. opset 11 + no NMS + static
-        # batch + FP32 weights = the shape Hailo's compiler accepts.
-        # Different ONNX shape from the gpu path; this is what
-        # tools/compile-hef/ feeds to hailomz.
-        print("=== exporting vanilla Ultralytics ONNX (Hailo target) ===")
-        trimmed = YOLO(str(pt_path))
-        out = trimmed.export(
-            format="onnx",
-            imgsz=args.imgsz,
-            opset=11,
-            simplify=True,
-            dynamic=False,
-            half=False,
-            nms=False,
-        )
-        # Ultralytics drops the file in the .pt's directory; move
-        # to the canonical name.
-        if Path(out) != onnx_path:
-            shutil.move(str(out), str(onnx_path))
+    # Export via DeepStream-Yolo's export_yolo26.py — that's what
+    # the production pipeline uses, so the resulting ONNX is
+    # byte-shape-compatible with NvDsInferParseYolo.
+    print("=== exporting via export_yolo26.py (DeepStream-Yolo path) ===")
+    rc = subprocess.run(
+        ["python3", "/usr/local/bin/export_yolo26.py",
+         "-w", str(pt_path.resolve()),
+         "-s", str(args.imgsz),
+         "--simplify"],
+        cwd=out_dir,
+        check=False,
+    ).returncode
+    if rc != 0:
+        sys.exit(f"export_yolo26.py failed with rc={rc}")
     if not onnx_path.exists():
         sys.exit(f"export finished but {onnx_path} is missing")
     print(f"=== ONNX written to {onnx_path} ===")
@@ -234,14 +203,9 @@ def main() -> None:
 
     print()
     print("Next:")
-    if args.target == "gpu":
-        print(f"  rsync -avz {out_dir}/best.onnx \\")
-        print(f"      tim@172.16.4.23:/var/lib/docker/volumes/fnvr_fnvr-data/_data/models/yolo26/{args.out}.onnx")
-        print(f"Then in Settings → Object detector pick 'Custom fine-tuned' and set the name to '{args.out}'.")
-    else:  # hailo
-        print(f"  rsync -avz {out_dir}/best.onnx tim@172.16.4.4:~/fnvr-compile-hef/onnx-src/best.onnx")
-        print(f"  # then on hammer (172.16.4.4): ./compile.sh {args.out}")
-        print(f"Once the HEF is built, rsync it to the Orin's hailo models dir and set hailo_model_version to '{args.out}'.")
+    print(f"  sudo cp {out_dir}/best.onnx \\")
+    print(f"      /var/lib/docker/volumes/fnvr_fnvr-data/_data/models/yolo26/{args.out}.onnx")
+    print(f"Then in Settings → Object detector pick 'Custom fine-tuned' and set the name to '{args.out}'.")
 
 
 if __name__ == "__main__":

@@ -1,25 +1,28 @@
 # train-detector
 
-Fine-tune a YOLOv11 detector on the dataset that the Orin's flag UI
-collects, then export to ONNX for `tools/compile-hef/` to turn into a
-Hailo HEF.
+Fine-tune a YOLO26 detector on the dataset that the NVR's flag UI
+collects, then export to ONNX for the pipeline's nvinfer PGIE.
 
-Designed to run on the **DGX Spark** at `tim@172.16.4.6` (ARM64 GB10
-+ CUDA, 128 GB unified memory). Also works on any linux/arm64 + CUDA
-box. The Orin's GPU is already pinned at 98 % by live inference —
-training there would starve detection.
+The NVR itself runs on the **DGX Spark** (ARM64 GB10 + CUDA, 128 GB
+unified memory), and training happens on the same box — the Blackwell
+GPU has headroom for both, though a long training run will steal
+inference throughput, so schedule accordingly. Also works on any
+linux/arm64 + CUDA box.
+
+(The Orin-era `--target hailo` export and the `tools/compile-hef/`
+HEF toolchain were removed with the Hailo path in fnvr-dgx. Phase 3 of
+the DGX retarget moves the primary detector to RF-DETR; this tool's
+YOLO26 fine-tune path remains the custom-training story until an
+RF-DETR fine-tune flow replaces it.)
 
 ## Workflow
 
 ```sh
-# Once on your laptop, push this directory to the Spark:
-rsync -avz tools/train-detector/ tim@172.16.4.6:~/fnvr-train/
+cd tools/train-detector
 
-# Then on the Spark (tim@172.16.4.6):
-cd ~/fnvr-train
-
-# 1. Pull the dataset off the Orin (incremental rsync).
-ORIN=tim@172.16.4.23 ./pull-dataset.sh
+# 1. Pull the dataset from the NVR's data volume (incremental rsync;
+#    same host, so this is just a local copy).
+ORIN=tim@localhost ./pull-dataset.sh   # or point at the volume path directly
 
 # 2. Build the trainer image (one-time, ~5 min — pulls the
 #    ARM64 PyTorch container).
@@ -37,15 +40,12 @@ ls runs/fnvr-v1/weights/
 
 ## Notes on flags
 
-`train.py` defaults are tuned for the Hailo-target export, not for
-peak Ultralytics accuracy:
-
-- `--imgsz 640` — must match the HEF input shape. Don't bump unless
-  you're also changing `tools/compile-hef/`'s `--resolutions`.
-- `--variant yolo11l.pt` — matches the Hailo Model Zoo recipe we use
-  in the compile step. Swap to `yolo11x.pt` later for a stretch run
-  once `yolo11l` is proven through end-to-end.
-- `nms=False` on export — Hailo re-attaches NMS during compile.
+- `--imgsz 640` — matches the DeepStream PGIE network input shape.
+  Don't bump unless you're also retuning the deploy side.
+- `--variant yolo26l.pt` — default backbone. Swap to `yolo26x.pt` for
+  a stretch run once `yolo26l` is proven end-to-end.
+- `--batch 16` — on the Spark's 128 GB unified memory you can crank
+  this to 32+ on yolo26l.
 
 ## Class set
 
@@ -54,6 +54,7 @@ detection or draw a manual label. It only contains the **enabled**
 classes from `detection_classes` — so the trained model's head has
 exactly that many outputs.
 
-If you change the class set after a training run, the next ONNX has
-a different head shape — `tools/compile-hef/` regenerates the HEF
-and `detector.hailo_model_version` lets you flip cleanly.
+If you change the class set after a training run, the next ONNX has a
+different head shape — pair it with a matching `labels.txt`
+(trim-classes.py writes one) and a `num-detected-classes` that the
+pipeline entrypoint resolves from `/api/v1/internal/classes`.

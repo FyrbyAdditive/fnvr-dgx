@@ -112,7 +112,6 @@ function Detector() {
   const [precision, setPrecision] = useState<DetectorSettings["yolo26_precision"]>("fp16");
   const [anpr, setAnpr] = useState<boolean>(false);
   const [faceId, setFaceId] = useState<boolean>(false);
-  const [hailoVersion, setHailoVersion] = useState<string>("stock");
 
   // Seed local state from server once.
   useEffect(() => {
@@ -121,7 +120,6 @@ function Detector() {
       setPrecision(current.yolo26_precision);
       setAnpr(!!current.anpr_enabled);
       setFaceId(!!current.face_id_enabled);
-      setHailoVersion(current.hailo_model_version || "stock");
     }
   }, [current]);
 
@@ -132,7 +130,6 @@ function Detector() {
         yolo26_precision: precision,
         anpr_enabled: anpr,
         face_id_enabled: faceId,
-        hailo_model_version: hailoVersion,
       });
       await api.restartPipeline();
     },
@@ -148,8 +145,7 @@ function Detector() {
     (variant !== current.yolo26_variant ||
       precision !== current.yolo26_precision ||
       anpr !== !!current.anpr_enabled ||
-      faceId !== !!current.face_id_enabled ||
-      hailoVersion !== (current.hailo_model_version || "stock"));
+      faceId !== !!current.face_id_enabled);
 
   return (
     <section>
@@ -256,22 +252,6 @@ function Detector() {
             />
             <span>Detect &amp; recognise faces (SCRFD-like + ArcFace)</span>
           </label>
-        </div>
-
-        <div className="grid grid-cols-[8rem_1fr] items-center gap-2">
-          <label
-            className="text-neutral-400"
-            title="Which HEF the hailo-broker loads. 'stock' uses the Hailo Model Zoo's pre-compiled yolov11l (80 COCO classes). Set to a custom name like 'fnvr-v1' to load /var/lib/fnvr/models/hailo/fnvr-v1.hef from tools/compile-hef/. Missing files transparently fall back to stock."
-          >
-            Hailo model
-          </label>
-          <input
-            type="text"
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
-            value={hailoVersion}
-            placeholder="stock"
-            onChange={(e) => setHailoVersion(e.target.value.trim().toLowerCase())}
-          />
         </div>
 
         {isAdmin && (

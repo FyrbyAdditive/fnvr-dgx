@@ -51,10 +51,6 @@ export type Camera = {
    *  doing CA validation. Populated automatically when operator ticks
    *  "Ignore certificate" on an RTSPS source. */
   mtx_tls_fingerprint?: string;
-  /** Which inference path this camera's primary detector runs on.
-   *  "trt" (default) = DeepStream nvinfer on the Orin GPU.
-   *  "hailo" = hailonet on the Hailo-8 PCIe accelerator. */
-  detector_backend?: "trt" | "hailo";
   created_at: string;
   state?: "starting" | "running" | "failed" | "unknown";
   /** Last time the api-server saw a heartbeat on
@@ -282,12 +278,6 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ mtx_proxy }),
     }),
-  updateCameraDetectorBackend: (id: string, backend: "trt" | "hailo") =>
-    req<void>(`/cameras/${id}/detector_backend`, {
-      method: "PATCH",
-      body: JSON.stringify({ backend }),
-    }),
-  getHailoStatus: () => req<{ present: boolean }>("/system/hailo"),
   updateCameraMtxTLSIgnore: (id: string, ignore: boolean) =>
     req<{ mtx_tls_fingerprint: string }>(
       `/cameras/${id}/mtx_tls_ignore`,
@@ -640,12 +630,6 @@ export type DetectorSettings = {
   yolo26_precision: "fp16" | "int8";
   anpr_enabled?: boolean;
   face_id_enabled?: boolean;
-  // Hailo HEF version: "stock" loads the pre-compiled
-  // yolov11l.hef from Hailo Model Zoo; any other string loads
-  // /var/lib/fnvr/models/hailo/<name>.hef (fine-tuned via
-  // tools/compile-hef/). Broker resolves at startup with graceful
-  // fallback to stock if the file's missing.
-  hailo_model_version?: string;
 };
 
 // Current INT8 calibration state. image_count reflects the on-disk

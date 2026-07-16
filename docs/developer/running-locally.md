@@ -112,7 +112,6 @@ See [migrations.md](migrations.md) for schema evolution; [settings.md](../operat
 | fnvr-notifications | fnvr-notifications:latest | — |
 | fnvr-ml-worker | fnvr-ml-worker:latest | 8090 internal |
 | fnvr-pipeline | fnvr-pipeline:latest | — (talks to mediamtx via internal RTSP) |
-| fnvr-hailo-broker | fnvr-hailo-broker:latest | unix socket only (`/var/run/fnvr/hailo.sock`) |
 | fnvr-mediamtx | bluenviron/mediamtx | 8554 (rtsp), 8889 (WebRTC/WHEP), 9996 (chunked fMP4 GET) |
 | fnvr-usb-bridge | ffmpeg as RTSP publisher | — |
 | fnvr-testsrc | gstreamer synthetic source | — |

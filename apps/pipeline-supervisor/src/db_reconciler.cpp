@@ -103,7 +103,7 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
 
     const char* q =
         "SELECT id, url, COALESCE(substream,''), record_mode, rotation, "
-        "       enabled_detectors, mtx_proxy, detector_backend "
+        "       enabled_detectors, mtx_proxy "
         "FROM cameras WHERE enabled = TRUE "
         "ORDER BY created_at ASC";
     PGresult* r = PQexec(conn, q);
@@ -131,10 +131,6 @@ std::vector<CameraConfig> ReadEnabledCameras(const std::string& url) {
         {
             std::string v = pgGetValueOrEmpty(r, i, 6);
             c.mtx_proxy = (v == "t" || v == "true" || v == "1");
-        }
-        {
-            std::string v = pgGetValueOrEmpty(r, i, 7);
-            c.detector_backend = v.empty() ? "trt" : v;
         }
         out.push_back(std::move(c));
     }
@@ -290,27 +286,6 @@ bool ReadMtxProxyForCamera(
     PQclear(r);
     PQfinish(conn);
     return mtx;
-}
-
-std::string ReadDetectorBackendForCamera(
-    const std::string& url, const std::string& camera_id) {
-    PGconn* conn = PQconnectdb(url.c_str());
-    if (PQstatus(conn) != CONNECTION_OK) {
-        std::cerr << "db[backend]: connect failed: " << PQerrorMessage(conn);
-        PQfinish(conn);
-        return "trt";
-    }
-    const char* q = "SELECT detector_backend FROM cameras WHERE id = $1";
-    const char* params[1] = { camera_id.c_str() };
-    PGresult* r = PQexecParams(conn, q, 1, nullptr, params, nullptr, nullptr, 0);
-    std::string backend = "trt";
-    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1) {
-        std::string v = pgGetValueOrEmpty(r, 0, 0);
-        if (!v.empty()) backend = v;
-    }
-    PQclear(r);
-    PQfinish(conn);
-    return backend;
 }
 
 }  // namespace fnvr

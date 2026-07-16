@@ -57,15 +57,15 @@ var validYoloVariants = map[string]struct{}{
 
 // validYoloVariant accepts either a stock variant or a custom-trained
 // model name in the form fnvr-vN (lowercase + digits + hyphens, ≤32
-// chars — same shape as Hailo's). The pipeline entrypoint trusts the
-// stored value and resolves it to a model file at startup; an unknown
-// fnvr-vN gracefully degrades to FP16 fallback (same path as a
-// missing ONNX) rather than crashing the worker.
+// chars). The pipeline entrypoint trusts the stored value and resolves
+// it to a model file at startup; an unknown fnvr-vN gracefully degrades
+// to FP16 fallback (same path as a missing ONNX) rather than crashing
+// the worker.
 func validYoloVariant(v string) bool {
 	if _, ok := validYoloVariants[v]; ok {
 		return true
 	}
-	if !validHailoVersion(v) {
+	if !validModelName(v) {
 		return false
 	}
 	// At least filter out empty / nonsense — any custom name should
@@ -94,21 +94,13 @@ type Detector struct {
 	// FaceIDEnabled toggles the SCRFD + ArcFace SGIE chain for face
 	// detect + embed. Same scaling + restart story as AnprEnabled.
 	FaceIDEnabled bool `json:"face_id_enabled"`
-	// HailoModelVersion picks which HEF the hailo-broker container
-	// loads at startup. "stock" → /var/lib/fnvr/models/hailo/yolov11l.hef
-	// (Hailo Model Zoo's pre-compiled weights, 80 COCO classes).
-	// Anything else → /var/lib/fnvr/models/hailo/<version>.hef, which
-	// is what tools/compile-hef/ produces from a fine-tuned ONNX. The
-	// broker entrypoint script resolves the name and falls back to
-	// "stock" with a log line if the file's missing.
-	HailoModelVersion string `json:"hailo_model_version"`
 }
 
 // GetDetector reads the detector settings, falling back to defaults if a
 // key is missing (e.g. after a fresh install before the migration's seed
 // row runs — belt-and-braces).
 func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
-	d := Detector{YoloVariant: "yolo26x", YoloPrecision: "fp16", HailoModelVersion: "stock"}
+	d := Detector{YoloVariant: "yolo26x", YoloPrecision: "fp16"}
 	if raw, err := s.Get(ctx, "detector.yolo26_variant"); err == nil {
 		_ = json.Unmarshal(raw, &d.YoloVariant)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -129,11 +121,6 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
-	if raw, err := s.Get(ctx, "detector.hailo_model_version"); err == nil {
-		_ = json.Unmarshal(raw, &d.HailoModelVersion)
-	} else if !errors.Is(err, ErrNotFound) {
-		return d, err
-	}
 	return d, nil
 }
 
@@ -146,21 +133,10 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	if _, ok := validPrecisions[d.YoloPrecision]; !ok {
 		return fmt.Errorf("invalid yolo26_precision %q", d.YoloPrecision)
 	}
-	// Permissive validation on hailo_model_version: any
-	// alphanumeric/hyphen string up to 32 chars is allowed. The
-	// broker's entrypoint script does the actual file-exists check
-	// and falls back gracefully if a referenced HEF is missing.
-	if d.HailoModelVersion == "" {
-		d.HailoModelVersion = "stock"
-	}
-	if !validHailoVersion(d.HailoModelVersion) {
-		return fmt.Errorf("invalid hailo_model_version %q (allowed: a-z, 0-9, '-', max 32 chars)", d.HailoModelVersion)
-	}
 	vb, _ := json.Marshal(d.YoloVariant)
 	pb, _ := json.Marshal(d.YoloPrecision)
 	ab, _ := json.Marshal(d.AnprEnabled)
 	fb, _ := json.Marshal(d.FaceIDEnabled)
-	hb, _ := json.Marshal(d.HailoModelVersion)
 	if err := s.Set(ctx, "detector.yolo26_variant", vb); err != nil {
 		return err
 	}
@@ -170,13 +146,12 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	if err := s.Set(ctx, "detector.anpr_enabled", ab); err != nil {
 		return err
 	}
-	if err := s.Set(ctx, "detector.face_id_enabled", fb); err != nil {
-		return err
-	}
-	return s.Set(ctx, "detector.hailo_model_version", hb)
+	return s.Set(ctx, "detector.face_id_enabled", fb)
 }
 
-func validHailoVersion(v string) bool {
+// validModelName accepts lowercase alphanumeric/hyphen names up to 32
+// chars — the shape used for custom-trained model versions.
+func validModelName(v string) bool {
 	if len(v) == 0 || len(v) > 32 {
 		return false
 	}

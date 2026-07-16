@@ -9,13 +9,8 @@ cd ~/fnvr
 git pull                              # or git fetch && git checkout <tag>
 cd deploy/docker
 
-# Without Hailo:
 sudo docker compose pull
 sudo docker compose up -d
-
-# With Hailo: ALWAYS include the overlay or the pipeline loses /var/run/fnvr/hailo.sock.
-sudo docker compose -f docker-compose.yml -f docker-compose.hailo.yml pull
-sudo docker compose -f docker-compose.yml -f docker-compose.hailo.yml up -d
 ```
 
 What happens:

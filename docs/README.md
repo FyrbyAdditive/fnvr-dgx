@@ -13,7 +13,7 @@
 ### Architecture
 
 - [Overview](architecture/README.md) — services, data flow, who talks to whom.
-- [Pipeline](architecture/pipeline.md) — DeepStream graph, MediaMTX live + recording, Hailo broker, detection publish.
+- [Pipeline](architecture/pipeline.md) — DeepStream graph, MediaMTX live + recording, detection publish.
 - [Rules engine](architecture/rules-engine.md) — zones, tripwires, schedules, cooldowns, cross-camera sequence rules, incident threading.
 - [Storage](architecture/storage.md) — segment rotation, per-camera retention + quota, disk-pressure purge.
 - [Face-ID](architecture/face-id.md) — detector + embedder models, matcher algorithm, drift detection.

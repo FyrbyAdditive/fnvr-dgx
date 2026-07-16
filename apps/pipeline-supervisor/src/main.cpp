@@ -5,8 +5,8 @@
 // or stops workers to match. Each worker independently restarts its
 // GStreamer pipeline with exponential backoff on EOS/error.
 //
-// Jetson build wires the DeepStream nvinfer chain; non-Jetson falls back
-// to pass-through record via software encoder.
+// DeepStream builds wire the nvinfer chain; GPU-less dev builds fall
+// back to pass-through record via software encoder.
 
 #include <chrono>
 #include <csignal>
@@ -95,12 +95,6 @@ int main(int argc, char** argv) {
         cam.mtx_proxy = fnvr::ReadMtxProxyForCamera(cfg.database_url, cam.id);
         if (cam.mtx_proxy) {
             std::cerr << "worker[" << cam.id << "]: mtx_proxy=on\n";
-        }
-        cam.detector_backend = fnvr::ReadDetectorBackendForCamera(
-            cfg.database_url, cam.id);
-        if (cam.detector_backend != "trt") {
-            std::cerr << "worker[" << cam.id << "]: detector_backend="
-                      << cam.detector_backend << "\n";
         }
         // Inform pipeline's bus-error path of the startup grace window
         // so transient faults during warmup don't publish `failed` to

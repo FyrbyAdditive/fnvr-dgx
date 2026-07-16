@@ -53,15 +53,9 @@ type Camera struct {
 	// CA-validation path. Needed for devices with self-signed certs that
 	// lack IP SAN entries (e.g. Bambu H2D). Populated automatically by
 	// the API when the operator toggles "Ignore certificate" in the UI.
-	MtxTLSFingerprint string `json:"mtx_tls_fingerprint,omitempty"`
-	// DetectorBackend selects the primary-detector (PGIE) inference
-	// path for this camera. "trt" (default) = DeepStream nvinfer on
-	// the Orin GPU. "hailo" = route via hailonet to the Hailo-8 PCIe
-	// accelerator. Tracker + ANPR SGIEs + face SGIEs stay on GPU
-	// regardless — only PGIE moves.
-	DetectorBackend       string    `json:"detector_backend"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	MtxTLSFingerprint string    `json:"mtx_tls_fingerprint,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type Store struct {
@@ -76,7 +70,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
 		       rotation, mtx_proxy, mtx_tls_fingerprint,
-		       detector_backend, created_at, updated_at
+		       created_at, updated_at
 		FROM cameras ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -89,7 +83,7 @@ func (s *Store) List(ctx context.Context) ([]Camera, error) {
 			&c.Enabled, &c.RetentionDays, &c.QuotaGB, &c.GroupID,
 			&c.EnabledDetectors, &c.LocationKind, &c.MuteClassesOverride,
 			&c.UnmuteClassesOverride, &c.Rotation, &c.MtxProxy,
-			&c.MtxTLSFingerprint, &c.DetectorBackend,
+			&c.MtxTLSFingerprint,
 			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -105,13 +99,13 @@ func (s *Store) Get(ctx context.Context, id string) (Camera, error) {
 		       retention_days, quota_gb, group_id, enabled_detectors,
 		       location_kind, mute_classes_override, unmute_classes_override,
 		       rotation, mtx_proxy, mtx_tls_fingerprint,
-		       detector_backend, created_at, updated_at
+		       created_at, updated_at
 		FROM cameras WHERE id = $1`, id).
 		Scan(&c.ID, &c.Name, &c.URL, &c.Substream, &c.RecordMode, &c.Enabled,
 			&c.RetentionDays, &c.QuotaGB, &c.GroupID, &c.EnabledDetectors,
 			&c.LocationKind, &c.MuteClassesOverride, &c.UnmuteClassesOverride,
 			&c.Rotation, &c.MtxProxy, &c.MtxTLSFingerprint,
-			&c.DetectorBackend, &c.CreatedAt, &c.UpdatedAt)
+			&c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}
@@ -410,29 +404,6 @@ func (s *Store) SetMtxTLSFingerprint(ctx context.Context, id, fingerprint string
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE cameras SET mtx_tls_fingerprint=$1, updated_at=NOW() WHERE id=$2`,
 		fingerprint, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// SetDetectorBackend switches this camera's primary-detector path
-// between the TensorRT (GPU) backend and the Hailo-8 (PCIe) backend.
-// The pipeline-supervisor's reconcile loop picks up the change on
-// its next tick (~5 s) and respawns just the affected worker. Other
-// cameras are unaffected.
-func (s *Store) SetDetectorBackend(ctx context.Context, id, backend string) error {
-	switch backend {
-	case "trt", "hailo":
-	default:
-		return fmt.Errorf("invalid detector_backend %q (want trt|hailo)", backend)
-	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE cameras SET detector_backend=$1, updated_at=NOW() WHERE id=$2`,
-		backend, id)
 	if err != nil {
 		return err
 	}
