@@ -202,6 +202,31 @@ func (s *Store) Patch(ctx context.Context, id int, args PatchArgs) (Class, error
 	return c, err
 }
 
+// SetEnabledBulk applies many enabled flips in one transaction, so a
+// Settings "Save & restart" can't half-apply the taxonomy: either every
+// change lands or none does. Unknown ids roll the whole batch back.
+func (s *Store) SetEnabledBulk(ctx context.Context, changes map[int]bool) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for id, enabled := range changes {
+		tag, err := tx.Exec(ctx,
+			`UPDATE detection_classes SET enabled = $1 WHERE id = $2`, enabled, id)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: id %d", ErrNotFound, id)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) Get(ctx context.Context, id int) (Class, error) {
 	var c Class
 	err := s.pool.QueryRow(ctx, `

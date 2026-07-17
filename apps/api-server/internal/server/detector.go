@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -22,15 +23,34 @@ func (s *Server) handleGetDetector(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, d)
 }
 
+// mergeDetector decodes a partial JSON body over the current settings,
+// so fields the client omits keep their stored values. Without this,
+// a client built before a field existed (or one sending a subset)
+// silently resets everything it doesn't know about — that once reverted
+// the fleet's inference_backend=triton to nvinfer on a UI ANPR toggle.
+func mergeDetector(cur settings.Detector, body io.Reader) (settings.Detector, error) {
+	d := cur
+	if err := json.NewDecoder(body).Decode(&d); err != nil {
+		return cur, err
+	}
+	return d, nil
+}
+
 func (s *Server) handleUpdateDetector(w http.ResponseWriter, r *http.Request) {
-	var d settings.Detector
-	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+	cur, err := s.settings.GetDetector(r.Context())
+	if err != nil {
+		slog.Error("get detector settings", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	d, err := mergeDetector(cur, r.Body)
+	if err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if err := s.settings.SetDetector(r.Context(), d); err != nil {
-		// Validation errors (bad variant / precision) come through here —
-		// surface as 400 so the UI can show them, not 500.
+		// Validation errors (bad variant / precision / backend×family)
+		// come through here — surface as 400 so the UI can show them.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

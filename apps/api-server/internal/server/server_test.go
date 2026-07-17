@@ -5,12 +5,15 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/fnvr/fnvr/apps/api-server/internal/classes"
 	"github.com/fnvr/fnvr/apps/api-server/internal/config"
 	"github.com/fnvr/fnvr/apps/api-server/internal/detections"
 	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
+	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
+	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 )
 
 // TestHealthNoDB covers only the routing layer — no DB hit.
@@ -48,12 +51,15 @@ func TestRoutingRegisteredFullDeps(t *testing.T) {
 		}
 	}()
 	s := New(Deps{
-		Config:     &config.Config{},
-		Rules:      &rules.Store{},
-		Segments:   &segments.Store{},
-		Detections: &detections.Store{},
-		Persons:    &persons.Store{},
-		Flags:      &flags.Store{},
+		Config:        &config.Config{},
+		Rules:         &rules.Store{},
+		Segments:      &segments.Store{},
+		Detections:    &detections.Store{},
+		Persons:       &persons.Store{},
+		Flags:         &flags.Store{},
+		Settings:      &settings.Store{},
+		Classes:       &classes.Store{},
+		Notifications: &notifications.Store{},
 	})
 	_ = s.Handler()
 }

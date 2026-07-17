@@ -73,14 +73,15 @@ func validYoloVariant(v string) bool {
 	// the stock list at a glance in logs and Settings.
 	return len(v) >= 6 && v[:5] == "fnvr-"
 }
-// fp16 is the default; fp8/nvfp4 consume a pre-quantised ONNX produced
-// by tools/quant-onnx on the Spark (Blackwell-native precisions); int8
-// is the legacy offline-trtexec calibration path.
+// fp16 is the default; int8 is the legacy offline-trtexec calibration
+// path. fp8/nvfp4 were once accepted here but the entrypoint has no
+// branch for them (they silently ran fp16) — real quantisation ships as
+// a pre-quantised ONNX under a custom fnvr-* variant name instead.
+// Legacy fp8/nvfp4 rows are still readable via GetDetector; only new
+// writes are restricted.
 var validPrecisions = map[string]struct{}{
-	"fp16":  {},
-	"fp8":   {},
-	"nvfp4": {},
-	"int8":  {},
+	"fp16": {},
+	"int8": {},
 }
 
 var validFamilies = map[string]struct{}{
@@ -171,21 +172,24 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	return d, nil
 }
 
-// SetDetector validates and upserts detector settings. Any invalid value
-// produces an error and no write happens.
-func (s *Store) SetDetector(ctx context.Context, d Detector) error {
+// Validate checks all fields and normalises the defaultable ones in
+// place (empty family/variant/backend get their defaults, so the
+// stored keys are never ambiguous empty strings).
+func (d *Detector) Validate() error {
 	if !validYoloVariant(d.YoloVariant) {
 		return fmt.Errorf("invalid yolo26_variant %q (allowed: yolo26{n,s,m,l,x} or fnvr-v<N>)", d.YoloVariant)
 	}
 	if _, ok := validPrecisions[d.YoloPrecision]; !ok {
-		return fmt.Errorf("invalid yolo26_precision %q", d.YoloPrecision)
+		return fmt.Errorf("invalid yolo26_precision %q (want fp16|int8)", d.YoloPrecision)
 	}
 	if d.Interval < 0 || d.Interval > 4 {
 		return fmt.Errorf("invalid interval %d (0-4)", d.Interval)
 	}
-	if d.InferenceBackend != "" && d.InferenceBackend != "nvinfer" &&
-		d.InferenceBackend != "triton" {
-		return fmt.Errorf("invalid inference_backend %q", d.InferenceBackend)
+	if d.InferenceBackend == "" {
+		d.InferenceBackend = "nvinfer"
+	}
+	if d.InferenceBackend != "nvinfer" && d.InferenceBackend != "triton" {
+		return fmt.Errorf("invalid inference_backend %q (want nvinfer|triton)", d.InferenceBackend)
 	}
 	if d.ModelFamily == "" {
 		d.ModelFamily = "yolo26"
@@ -193,11 +197,23 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	if _, ok := validFamilies[d.ModelFamily]; !ok {
 		return fmt.Errorf("invalid model_family %q (want yolo26|rfdetr)", d.ModelFamily)
 	}
+	if d.InferenceBackend == "triton" && d.ModelFamily != "rfdetr" {
+		return fmt.Errorf("inference_backend=triton requires model_family=rfdetr (the Triton path serves only the RF-DETR engine)")
+	}
 	if d.RFDETRVariant == "" {
 		d.RFDETRVariant = "base"
 	}
 	if _, ok := validRFDETRVariants[d.RFDETRVariant]; !ok {
 		return fmt.Errorf("invalid rfdetr_variant %q", d.RFDETRVariant)
+	}
+	return nil
+}
+
+// SetDetector validates and upserts detector settings. Any invalid value
+// produces an error and no write happens.
+func (s *Store) SetDetector(ctx context.Context, d Detector) error {
+	if err := d.Validate(); err != nil {
+		return err
 	}
 	mb, _ := json.Marshal(d.ModelFamily)
 	rb, _ := json.Marshal(d.RFDETRVariant)
@@ -247,34 +263,6 @@ func validModelName(v string) bool {
 		}
 	}
 	return true
-}
-
-// Face match threshold — cosine similarity floor above which a
-// detection is considered to match an enrolled person. Callable
-// from event-processor via a Postgres read; no Go code path today
-// reads it directly but API handlers may soon.
-func (s *Store) GetFaceMatchThreshold(ctx context.Context) (float64, error) {
-	const def = 0.40
-	raw, err := s.Get(ctx, "faces.match_threshold")
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return def, nil
-		}
-		return def, err
-	}
-	var t float64
-	if err := json.Unmarshal(raw, &t); err != nil || t <= 0 || t >= 1 {
-		return def, nil
-	}
-	return t, nil
-}
-
-func (s *Store) SetFaceMatchThreshold(ctx context.Context, t float64) error {
-	if t <= 0 || t >= 1 {
-		return fmt.Errorf("threshold must be in (0,1)")
-	}
-	b, _ := json.Marshal(t)
-	return s.Set(ctx, "faces.match_threshold", b)
 }
 
 // HAConfig is the Home Assistant bridge config surfaced via /settings/ha.

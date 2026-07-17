@@ -93,6 +93,45 @@ func (s *Server) handlePatchClass(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
+// POST /api/v1/admin/classes/bulk_enable
+// Body: {"changes": [{"id": 7, "enabled": false}, ...]} — one atomic
+// transaction, so the Settings "Save & restart" flow can't half-apply
+// a batch of taxonomy toggles before the single pipeline restart.
+func (s *Server) handleBulkEnableClasses(w http.ResponseWriter, r *http.Request) {
+	if s.classes == nil {
+		http.Error(w, "classes store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Changes []struct {
+			ID      int  `json:"id"`
+			Enabled bool `json:"enabled"`
+		} `json:"changes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(body.Changes) == 0 {
+		http.Error(w, "no changes provided", http.StatusBadRequest)
+		return
+	}
+	changes := make(map[int]bool, len(body.Changes))
+	for _, c := range body.Changes {
+		changes[c.ID] = c.Enabled
+	}
+	err := s.classes.SetEnabledBulk(r.Context(), changes)
+	switch {
+	case errors.Is(err, classes.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // DELETE /api/v1/admin/classes/{id}
 // Refuses on seeded COCO rows (use PATCH enabled=false instead) and on
 // custom classes that already have flagged samples in object_flags.

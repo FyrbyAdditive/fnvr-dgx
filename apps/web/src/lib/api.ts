@@ -502,6 +502,12 @@ export const api = {
       body: JSON.stringify({ startup_grace_sec: sec }),
     }),
 
+  // Advanced runtime knobs (whitelisted server-side). PUT accepts a
+  // partial object — only the provided keys are written.
+  getAdvancedSettings: () => req<AdvancedSettings>("/settings/advanced"),
+  updateAdvancedSettings: (body: Partial<AdvancedSettings>) =>
+    req<void>("/settings/advanced", { method: "PUT", body: JSON.stringify(body) }),
+
   // Face ID: persons CRUD + recent-faces view for enrolment.
   listPersons: () => req<Person[]>("/persons"),
   createPerson: (body: Partial<Person>) =>
@@ -699,10 +705,32 @@ export type DetectorSettings = {
   model_family?: "yolo26" | "rfdetr";
   rfdetr_variant?: "nano" | "small" | "medium" | "base" | "large";
   yolo26_variant: string;
-  // fp8/nvfp4 consume a pre-quantised ONNX from tools/quant-onnx.
-  yolo26_precision: "fp16" | "fp8" | "nvfp4" | "int8";
+  // fp16|int8 are writable; legacy fp8/nvfp4 rows may still be READ
+  // from old installs (server rejects new writes — real quantisation
+  // ships as a custom fnvr-* variant instead).
+  yolo26_precision: string;
   anpr_enabled?: boolean;
   face_id_enabled?: boolean;
+  // nvinfer = in-process TensorRT per worker (default); triton =
+  // shared tritonserver via gRPC — one engine copy for the fleet.
+  // rfdetr-only; takes effect on pipeline restart.
+  inference_backend?: "nvinfer" | "triton";
+  // Skip primary inference on N of every N+1 frames (tracker bridges
+  // the gaps). 0 = every frame. Takes effect on pipeline restart.
+  interval?: number;
+};
+
+// Runtime tuning knobs (Settings → System → Advanced). Whitelisted
+// server-side; consumed by event-processor / storage-manager /
+// ml-worker on their own ~30s reload cycles — no restart needed.
+export type AdvancedSettings = {
+  "faces.match_threshold": number;
+  "faces.match_margin": number;
+  "faces.negative_penalty_weight": number;
+  "detections.suppression_hamming_threshold": number;
+  "detections.hot_hours": number;
+  "storage.min_free_pct": number;
+  "ml.cluster.batch_schedule": string;
 };
 
 // Current INT8 calibration state. image_count reflects the on-disk
@@ -961,6 +989,17 @@ export function patchDetectionClass(
 export function deleteDetectionClass(id: number) {
   invalidateDetectionClasses();
   return req<void>(`/admin/classes/${id}`, { method: "DELETE" });
+}
+
+// Atomic batch of enabled flips — the Settings "Save & restart" flow
+// uses this so a taxonomy batch can't half-apply before the single
+// pipeline restart.
+export function bulkEnableClasses(changes: { id: number; enabled: boolean }[]) {
+  invalidateDetectionClasses();
+  return req<void>("/admin/classes/bulk_enable", {
+    method: "POST",
+    body: JSON.stringify({ changes }),
+  });
 }
 
 // Legacy alias kept temporarily while callers migrate to the

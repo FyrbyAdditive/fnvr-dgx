@@ -258,6 +258,7 @@ func (s *Server) Handler() http.Handler {
 		if s.classes != nil {
 			protected.HandleFunc("GET /api/v1/admin/classes", s.handleListClasses)
 			protected.Handle("POST /api/v1/admin/classes", auth.AdminFunc(s.handleCreateClass))
+			protected.Handle("POST /api/v1/admin/classes/bulk_enable", auth.AdminFunc(s.handleBulkEnableClasses))
 			protected.Handle("PATCH /api/v1/admin/classes/{id}", auth.AdminFunc(s.handlePatchClass))
 			protected.Handle("DELETE /api/v1/admin/classes/{id}", auth.AdminFunc(s.handleDeleteClass))
 		}
@@ -291,6 +292,8 @@ func (s *Server) Handler() http.Handler {
 			protected.Handle("PUT /api/v1/settings/alarm", auth.AdminFunc(s.handleUpdateAlarm))
 			protected.HandleFunc("GET /api/v1/settings/pipeline_startup_grace", s.handleGetPipelineStartupGrace)
 			protected.Handle("PUT /api/v1/settings/pipeline_startup_grace", auth.AdminFunc(s.handleUpdatePipelineStartupGrace))
+			protected.HandleFunc("GET /api/v1/settings/advanced", s.handleGetAdvancedSettings)
+			protected.Handle("PUT /api/v1/settings/advanced", auth.AdminFunc(s.handleUpdateAdvancedSettings))
 		}
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
@@ -376,6 +379,7 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/settings/ha", guarded)
 			mux.Handle("/api/v1/settings/alarm", guarded)
 			mux.Handle("/api/v1/settings/pipeline_startup_grace", guarded)
+			mux.Handle("/api/v1/settings/advanced", guarded)
 		}
 		if s.pipelineStat != nil {
 			mux.Handle("/api/v1/system/pipeline/state", guarded)

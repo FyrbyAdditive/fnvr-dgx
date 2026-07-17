@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, SystemStorage } from "@/lib/api";
 import { useMe } from "@/lib/me";
@@ -49,7 +50,10 @@ export function Storage() {
         />
         <div className="text-xs text-neutral-500 mt-1">
           Emergency purge floor: {data.min_free_pct.toFixed(1)}%
-          {" · "}admin can tune via <code>settings.storage.min_free_pct</code>
+          {" · "}
+          <Link to="/settings?tab=system" className="text-blue-400 hover:underline">
+            tune in Settings → System
+          </Link>
         </div>
       </section>
 
