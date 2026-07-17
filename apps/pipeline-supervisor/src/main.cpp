@@ -177,11 +177,24 @@ static int runWorkerGroup(const std::string& group_id,
         std::vector<std::uint64_t> last_in(n, 0), last_push(n, 0);
         std::vector<int> bad_windows(n, 0);
         auto last_window = std::chrono::steady_clock::now();
+        // Escalating heal debounce, set per spawn by the supervisor
+        // (120s on a fresh group; doubles after each heal that didn't
+        // stick, cap 600s).
+        const int heal_delay_sec = [] {
+            const char* e = std::getenv("FNVR_HEAL_DELAY_SEC");
+            int v = e ? std::atoi(e) : 120;
+            return (v >= 30 && v <= 3600) ? v : 120;
+        }();
+        // Push-watchdog arm time: judging relay ratios while TRT
+        // engines load and seven RTSP sessions re-handshake produces
+        // false degrades that amplify every restart into churn. Only
+        // arm after the pipeline has been PLAYING for 90s.
+        std::chrono::steady_clock::time_point playing_since{};
         while (!g_stop && !p.Faulted()) {
             if (p.DeadMembers() > 0) {
                 auto age = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now() - p.FirstDeathAt()).count();
-                if (age >= 120) {
+                if (age >= heal_delay_sec) {
                     std::cerr << "group[" << group_id << "]: self-heal restart ("
                               << p.DeadMembers() << " dead member(s) for "
                               << age << "s)\n";
@@ -189,7 +202,17 @@ static int runWorkerGroup(const std::string& group_id,
                 }
             }
             const auto now = std::chrono::steady_clock::now();
-            if (p.Playing() && now - last_window >= std::chrono::seconds(30)) {
+            if (p.Playing() && playing_since.time_since_epoch().count() == 0) {
+                playing_since = now;
+            }
+            const bool armed =
+                playing_since.time_since_epoch().count() != 0 &&
+                now - playing_since >= std::chrono::seconds(90);
+            if (!armed) {
+                last_window = now;  // windows start clean at arm time
+            }
+            if (armed && p.Playing() &&
+                now - last_window >= std::chrono::seconds(30)) {
                 last_window = now;
                 for (size_t i = 0; i < n; i++) {
                     const std::uint64_t in_now   = p.InputFramesForSource(i);

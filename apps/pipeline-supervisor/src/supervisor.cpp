@@ -333,6 +333,15 @@ void Supervisor::workerMain(Worker* w) {
     // startup grace, overridden for chronic loops).
     std::deque<std::chrono::steady_clock::time_point> recent_exits;
 
+    // Escalating self-heal delay: consecutive SHORT-LIVED rc=3 exits
+    // (self-heal restarts that didn't stick) double the next child's
+    // in-process heal debounce — 120s → 240s → 480s (cap 600s). The
+    // group keeps streaming with the dead member excluded the whole
+    // time; only the broken member waits longer between reconnect
+    // attempts, so a grumpy camera stops dragging its group through a
+    // restart every 4 minutes. A child that lives ≥10 min resets it.
+    int consecutive_heal_exits = 0;
+
     // Per-member fault strikes (10-min sliding window) for quarantine
     // decisions — see the strike-counting block below.
     std::map<std::string, std::deque<std::chrono::steady_clock::time_point>>
@@ -371,6 +380,8 @@ void Supervisor::workerMain(Worker* w) {
             continue;
         }
         if (pid == 0) {
+            const int heal_delay = std::min(120 << std::min(consecutive_heal_exits, 3), 600);
+            setenv("FNVR_HEAL_DELAY_SEC", std::to_string(heal_delay).c_str(), 1);
             const char* argv0 = "/usr/local/bin/pipeline-supervisor";
             execl(argv0, argv0, "--worker-group",
                   w->plan.group_id.c_str(), member_csv.c_str(),
@@ -503,6 +514,18 @@ void Supervisor::workerMain(Worker* w) {
             backoff_ms = 1000;
         } else {
             consecutive_fast_exits++;
+        }
+
+        // Escalating-heal accounting: rc=3 from a short-lived child =
+        // the heal didn't stick; long-lived child = recovered.
+        {
+            const auto lived = std::chrono::steady_clock::now() - child_spawn_at;
+            const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            if (rc == 3 && lived < std::chrono::minutes(10)) {
+                consecutive_heal_exits++;
+            } else if (lived >= std::chrono::minutes(10)) {
+                consecutive_heal_exits = 0;
+            }
         }
 
         // Flap accounting + failed publishes.
