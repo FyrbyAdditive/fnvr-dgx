@@ -200,8 +200,9 @@ func (s *Server) handleEnrolCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"added":     n,
-		"person_id": personID,
+		"added":         n,
+		"person_id":     personID,
+		"retro_matched": s.runRetroMatch(r.Context()),
 	})
 }
 

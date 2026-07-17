@@ -579,7 +579,7 @@ export const api = {
     id: string,
     body: { person_id?: string; new_label?: string },
   ) =>
-    req<{ added: number; person_id: string }>(`/clusters/${id}/enrol`, {
+    req<{ added: number; person_id: string; retro_matched: number }>(`/clusters/${id}/enrol`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
@@ -604,7 +604,7 @@ export const api = {
     id: string,
     items: Array<{ vector: number[]; source: string; detection_id?: number }>,
   ) =>
-    req<{ added: number }>(`/persons/${id}/embeddings_bulk`, {
+    req<{ added: number; retro_matched: number }>(`/persons/${id}/embeddings_bulk`, {
       method: "POST",
       body: JSON.stringify({ items }),
     }),

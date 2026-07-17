@@ -148,10 +148,11 @@ func (s *Server) handleUploadEnrol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"person_id": personID,
-		"embedding": emb,
-		"face":      chosen,
-		"source":    source,
+		"person_id":     personID,
+		"embedding":     emb,
+		"face":          chosen,
+		"source":        source,
+		"retro_matched": s.runRetroMatch(r.Context()),
 	})
 }
 

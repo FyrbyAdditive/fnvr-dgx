@@ -47,16 +47,20 @@ export function FaceTile({
       }
       const vectors = buildEnrolVectors([face], all);
       if (vectors.length === 0) throw new Error("no embedding on this detection");
-      await api.addPersonEmbeddingsBulk(pid, vectors);
+      const res = await api.addPersonEmbeddingsBulk(pid, vectors);
       // Best-effort autohide — the enrolment itself has committed.
       try { await dismissAs("enrolled"); } catch { /* ignore */ }
-      return vectors.length;
+      return { n: vectors.length, retro: res.retro_matched ?? 0 };
     },
-    onSuccess: (n) => {
+    onSuccess: ({ n, retro }) => {
       setShowEnrol(false);
       qc.invalidateQueries({ queryKey: ["persons"] });
+      qc.invalidateQueries({ queryKey: ["recent-faces"] });
       onChanged();
-      toast.success(`Enrolled ${n} face sample${n === 1 ? "" : "s"}`);
+      toast.success(
+        `Enrolled ${n} face sample${n === 1 ? "" : "s"}` +
+          (retro > 0 ? ` · ${retro} earlier sighting${retro === 1 ? "" : "s"} auto-matched` : ""),
+      );
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "enrol failed")),
   });

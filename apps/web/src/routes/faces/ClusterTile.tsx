@@ -37,7 +37,12 @@ export function ClusterTile({
     onSuccess: (res) => {
       setShowEnrol(false);
       onChanged();
-      toast.success(`Enrolled cluster — ${res.added} embeddings added`);
+      toast.success(
+        `Enrolled cluster — ${res.added} embeddings added` +
+          (res.retro_matched > 0
+            ? ` · ${res.retro_matched} earlier sighting${res.retro_matched === 1 ? "" : "s"} auto-matched`
+            : ""),
+      );
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "enrol failed")),
   });

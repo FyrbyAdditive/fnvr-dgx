@@ -96,18 +96,21 @@ export function ReviewCard({ isAdmin }: { isAdmin: boolean }) {
       }
       const vectors = buildEnrolVectors(faces, selected);
       if (vectors.length === 0) throw new Error("nothing selected with embeddings");
-      await api.addPersonEmbeddingsBulk(pid, vectors);
+      const res = await api.addPersonEmbeddingsBulk(pid, vectors);
       try {
         await api.dismissFaces(buildDismissItems(faces, selected, "enrolled"));
       } catch {
         /* best-effort autohide */
       }
-      return vectors.length;
+      return { n: vectors.length, retro: res.retro_matched ?? 0 };
     },
-    onSuccess: (n) => {
+    onSuccess: ({ n, retro }) => {
       setShowBulkEnrol(false);
       invalidate();
-      toast.success(`Enrolled ${n} face samples`);
+      toast.success(
+        `Enrolled ${n} face samples` +
+          (retro > 0 ? ` · ${retro} earlier sighting${retro === 1 ? "" : "s"} auto-matched` : ""),
+      );
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "bulk enrol failed")),
   });

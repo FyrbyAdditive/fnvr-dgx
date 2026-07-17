@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -417,7 +418,28 @@ func (s *Server) handleAddPersonEmbeddingsBulk(w http.ResponseWriter, r *http.Re
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]int{"added": n})
+	writeJSON(w, http.StatusCreated, map[string]int{
+		"added":         n,
+		"retro_matched": s.runRetroMatch(r.Context()),
+	})
+}
+
+// runRetroMatch re-scores the recent unmatched face queue after an
+// enrolment so already-captured sightings of the newly-enrolled
+// person flip to matched (and leave the review queue) instead of
+// lingering as strangers. Non-fatal — the enrolment has committed.
+func (s *Server) runRetroMatch(ctx context.Context) int {
+	start := time.Now()
+	n, err := s.persons.RetroMatch(ctx)
+	if err != nil {
+		slog.Warn("retro-match after enrol", "err", err)
+		return 0
+	}
+	if n > 0 {
+		slog.Info("retro-matched queue faces", "updated", n,
+			"dur", time.Since(start).Round(time.Millisecond))
+	}
+	return n
 }
 
 // handleFaceThumbnail returns a JPEG cropped to the face bbox of a
