@@ -407,13 +407,17 @@ func (s *Store) ListDismissedIDs(ctx context.Context) (map[string]struct{}, erro
 	return out, rows.Err()
 }
 
-// AllNegatives returns every dismissed embedding — event-processor
-// reloads this on the same 30s cadence as positive enrolments to
-// apply negative-penalty scoring.
+// AllNegatives returns the dismissed embeddings that carry training
+// signal — "not_a_face" and "duplicate" only, mirroring the live
+// matcher's loadFaceNegatives. "deleted" and "enrolled" are UI-only
+// hides and MUST NOT feed the negative veto: they are usually the
+// operator's own face (hidden queue tiles, auto-hidden enrol seeds),
+// so including them vetoes every genuine match.
 func (s *Store) AllNegatives(ctx context.Context) ([]DismissedEmbedding, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT detection_id, reason, embedding::text
-		FROM face_dismissals`)
+		FROM face_dismissals
+		WHERE reason IN ('not_a_face', 'duplicate')`)
 	if err != nil {
 		return nil, err
 	}
