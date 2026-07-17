@@ -66,12 +66,25 @@ type blob struct {
 
 type key struct{ group, camera string }
 
+// MemberMetrics is the raw per-camera snapshot the JSON endpoint
+// serves (GET /api/v1/system/pipeline/metrics) — the same numbers the
+// Prometheus gauges carry, keyed by camera for the Live stats overlay.
+type MemberMetrics struct {
+	Group     string    `json:"group"`
+	InputFPS  float64   `json:"input_fps"`
+	PushFPS   float64   `json:"push_fps"`
+	InferFPS  float64   `json:"infer_fps"`
+	Dead      bool      `json:"dead"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // Exporter owns the subscription and the staleness janitor.
 type Exporter struct {
 	nc         *nats.Conn
 	mu         sync.Mutex
 	seen       map[key]time.Time
 	groupsSeen map[string]time.Time
+	members    map[string]MemberMetrics // camera_id → latest
 	done       chan struct{}
 }
 
@@ -89,7 +102,9 @@ func New(natsURL string) (*Exporter, error) {
 		return nil, err
 	}
 	e := &Exporter{nc: nc, seen: make(map[key]time.Time),
-		groupsSeen: make(map[string]time.Time), done: make(chan struct{})}
+		groupsSeen: make(map[string]time.Time),
+		members:    make(map[string]MemberMetrics),
+		done:       make(chan struct{})}
 	if _, err := nc.Subscribe(subject, e.handle); err != nil {
 		nc.Close()
 		return nil, err
@@ -124,7 +139,29 @@ func (e *Exporter) handle(msg *nats.Msg) {
 		}
 		memberDead.WithLabelValues(b.GroupID, m.CameraID).Set(d)
 		e.seen[key{b.GroupID, m.CameraID}] = now
+		// Last-writer-wins by camera; groups are disjoint in practice.
+		e.members[m.CameraID] = MemberMetrics{
+			Group:     b.GroupID,
+			InputFPS:  m.InputFPS,
+			PushFPS:   m.PushFPS,
+			InferFPS:  m.InferFPS,
+			Dead:      m.Dead,
+			UpdatedAt: now,
+		}
 	}
+}
+
+// Snapshot returns a copy of the per-camera metrics map for the JSON
+// endpoint. Staleness beyond ~90s is handled by the janitor; consumers
+// can additionally gate on UpdatedAt.
+func (e *Exporter) Snapshot() map[string]MemberMetrics {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]MemberMetrics, len(e.members))
+	for k, v := range e.members {
+		out[k] = v
+	}
+	return out
 }
 
 func (e *Exporter) janitor() {
@@ -136,26 +173,34 @@ func (e *Exporter) janitor() {
 			return
 		case <-t.C:
 		}
-		cutoff := time.Now().Add(-staleAge)
-		e.mu.Lock()
-		for k, at := range e.seen {
-			if at.After(cutoff) {
-				continue
-			}
-			inputFPS.DeleteLabelValues(k.group, k.camera)
-			pushFPS.DeleteLabelValues(k.group, k.camera)
-			inferFPS.DeleteLabelValues(k.group, k.camera)
-			memberDead.DeleteLabelValues(k.group, k.camera)
-			delete(e.seen, k)
+		e.prune(time.Now().Add(-staleAge))
+	}
+}
+
+// prune drops gauges + snapshot rows not refreshed since cutoff.
+// Split from the janitor loop so tests can call it directly.
+func (e *Exporter) prune(cutoff time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for k, at := range e.seen {
+		if at.After(cutoff) {
+			continue
 		}
-		for g, at := range e.groupsSeen {
-			if at.After(cutoff) {
-				continue
-			}
-			groupDead.DeleteLabelValues(g)
-			delete(e.groupsSeen, g)
+		inputFPS.DeleteLabelValues(k.group, k.camera)
+		pushFPS.DeleteLabelValues(k.group, k.camera)
+		inferFPS.DeleteLabelValues(k.group, k.camera)
+		memberDead.DeleteLabelValues(k.group, k.camera)
+		delete(e.seen, k)
+		if m, ok := e.members[k.camera]; ok && m.Group == k.group {
+			delete(e.members, k.camera)
 		}
-		e.mu.Unlock()
+	}
+	for g, at := range e.groupsSeen {
+		if at.After(cutoff) {
+			continue
+		}
+		groupDead.DeleteLabelValues(g)
+		delete(e.groupsSeen, g)
 	}
 }
 

@@ -4,3 +4,10 @@
 
 :root { color-scheme: dark; }
 html, body, #root { height: 100%; }
+
+/* Loading shimmer sweep on Live tiles while a stream connects with no
+   poster to show yet. */
+@keyframes shimmer {
+  from { transform: translateX(-30%); }
+  to { transform: translateX(30%); }
+}

@@ -508,6 +508,11 @@ export const api = {
   updateAdvancedSettings: (body: Partial<AdvancedSettings>) =>
     req<void>("/settings/advanced", { method: "PUT", body: JSON.stringify(body) }),
 
+  // Real per-camera pipeline fps (workers publish every 15s; rows older
+  // than ~90s are pruned server-side). The Live stats overlay prefers
+  // these over its SSE-derived heuristic.
+  pipelineMetrics: () => req<PipelineMetricsResponse>("/system/pipeline/metrics"),
+
   // Face ID: persons CRUD + recent-faces view for enrolment.
   listPersons: () => req<Person[]>("/persons"),
   createPerson: (body: Partial<Person>) =>
@@ -718,6 +723,19 @@ export type DetectorSettings = {
   // Skip primary inference on N of every N+1 frames (tracker bridges
   // the gaps). 0 = every frame. Takes effect on pipeline restart.
   interval?: number;
+};
+
+export type PipelineCameraMetrics = {
+  group: string;
+  input_fps: number;
+  push_fps: number;
+  infer_fps: number;
+  dead: boolean;
+  updated_at: string;
+};
+
+export type PipelineMetricsResponse = {
+  cameras: Record<string, PipelineCameraMetrics>;
 };
 
 // Runtime tuning knobs (Settings → System → Advanced). Whitelisted

@@ -11,10 +11,17 @@ import (
 	"github.com/fnvr/fnvr/apps/api-server/internal/flags"
 	"github.com/fnvr/fnvr/apps/api-server/internal/notifications"
 	"github.com/fnvr/fnvr/apps/api-server/internal/persons"
+	"github.com/fnvr/fnvr/apps/api-server/internal/pipemetrics"
 	"github.com/fnvr/fnvr/apps/api-server/internal/rules"
 	"github.com/fnvr/fnvr/apps/api-server/internal/segments"
 	"github.com/fnvr/fnvr/apps/api-server/internal/settings"
 )
+
+type stubMetrics struct{}
+
+func (stubMetrics) Snapshot() map[string]pipemetrics.MemberMetrics {
+	return map[string]pipemetrics.MemberMetrics{}
+}
 
 // TestHealthNoDB covers only the routing layer — no DB hit.
 // Real DB-backed tests live in integration tests under tests/integration/.
@@ -60,6 +67,7 @@ func TestRoutingRegisteredFullDeps(t *testing.T) {
 		Settings:      &settings.Store{},
 		Classes:       &classes.Store{},
 		Notifications: &notifications.Store{},
+		PipeMetrics:   stubMetrics{},
 	})
 	_ = s.Handler()
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { HistoricDetection } from "@/lib/api";
-import { BBox, FlagPopover } from "@/routes/live/Live";
+import { BBox, FlagPopover } from "@/routes/live/overlays";
 import { DetectionEvent } from "@/lib/events";
 
 // Adapter: BBox / FlagPopover (lifted from Live.tsx) speak in

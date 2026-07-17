@@ -48,6 +48,7 @@ type Server struct {
 	notifs       *notifications.Store
 	settings     *settings.Store
 	pipelineStat *pipeline.StateTracker
+	pipeMetrics  PipelineMetricsSource
 	natsPublish  func(subject string, data []byte) error
 	// mtxReconcile is called after any mutation that could change the
 	// desired MediaMTX proxy-path set (mtx_proxy toggle, url change on a
@@ -76,6 +77,7 @@ type Deps struct {
 	Notifications *notifications.Store
 	Settings      *settings.Store
 	PipelineStat  *pipeline.StateTracker
+	PipeMetrics   PipelineMetricsSource
 	NatsPublish   func(subject string, data []byte) error
 	MtxReconcile  func(ctx context.Context)
 	Detections    *detections.Store
@@ -101,6 +103,7 @@ func New(d Deps) *Server {
 		notifs:       d.Notifications,
 		settings:     d.Settings,
 		pipelineStat: d.PipelineStat,
+		pipeMetrics:  d.PipeMetrics,
 		natsPublish:  d.NatsPublish,
 		mtxReconcile: d.MtxReconcile,
 		detections:   d.Detections,
@@ -298,6 +301,9 @@ func (s *Server) Handler() http.Handler {
 		if s.pipelineStat != nil {
 			protected.HandleFunc("GET /api/v1/system/pipeline/state", s.handlePipelineState)
 		}
+		if s.pipeMetrics != nil {
+			protected.HandleFunc("GET /api/v1/system/pipeline/metrics", s.handlePipelineMetrics)
+		}
 		if s.natsPublish != nil {
 			protected.Handle("POST /api/v1/system/pipeline/restart", auth.AdminFunc(s.handlePipelineRestart))
 		}
@@ -383,6 +389,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		if s.pipelineStat != nil {
 			mux.Handle("/api/v1/system/pipeline/state", guarded)
+		}
+		if s.pipeMetrics != nil {
+			mux.Handle("/api/v1/system/pipeline/metrics", guarded)
 		}
 		if s.natsPublish != nil {
 			mux.Handle("/api/v1/system/pipeline/restart", guarded)

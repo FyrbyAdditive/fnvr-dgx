@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { useToast } from "./ui/Toast";
 
 type Variant = "overlay" | "inline";
 
@@ -16,6 +17,7 @@ export function CameraToggle({
   variant?: Variant;
 }) {
   const qc = useQueryClient();
+  const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [local, setLocal] = useState(enabled);
   const effective = busy ? local : enabled;
@@ -34,7 +36,9 @@ export function CameraToggle({
       onChange?.(next);
     } catch (err) {
       setLocal(!next);
-      alert(`failed to ${next ? "enable" : "disable"} camera: ${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `Failed to ${next ? "enable" : "disable"} camera: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusy(false);
     }

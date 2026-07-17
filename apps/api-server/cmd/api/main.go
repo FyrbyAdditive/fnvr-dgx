@@ -193,6 +193,7 @@ func runServe() error {
 		Notifications: notifications.NewStore(pool),
 		Settings:      settings.NewStore(pool),
 		PipelineStat:  pipelineStat,
+		PipeMetrics:   pipeMetrics,
 		NatsPublish:   pipelineStat.Publish,
 		MtxReconcile:  mtxReconcileCb,
 		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),

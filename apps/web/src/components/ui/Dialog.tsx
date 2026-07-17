@@ -7,11 +7,17 @@ export function Dialog({
   onClose,
   ariaLabel,
   children,
+  panelClassName,
+  panelRef,
 }: {
   open: boolean;
   onClose: () => void;
   ariaLabel: string;
   children: React.ReactNode;
+  /** Override the panel chrome (e.g. a video modal wants a large black
+   *  panel). Defaults to the standard small settings-dialog look. */
+  panelClassName?: string;
+  panelRef?: React.Ref<HTMLDivElement>;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -37,8 +43,12 @@ export function Dialog({
       aria-label={ariaLabel}
     >
       <div
+        ref={panelRef}
         onClick={(e) => e.stopPropagation()}
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[min(92vw,28rem)] p-4"
+        className={
+          panelClassName ??
+          "bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[min(92vw,28rem)] p-4"
+        }
       >
         {children}
       </div>

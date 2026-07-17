@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { useToast } from "./ui/Toast";
 
 type Variant = "overlay" | "inline";
 
@@ -22,6 +23,7 @@ export function CameraDetectorChips({
   variant?: Variant;
 }) {
   const qc = useQueryClient();
+  const toast = useToast();
   const [busy, setBusy] = useState(false);
   // Encoding of the stored enabled_detectors array:
   //   []          → all detectors enabled (legacy default, survives
@@ -59,7 +61,9 @@ export function CameraDetectorChips({
       qc.invalidateQueries({ queryKey: ["cameras"] });
     } catch (err) {
       setOptimistic(null);
-      alert(`failed to update detectors: ${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `Failed to update detectors: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusy(false);
       // Clear optimistic so it re-reads the server truth once the
