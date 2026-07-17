@@ -1117,10 +1117,27 @@ GstElement* GroupPipeline::BuildPipeline() {
                 "nvinfer name=embedder config-file-path=/etc/fnvr/nvinfer/adaface.txt ! ";
         }
 
+        // Primary detector backend: in-process nvinfer (default) or
+        // shared Triton via nvinferserver/gRPC — one engine copy for
+        // the whole fleet, cross-worker scheduling in tritonserver.
+        // Validated on GB10 2026-07-17 (no CUDA-IPC on iGPU; plain
+        // gRPC transport).
+        const char* backend_env = std::getenv("FNVR_INFER_BACKEND");
+        const bool use_triton =
+            backend_env && std::string(backend_env) == "triton";
+        std::string pgie_str;
+        if (use_triton) {
+            pgie_str =
+                "nvinferserver name=pgie config-file-path="
+                "/etc/fnvr/nvinferserver/rfdetr_grpc.txt ! ";
+        } else {
+            pgie_str = "nvinfer name=pgie config-file-path=" +
+                       infer_config_ + " ! ";
+        }
         p << "nvstreammux name=mux batch-size=" << sources_.size()
           << " width=" << mux_w_ << " height=" << mux_h_
           << " live-source=1 batched-push-timeout=40000 enable-padding=1 ! "
-          << "nvinfer name=pgie config-file-path=" << infer_config_ << " ! "
+          << pgie_str
           << "nvtracker name=tracker "
              "  ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so "
              "  ll-config-file=/etc/fnvr/nvinfer/tracker_NvDCF.yml "

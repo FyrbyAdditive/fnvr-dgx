@@ -16,7 +16,7 @@ infer_config {
       model_name: "rfdetr"
       version: -1
       grpc {
-        url: "localhost:8001"
+        url: "triton:8001"
         # cudaIpc (CUDA shm) is unsupported on integrated-GPU
         # platforms — GB10 included. Tensors ride regular gRPC;
         # ~4 MB/frame at fp32 560² is noise for a Grace CPU.

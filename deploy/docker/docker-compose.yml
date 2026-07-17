@@ -287,6 +287,32 @@ services:
       - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
       - "9996:9996" # playback API (timeline /get clips)
 
+  # Shared Triton inference server (detector.inference_backend=triton):
+  # serves the RF-DETR engine to every worker over gRPC — one engine
+  # copy + one CUDA context instead of per-worker duplicates. Workers
+  # fall back is manual: set the setting back to nvinfer + restart.
+  triton:
+    profiles: ["gpu"]
+    image: fnvr-pipeline
+    restart: unless-stopped
+    entrypoint: ["bash", "/usr/local/bin/triton-entrypoint.sh"]
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    volumes:
+      - fnvr-data:/var/lib/fnvr
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf localhost:8000/v2/models/rfdetr/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
   # On-demand playback transcoder: H.265 recordings → H.264 fMP4 for
   # browsers without H.265 MSE (Firefox; some remote clients). Reuses
   # the pipeline image (GStreamer + NVDEC/NVENC); both units are

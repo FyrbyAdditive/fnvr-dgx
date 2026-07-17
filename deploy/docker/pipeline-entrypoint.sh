@@ -144,6 +144,7 @@ if command -v curl >/dev/null 2>&1; then
         P=$(echo "$SETTINGS_JSON" | sed -n 's/.*"yolo26_precision":"\([^"]*\)".*/\1/p')
         MF=$(echo "$SETTINGS_JSON" | sed -n 's/.*"model_family":"\([^"]*\)".*/\1/p')
         RV=$(echo "$SETTINGS_JSON" | sed -n 's/.*"rfdetr_variant":"\([^"]*\)".*/\1/p')
+        IB=$(echo "$SETTINGS_JSON" | sed -n 's/.*"inference_backend":"\([a-z]*\)".*/\1/p')
         IV=$(echo "$SETTINGS_JSON" | sed -n 's/.*"interval":\([0-9]\+\).*/\1/p')
         A=$(echo "$SETTINGS_JSON" | sed -n 's/.*"anpr_enabled":\(true\|false\).*/\1/p')
         F=$(echo "$SETTINGS_JSON" | sed -n 's/.*"face_id_enabled":\(true\|false\).*/\1/p')
@@ -152,6 +153,7 @@ if command -v curl >/dev/null 2>&1; then
         [ -n "$MF" ] && MODEL_FAMILY="$MF"
         [ -n "$RV" ] && RFDETR_VARIANT="$RV"
         [ -n "$IV" ] && PGIE_INTERVAL="$IV"
+        [ -n "$IB" ] && export FNVR_INFER_BACKEND="$IB"
         if [ "$A" = "true" ]; then
             export FNVR_USE_ANPR=1
         else

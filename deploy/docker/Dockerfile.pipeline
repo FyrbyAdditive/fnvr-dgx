@@ -342,6 +342,9 @@ WORKDIR /src
 COPY tools/transcoder/transcoder.py /usr/local/bin/fnvr-transcoder.py
 # Retro-analytics runner (docker exec … bash /usr/local/bin/retro-replay.sh).
 COPY tools/retro/retro-replay.sh /usr/local/bin/retro-replay.sh
+# Triton service entrypoint (the `triton` compose service runs this
+# image with it — one shared engine copy for the fleet).
+COPY deploy/docker/triton-entrypoint.sh /usr/local/bin/triton-entrypoint.sh
 
 COPY apps/pipeline-supervisor /src/apps/pipeline-supervisor
 COPY libs /src/libs
@@ -387,6 +390,8 @@ RUN chmod +x /usr/local/bin/pipeline-entrypoint.sh /usr/local/bin/calibrate-yolo
 
 # DeepStream libs first, then our own installs. No Tegra dirs — this is
 # an SBSA (dGPU-style) platform.
-ENV LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:/usr/local/lib
+# /opt/tritonserver/lib: the nvinferserver plugin dlopens
+# libtritonserver.so even in gRPC mode.
+ENV LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:/usr/local/lib:/opt/tritonserver/lib
 
 ENTRYPOINT ["/usr/local/bin/pipeline-entrypoint.sh"]

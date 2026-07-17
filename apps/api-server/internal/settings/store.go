@@ -109,6 +109,11 @@ type Detector struct {
 	// FaceIDEnabled toggles the SCRFD + ArcFace SGIE chain for face
 	// detect + embed. Same scaling + restart story as AnprEnabled.
 	FaceIDEnabled bool `json:"face_id_enabled"`
+	// InferenceBackend selects how the primary detector runs:
+	// "nvinfer" (in-process TRT, default) or "triton" (shared
+	// tritonserver via nvinferserver/gRPC — one engine copy for the
+	// whole fleet). Takes effect on pipeline restart.
+	InferenceBackend string `json:"inference_backend"`
 	// Interval skips primary inference on N of every N+1 frames (the
 	// tracker bridges the gaps). 0 = infer every frame (default);
 	// 1 = every 2nd frame ≈ halves pgie GPU. The standard relief
@@ -121,7 +126,8 @@ type Detector struct {
 // row runs — belt-and-braces).
 func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	d := Detector{ModelFamily: "rfdetr", RFDETRVariant: "base",
-		YoloVariant: "yolo26x", YoloPrecision: "fp16"}
+		YoloVariant: "yolo26x", YoloPrecision: "fp16",
+		InferenceBackend: "nvinfer"}
 	if raw, err := s.Get(ctx, "detector.model_family"); err == nil {
 		_ = json.Unmarshal(raw, &d.ModelFamily)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -144,6 +150,11 @@ func (s *Store) GetDetector(ctx context.Context) (Detector, error) {
 	}
 	if raw, err := s.Get(ctx, "detector.anpr_enabled"); err == nil {
 		_ = json.Unmarshal(raw, &d.AnprEnabled)
+	} else if !errors.Is(err, ErrNotFound) {
+		return d, err
+	}
+	if raw, err := s.Get(ctx, "detector.inference_backend"); err == nil {
+		_ = json.Unmarshal(raw, &d.InferenceBackend)
 	} else if !errors.Is(err, ErrNotFound) {
 		return d, err
 	}
@@ -171,6 +182,10 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 	}
 	if d.Interval < 0 || d.Interval > 4 {
 		return fmt.Errorf("invalid interval %d (0-4)", d.Interval)
+	}
+	if d.InferenceBackend != "" && d.InferenceBackend != "nvinfer" &&
+		d.InferenceBackend != "triton" {
+		return fmt.Errorf("invalid inference_backend %q", d.InferenceBackend)
 	}
 	if d.ModelFamily == "" {
 		d.ModelFamily = "yolo26"
@@ -200,6 +215,10 @@ func (s *Store) SetDetector(ctx context.Context, d Detector) error {
 		return err
 	}
 	if err := s.Set(ctx, "detector.yolo26_precision", pb); err != nil {
+		return err
+	}
+	bb, _ := json.Marshal(d.InferenceBackend)
+	if err := s.Set(ctx, "detector.inference_backend", bb); err != nil {
 		return err
 	}
 	ib, _ := json.Marshal(d.Interval)
