@@ -28,8 +28,13 @@ type Person struct {
 	Enabled        bool      `json:"enabled"`
 	AlertOnMatch   bool      `json:"alert_on_match"`
 	EmbeddingCount int       `json:"embedding_count"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// ThumbDetectionID is the newest enrolled embedding's detection id
+	// — resolvable to a face thumbnail, so the People cards get an
+	// avatar without N+1 embedding fetches. Nil when no embedding has
+	// a detection source (e.g. photo-upload-only enrolments).
+	ThumbDetectionID *int64    `json:"thumb_detection_id,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type Embedding struct {
@@ -85,6 +90,9 @@ func (s *Store) List(ctx context.Context) ([]Person, error) {
 		SELECT p.id::text, p.label, COALESCE(p.notes,''), p.enabled,
 		       p.alert_on_match,
 		       (SELECT COUNT(*) FROM face_embeddings e WHERE e.person_id = p.id),
+		       (SELECT e.detection_id FROM face_embeddings e
+		        WHERE e.person_id = p.id AND e.detection_id IS NOT NULL
+		        ORDER BY e.created_at DESC LIMIT 1),
 		       p.created_at, p.updated_at
 		FROM persons p
 		ORDER BY p.label ASC`)
@@ -96,7 +104,8 @@ func (s *Store) List(ctx context.Context) ([]Person, error) {
 	for rows.Next() {
 		var p Person
 		if err := rows.Scan(&p.ID, &p.Label, &p.Notes, &p.Enabled,
-			&p.AlertOnMatch, &p.EmbeddingCount, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			&p.AlertOnMatch, &p.EmbeddingCount, &p.ThumbDetectionID,
+			&p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

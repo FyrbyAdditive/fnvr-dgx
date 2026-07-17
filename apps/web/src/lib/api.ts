@@ -573,7 +573,7 @@ export const api = {
   clusterRunNow: () =>
     req<void>(`/clusters/run_now`, { method: "POST" }),
   clusterStatus: () =>
-    req<{ last_run_state: unknown }>(`/clusters/status`),
+    req<{ last_run_state: ClusterRunState | null }>(`/clusters/status`),
   driftStatus: () => req<DriftStatus>(`/ml/drift/status`),
   clusterEnrol: (
     id: string,
@@ -600,23 +600,6 @@ export const api = {
       `/persons/${personID}/embeddings/delete_bulk`,
       { method: "POST", body: JSON.stringify({ ids }) },
     ),
-  addPersonEmbedding: (
-    id: string,
-    vector: number[],
-    source: string,
-    detectionID?: number,
-  ) =>
-    req<{ id: string; person_id: string; source: string; created_at: string }>(
-      `/persons/${id}/embeddings`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          vector,
-          source,
-          detection_id: detectionID ?? 0,
-        }),
-      },
-    ),
   addPersonEmbeddingsBulk: (
     id: string,
     items: Array<{ vector: number[]; source: string; detection_id?: number }>,
@@ -626,13 +609,14 @@ export const api = {
       body: JSON.stringify({ items }),
     }),
   recentFaces: (
-    opts: { hours?: number; limit?: number; unmatched?: boolean; collapse?: boolean } = {},
+    opts: { hours?: number; limit?: number; unmatched?: boolean; collapse?: boolean; camera?: string } = {},
   ) => {
     const p = new URLSearchParams();
     if (opts.hours) p.set("hours", String(opts.hours));
     if (opts.limit) p.set("limit", String(opts.limit));
     if (opts.unmatched) p.set("unmatched", "true");
     if (opts.collapse) p.set("collapse", "true");
+    if (opts.camera) p.set("camera", opts.camera);
     return req<RecentFace[]>(`/faces/recent${p.size ? `?${p}` : ""}`);
   },
   dismissFaces: (
@@ -776,9 +760,31 @@ export type Person = {
   enabled: boolean;
   alert_on_match: boolean;
   embedding_count: number;
+  /** Newest enrolled embedding's detection id — resolvable to a face
+   *  thumbnail via faceThumbUrl(). Absent for photo-upload-only
+   *  enrolments. */
+  thumb_detection_id?: number;
   created_at: string;
   updated_at: string;
 };
+
+// ml-worker's last clustering run summary (settings row, written by
+// clusters.py; "running" is set while a batch is in flight).
+export type ClusterRunState = {
+  state: "running" | "ok" | "error";
+  at?: string;
+  clusters_written?: number;
+  members_written?: number;
+  new_clusters?: number;
+  preserved_clusters?: number;
+  noise?: number;
+};
+
+// Face thumbnail URL for a detection id (post-rename {pg_id}.jpg) or
+// an upload-enrol source name (upload-<sha8>). One helper so nothing
+// hardcodes the route shape.
+export const faceThumbUrl = (idOrName: number | string) =>
+  `/api/v1/faces/thumbnail/${idOrName}.jpg`;
 
 // One enrolled embedding for a person. The 512-d vector itself is
 // never returned by the list endpoint (it's ~2KB × N rows and the UI

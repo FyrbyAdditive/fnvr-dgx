@@ -73,6 +73,7 @@ func (s *Server) handleRecentFaces(w http.ResponseWriter, r *http.Request) {
 	}
 	onlyUnmatched := r.URL.Query().Get("unmatched") == "true"
 	collapse := r.URL.Query().Get("collapse") == "true"
+	camera := r.URL.Query().Get("camera")
 
 	to := time.Now()
 	from := to.Add(-time.Duration(hours) * time.Hour)
@@ -84,10 +85,11 @@ func (s *Server) handleRecentFaces(w http.ResponseWriter, r *http.Request) {
 		fetchMult = 10
 	}
 	rows, err := s.detections.List(r.Context(), detections.ListArgs{
-		From:  from,
-		To:    to,
-		Kind:  "face",
-		Limit: limit * fetchMult,
+		CameraID: camera,
+		From:     from,
+		To:       to,
+		Kind:     "face",
+		Limit:    limit * fetchMult,
 	})
 	if err != nil {
 		slog.Error("recent faces", "err", err)

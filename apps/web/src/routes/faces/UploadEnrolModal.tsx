@@ -1,6 +1,8 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
-import { api, ApiError, Person } from "@/lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, ApiError } from "@/lib/api";
+import { Dialog } from "@/components/ui/Dialog";
+import { useToast } from "@/components/ui/Toast";
 
 // UploadEnrolModal: enrol a person from a photo upload.
 //
@@ -8,20 +10,19 @@ import { api, ApiError, Person } from "@/lib/api";
 // 1. Operator picks a file + existing person (or types a new name).
 // 2. Client POSTs multipart; server runs RetinaFace+AdaFace via
 //    ml-worker.
-// 3. On a single-face image the server enrols immediately and
-//    returns the embedding row.
+// 3. On a single-face image the server enrols immediately.
 // 4. On multiple faces the server replies 409 with the face list;
-//    we show thumbnails of the detected faces and let the operator
-//    pick the right one, then resubmit with face_index.
+//    we show a picker and resubmit with face_index.
 export function UploadEnrolModal({
-  persons,
   onClose,
   onEnrolled,
 }: {
-  persons: Person[];
   onClose: () => void;
   onEnrolled: () => void;
 }) {
+  const toast = useToast();
+  const qc = useQueryClient();
+  const { data: persons = [] } = useQuery({ queryKey: ["persons"], queryFn: api.listPersons });
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [pickId, setPickId] = useState("");
@@ -42,6 +43,8 @@ export function UploadEnrolModal({
       });
     },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["persons"] });
+      toast.success("Photo enrolled");
       onEnrolled();
     },
     onError: (err) => {
@@ -52,24 +55,28 @@ export function UploadEnrolModal({
           const payload = JSON.parse(err.message);
           if (Array.isArray(payload.faces)) {
             setMultiFaces(payload.faces);
+            return;
           }
         } catch {
-          // ignore — stays in default error-banner mode
+          /* fall through to toast */
         }
       }
+      toast.error(String((err as Error)?.message ?? "upload failed"));
     },
   });
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
-      <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-4 max-w-xl w-full space-y-3">
+    <Dialog open onClose={onClose} ariaLabel="Upload photo to enrol"
+      panelClassName="bg-neutral-950 border border-neutral-800 rounded-lg shadow-2xl w-[min(92vw,36rem)] p-4">
+      <div className="space-y-3">
         <div className="flex items-baseline gap-3">
           <h3 className="text-lg font-semibold">Upload photo to enrol</h3>
           <button
-            className="ml-auto text-neutral-400 hover:underline text-sm"
+            className="ml-auto text-neutral-400 hover:text-white"
             onClick={onClose}
+            aria-label="Close"
           >
-            close
+            ✕
           </button>
         </div>
 
@@ -141,9 +148,9 @@ export function UploadEnrolModal({
           )}
         </div>
 
-        <div className="flex gap-2 items-center">
+        <div className="flex justify-end">
           <button
-            className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1 text-sm disabled:opacity-50"
+            className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-1.5 text-sm disabled:opacity-50"
             disabled={
               submit.isPending ||
               !file ||
@@ -152,15 +159,10 @@ export function UploadEnrolModal({
             }
             onClick={() => submit.mutate()}
           >
-            {submit.isPending ? "uploading…" : "enrol"}
+            {submit.isPending ? "Uploading…" : "Enrol"}
           </button>
-          {submit.isError && !multiFaces && (
-            <span className="text-red-400 text-xs">
-              {(submit.error as Error).message}
-            </span>
-          )}
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
