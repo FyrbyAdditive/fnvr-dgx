@@ -665,6 +665,19 @@ func (e *Engine) reload(ctx context.Context) error {
 		return out
 	}
 	globalMutes := bucket("classes.disabled.global")
+	// Taxonomy-disabled classes (Settings → Detection classes) are
+	// global mutes too — the enabled flag previously only filtered UI
+	// lists/dataset exports while detections kept flowing.
+	if rows, err := e.pool.Query(ctx,
+		`SELECT slug FROM detection_classes WHERE NOT enabled`); err == nil {
+		for rows.Next() {
+			var slug string
+			if rows.Scan(&slug) == nil {
+				globalMutes = append(globalMutes, slug)
+			}
+		}
+		rows.Close()
+	}
 	indoorMutes := bucket("classes.disabled.indoor")
 	outdoorMutes := bucket("classes.disabled.outdoor")
 

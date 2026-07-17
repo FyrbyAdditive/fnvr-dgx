@@ -171,6 +171,23 @@ std::set<std::string> ReadMutedClassesForCamera(
     }
     PQclear(r1);
 
+    // 1b) Taxonomy-disabled classes (Settings → Detection classes).
+    // detection_classes.enabled=false must behave as a global mute:
+    // before this, unselecting a class only filtered UI lists and
+    // dataset exports while live detections kept flowing (user-visible
+    // bug 2026-07-17). Slugs use spaces, matching obj labels directly.
+    PGresult* r1b =
+        PQexec(conn, "SELECT slug FROM detection_classes WHERE NOT enabled");
+    if (PQresultStatus(r1b) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(r1b); i++) {
+            global.insert(PQgetvalue(r1b, i, 0));
+        }
+    } else {
+        std::cerr << "db[mutes]: detection_classes query failed: "
+                  << PQerrorMessage(conn);
+    }
+    PQclear(r1b);
+
     // 2) Per-camera row. A missing row = camera was deleted mid-spawn,
     // just return empty (worker will exit shortly anyway).
     const char* q2 =
