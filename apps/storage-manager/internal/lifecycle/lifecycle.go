@@ -46,6 +46,9 @@ func freeSpacePercent(path string) (float64, error) {
 type Config struct {
 	DatabaseURL   string
 	RecordingsDir string
+	// FaceThumbsDir is the pipeline's face-crop output dir; the
+	// retention pass in facethumbs.go prunes it.
+	FaceThumbsDir string
 	ScanInterval  time.Duration
 }
 
@@ -107,6 +110,9 @@ func (m *Manager) tick(ctx context.Context) error {
 	}
 	if err := m.pruneHotDetections(ctx); err != nil {
 		slog.Warn("prune hot detections", "err", err)
+	}
+	if err := m.pruneFaceThumbs(ctx); err != nil {
+		slog.Warn("prune face thumbs", "err", err)
 	}
 	return nil
 }

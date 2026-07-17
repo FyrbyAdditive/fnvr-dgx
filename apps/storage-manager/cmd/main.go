@@ -17,6 +17,7 @@ func main() {
 	cfg := lifecycle.Config{
 		DatabaseURL:   envOr("FNVR_DATABASE_URL", "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"),
 		RecordingsDir: envOr("FNVR_RECORDINGS_DIR", "/var/lib/fnvr/recordings"),
+		FaceThumbsDir: envOr("FNVR_FACE_THUMBS_DIR", "/var/lib/fnvr/thumbs/faces"),
 		ScanInterval:  30 * time.Second,
 	}
 
