@@ -220,15 +220,36 @@ func (s *Store) SetRuleEnabled(ctx context.Context, id string, enabled bool) err
 
 // --- Incidents ---
 
-func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+type ListIncidentsArgs struct {
+	Limit    int    // default 100, cap 500
+	CameraID string // "" = all cameras
+	// From/To select incidents whose [started_at, last_detection_at]
+	// span overlaps the window, so an incident straddling midnight
+	// shows on both days. Zero = unbounded.
+	From time.Time
+	To   time.Time
+}
+
+func (s *Store) ListIncidents(ctx context.Context, a ListIncidentsArgs) ([]Incident, error) {
+	if a.Limit <= 0 || a.Limit > 500 {
+		a.Limit = 100
+	}
+	var from, to *time.Time
+	if !a.From.IsZero() {
+		from = &a.From
+	}
+	if !a.To.IsZero() {
+		to = &a.To
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, rule_id::text, camera_id, started_at, ended_at,
 		       severity, summary, acknowledged,
 		       classes, rule_ids::text[], last_detection_at, detection_count
-		FROM incidents ORDER BY started_at DESC LIMIT $1`, limit)
+		FROM incidents
+		WHERE ($2 = '' OR camera_id = $2)
+		  AND ($3::timestamptz IS NULL OR GREATEST(last_detection_at, started_at) >= $3)
+		  AND ($4::timestamptz IS NULL OR started_at < $4)
+		ORDER BY started_at DESC LIMIT $1`, a.Limit, a.CameraID, from, to)
 	if err != nil {
 		return nil, err
 	}

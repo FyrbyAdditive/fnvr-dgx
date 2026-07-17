@@ -145,6 +145,58 @@ func (s *Server) handleListDetections(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleDetectionSummary: GET /api/v1/detections/summary
+//   ?camera_id=X&from=RFC3339&to=RFC3339&buckets=N
+//
+// Server-side time-bucket aggregation for the Timeline activity band —
+// the full range is always represented, unlike the row-limited
+// /detections listing.
+func (s *Server) handleDetectionSummary(w http.ResponseWriter, r *http.Request) {
+	args := detections.SummaryArgs{
+		CameraID: r.URL.Query().Get("camera_id"),
+	}
+	if args.CameraID == "" {
+		http.Error(w, "camera_id required", http.StatusBadRequest)
+		return
+	}
+	for _, p := range []struct {
+		name string
+		dst  *time.Time
+	}{{"from", &args.From}, {"to", &args.To}} {
+		v := r.URL.Query().Get(p.name)
+		if v == "" {
+			http.Error(w, p.name+" required", http.StatusBadRequest)
+			return
+		}
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, "bad '"+p.name+"' (need RFC3339)", http.StatusBadRequest)
+			return
+		}
+		*p.dst = t
+	}
+	if !args.To.After(args.From) {
+		http.Error(w, "'from' must precede 'to'", http.StatusBadRequest)
+		return
+	}
+	args.Buckets = 288
+	if v := r.URL.Query().Get("buckets"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1000 {
+			http.Error(w, "bad 'buckets' (1..1000)", http.StatusBadRequest)
+			return
+		}
+		args.Buckets = n
+	}
+	out, err := s.detections.Summary(r.Context(), args)
+	if err != nil {
+		slog.Error("detection summary", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 type detectionsReq struct {
 	list        detections.ListArgs
 	errResponse string

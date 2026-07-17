@@ -180,6 +180,30 @@ export type Segment = {
   tier: "hot" | "warm" | "cold";
 };
 
+export type ClassCount = {
+  class: string;
+  count: number;
+};
+
+export type SummaryBucket = {
+  /** Bucket index within [from, to); empty buckets are omitted, so
+   *  the array is sparse and ascending. */
+  i: number;
+  count: number;
+  max_confidence: number;
+  /** Top 3 classes by count, descending. */
+  top_classes: ClassCount[];
+  /** Detection kinds present ("object" | "anpr" | "face"). */
+  kinds: string[];
+};
+
+export type DetectionSummary = {
+  from: string;
+  to: string;
+  bucket_ms: number;
+  buckets: SummaryBucket[];
+};
+
 export type HistoricDetection = {
   id: number;
   event_id: string;
@@ -322,7 +346,16 @@ export const api = {
   disableRule: (id: string) =>
     req<void>(`/rules/${id}/disable`, { method: "POST" }),
 
-  listIncidents: (limit = 100) => req<Incident[]>(`/incidents?limit=${limit}`),
+  listIncidents: (
+    limit = 100,
+    opts: { cameraId?: string; from?: Date; to?: Date } = {},
+  ) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (opts.cameraId) p.set("camera_id", opts.cameraId);
+    if (opts.from) p.set("from", opts.from.toISOString());
+    if (opts.to) p.set("to", opts.to.toISOString());
+    return req<Incident[]>(`/incidents?${p}`);
+  },
   ackIncident: (id: string) =>
     req<void>(`/incidents/${id}/ack`, { method: "POST" }),
   deleteIncident: (id: string) =>
@@ -383,6 +416,19 @@ export const api = {
     if (opts.kind) p.set("kind", opts.kind);
     if (opts.plate) p.set("plate", opts.plate);
     return req<HistoricDetection[]>(`/detections${p.size ? `?${p}` : ""}`);
+  },
+
+  // Server-side time-bucket aggregation for the Timeline activity
+  // band. Unlike listDetectionsHistoric this always represents the
+  // whole range faithfully — no row limit to silently truncate at.
+  detectionSummary: (opts: { cameraId: string; from: Date; to: Date; buckets?: number }) => {
+    const p = new URLSearchParams({
+      camera_id: opts.cameraId,
+      from: opts.from.toISOString(),
+      to: opts.to.toISOString(),
+    });
+    if (opts.buckets) p.set("buckets", String(opts.buckets));
+    return req<DetectionSummary>(`/detections/summary?${p}`);
   },
 
   listHotlist: () => req<HotlistEntry[]>("/plate_hotlist"),

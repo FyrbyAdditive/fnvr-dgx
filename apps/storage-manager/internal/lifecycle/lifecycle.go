@@ -291,8 +291,8 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 		// the file at fragment-open). Use UTC since MediaMTX
 		// formats with the container's clock which we keep on UTC.
 		startedAt, perr := time.Parse(
-			"2006-01-02_15-04-05",
-			match[1]+"_"+match[2]+"-"+match[3]+"-"+match[4],
+			"2006-01-02_15-04-05.000000",
+			match[1]+"_"+match[2]+"-"+match[3]+"-"+match[4]+"."+match[5],
 		)
 		if perr != nil {
 			return nil

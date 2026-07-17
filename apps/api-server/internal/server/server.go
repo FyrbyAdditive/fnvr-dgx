@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -197,6 +198,7 @@ func (s *Server) Handler() http.Handler {
 			protected.HandleFunc("GET /api/v1/segments", s.handleListSegments)
 			protected.HandleFunc("GET /api/v1/segments/{id}/file", s.handleSegmentFile)
 			protected.HandleFunc("GET /api/v1/detections", s.handleListDetections)
+			protected.HandleFunc("GET /api/v1/detections/summary", s.handleDetectionSummary)
 		}
 
 		if s.plates != nil {
@@ -328,6 +330,11 @@ func (s *Server) Handler() http.Handler {
 			mux.Handle("/api/v1/segments", guarded)
 			mux.Handle("/api/v1/segments/", guarded)
 			mux.Handle("/api/v1/detections", guarded)
+			// Exact pattern only — the flags block below registers the
+			// "/api/v1/detections/" prefix; duplicating it here would
+			// panic at startup (and this route must stay reachable when
+			// flags is nil).
+			mux.Handle("/api/v1/detections/summary", guarded)
 		}
 		if s.plates != nil {
 			mux.Handle("/api/v1/plate_hotlist", guarded)
@@ -1001,12 +1008,35 @@ func (s *Server) setRuleEnabled(w http.ResponseWriter, r *http.Request, enabled 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleListIncidents: GET /api/v1/incidents?limit=N&camera_id=X&from=RFC3339&to=RFC3339
+// from/to select incidents whose span overlaps the window (Timeline day view).
 func (s *Server) handleListIncidents(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if v := r.URL.Query().Get("limit"); v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &limit)
+	args := rules.ListIncidentsArgs{
+		Limit:    100,
+		CameraID: r.URL.Query().Get("camera_id"),
 	}
-	out, err := s.rules.ListIncidents(r.Context(), limit)
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			args.Limit = n
+		}
+	}
+	if v := r.URL.Query().Get("from"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, "bad 'from' (need RFC3339)", http.StatusBadRequest)
+			return
+		}
+		args.From = t
+	}
+	if v := r.URL.Query().Get("to"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, "bad 'to' (need RFC3339)", http.StatusBadRequest)
+			return
+		}
+		args.To = t
+	}
+	out, err := s.rules.ListIncidents(r.Context(), args)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
