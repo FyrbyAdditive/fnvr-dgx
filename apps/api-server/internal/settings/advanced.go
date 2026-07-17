@@ -36,6 +36,17 @@ var AdvancedWhitelist = []AdvancedSpec{
 	// Detections (event-processor + api-server/storage-manager).
 	{Key: "detections.suppression_hamming_threshold", Kind: KindInt, Min: 4, Max: 16, Default: 8},
 	{Key: "detections.hot_hours", Kind: KindInt, Min: 1, Max: 168, Default: 24},
+	// Face capture (pipeline probe; resolved at worker spawn — a
+	// pipeline restart is required for changes to take effect).
+	{Key: "faces.capture.interval_ms", Kind: KindInt, Min: 250, Max: 10000, Default: 1500},
+	{Key: "faces.capture.max_per_track", Kind: KindInt, Min: 1, Max: 100, Default: 12},
+	{Key: "faces.capture.min_confidence", Kind: KindFloat, Min: 0, Max: 0.99, Default: 0.55},
+	{Key: "faces.capture.min_px", Kind: KindInt, Min: 10, Max: 200, Default: 30},
+	// Face thumbnail retention (storage-manager cycle). Floor of 8 days
+	// is deliberate: enrolment sources (recent feed ≤168h, clusters
+	// ≤7d) can never reference a thumb older than 7 days, so pruning
+	// can never race an enrolment.
+	{Key: "faces.thumbs_retention_days", Kind: KindInt, Min: 8, Max: 365, Default: 30},
 	// Storage (storage-manager purge cycle).
 	{Key: "storage.min_free_pct", Kind: KindFloat, Min: 0, Max: 50, Default: 10.0},
 	// ML (ml-worker nightly scheduler).

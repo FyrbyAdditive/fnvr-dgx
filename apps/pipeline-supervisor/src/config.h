@@ -35,6 +35,16 @@ struct CameraConfig {
     bool mtx_proxy = false;
 };
 
+// Face-capture policy resolved from the settings table at worker
+// spawn (db_reconciler::ReadFaceCaptureParams). Defaults mirror the
+// api-server AdvancedWhitelist and apply when the DB is unreachable.
+struct FaceCaptureParams {
+    int   interval_ms    = 1500;  // best-of window after the first face
+    int   max_per_track  = 12;    // budget per tracked person appearance
+    float min_confidence = 0.55f; // SCRFD score floor
+    int   min_px         = 30;    // canvas-px floor (embedder noise below)
+};
+
 struct Config {
     std::string nats_url;         // e.g. "nats://nats:4222"
     std::string database_url;     // e.g. "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"

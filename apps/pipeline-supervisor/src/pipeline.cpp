@@ -43,6 +43,19 @@ namespace fnvr {
 
 namespace fs = std::filesystem;
 
+// Face-capture policy for this worker (faces.capture.* settings,
+// snapshot at spawn via SetFaceCaptureParams; defaults apply if the
+// DB was unreachable). FNVR_FACE_CAPTURE=0 disables the limiter
+// entirely — legacy publish-every-frame — as an on-fleet A/B lever.
+static FaceCaptureParams g_face_capture;
+[[maybe_unused]] static bool faceCaptureEnabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("FNVR_FACE_CAPTURE");
+        return !(e && std::string(e) == "0");
+    }();
+    return v;
+}
+
 // Directory for worker → supervisor fault attribution markers. When a
 // bus ERROR can be pinned on one member's source chain, the child
 // writes "<camera_id>" to <run_dir>/group-<group_id>.fault and exits
@@ -110,11 +123,37 @@ struct TrackPubState {
     std::chrono::steady_clock::time_point last_seen{};
 };
 
+// Per person-track face capture state. Policy: the FIRST face of a
+// track publishes immediately (recognition latency matters); after
+// that only the best-quality face per window publishes (quality =
+// canvas-px area × confidence — sharp close-ups beat blurry distant
+// frames). After max_per_track publishes the window stretches to
+// FACE_KEEPALIVE_MS so long dwells stay bounded but visible. A track
+// pruned with a pending candidate flushes it ("goodbye frame") so a
+// short walk-by keeps its best close-up, not just the first distant
+// sighting. Keyed by the PERSON's tracker id (obj->parent->object_id
+// — SCRFD faces are children of tracked person crops).
+struct FaceTrackState {
+    int published = 0;
+    std::chrono::steady_clock::time_point last_pub{};
+    std::chrono::steady_clock::time_point last_seen{};
+    // Pending window-best candidate (empty event_id = none). The crop
+    // JPEG is (re)written at stash time under cand_event_id, so the
+    // published event always names the best frame's image.
+    float       best_quality = -1.f;
+    std::string cand_event_id;
+    std::string cand_iso;  // best frame's ts (replay-safe)
+    float       cand_conf = 0.f;
+    float       cand_x = 0, cand_y = 0, cand_w = 0, cand_h = 0;
+    std::string cand_embedding_b64;
+};
+
 struct SourceView {
     std::string                 camera_id;
     std::set<std::string>       muted_classes;
     std::atomic<std::uint64_t>* frames = nullptr;
     std::map<std::uint64_t, TrackPubState> track_pub;
+    std::map<std::uint64_t, FaceTrackState> face_pub;
     // Letterbox mapping, computed lazily from the first frame's
     // source_frame_{width,height} (runtime truth beats the probe).
     bool  lb_ready = false;
@@ -214,9 +253,9 @@ constexpr unsigned PLATEDET_GIE_ID = 2;
 constexpr unsigned SCRFD_GIE_ID   = 4;
 // ArcFace's 512-d output lands on the face obj_meta's user meta.
 constexpr int      ARCFACE_DIM    = 512;
-// Minimum face bbox in CANVAS pixels — below this, the embedder
-// output is noise.
-constexpr int      MIN_FACE_PX    = 30;
+// Long-dwell trickle once a track's face budget is spent. Not a
+// setting — one fewer knob; 2/min is plenty for "still here".
+constexpr int      FACE_KEEPALIVE_MS = 30000;
 
 std::string base64_encode(const void* data, size_t n) {
     static const char tbl[] =
@@ -417,6 +456,31 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
 // camera via frame_meta->pad_index, normalises bboxes back into
 // SOURCE space via the letterbox inverse, and publishes one JSON
 // Detection per object on fnvr.events.detection.<camera_id>.
+// One face-detection JSON object — used by the inline first-sighting
+// publish, the window-close publish, and the departure flush, so a
+// stashed candidate serialises identically to a live one (including
+// its own per-object ts, which event-processor honours over the
+// batch envelope's).
+std::string faceDetJson(const std::string& det_id, const std::string& camera_id,
+                        const std::string& iso, float conf,
+                        float x, float y, float w, float h,
+                        std::uint64_t track_id, const std::string& embedding_b64) {
+    std::ostringstream js;
+    js << "{"
+       << "\"id\":\""         << det_id                  << "\","
+       << "\"camera_id\":\""  << json_escape(camera_id)  << "\","
+       << "\"ts\":\""         << iso                     << "\","
+       << "\"class_name\":\"face\","
+       << "\"kind\":\"face\","
+       << "\"confidence\":"   << conf                    << ","
+       << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
+       <<          ",\"w\":"  << w << ",\"h\":" << h << "},"
+       << "\"track_id\":\""   << track_id                << "\","
+       << "\"attributes\":{\"embedding\":\"" << embedding_b64 << "\"}"
+       << "}";
+    return js.str();
+}
+
 GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     auto* ctx = static_cast<ProbeCtx*>(user);
     GstBuffer* buf = gst_pad_probe_info_get_buffer(info);
@@ -531,17 +595,93 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             }
             std::string embedding_b64;
             if (is_face) {
-                if (obj->rect_params.width < MIN_FACE_PX ||
-                    obj->rect_params.height < MIN_FACE_PX) {
+                // Quality gates. min_px: below ~30 canvas px the
+                // embedder output is noise. min_confidence: NEW —
+                // marginal SCRFD hits made poor training samples.
+                if (obj->rect_params.width < float(g_face_capture.min_px) ||
+                    obj->rect_params.height < float(g_face_capture.min_px)) {
+                    continue;
+                }
+                if (obj->confidence < g_face_capture.min_confidence) {
                     continue;
                 }
                 embedding_b64 = extractFaceEmbedding(obj);
                 if (embedding_b64.empty()) continue;
             }
             const char* kind = is_plate ? "anpr" : is_face ? "face" : "object";
-            const uint64_t track_id = (is_plate && obj->parent)
+            // Faces and plates are SGIE children of tracked primary
+            // objects — the meaningful track id is the PARENT's. (For
+            // faces obj->object_id is the UNTRACKED sentinel: the
+            // tracker runs before the SCRFD SGIE.)
+            const uint64_t track_id = ((is_plate || is_face) && obj->parent)
                 ? obj->parent->object_id
                 : obj->object_id;
+
+            // Face capture limiting: first face of a person-track
+            // publishes immediately; afterwards only the best face
+            // per window. See FaceTrackState for the full policy.
+            if (is_face && faceCaptureEnabled()) {
+                const auto now_tp = std::chrono::steady_clock::now();
+                auto& st = sv.face_pub[track_id];
+                st.last_seen = now_tp;
+                const float quality =
+                    obj->rect_params.width * obj->rect_params.height *
+                    obj->confidence;
+
+                // (A) First sighting — publish this frame now.
+                if (st.published == 0 && st.cand_event_id.empty() &&
+                    st.last_pub.time_since_epoch().count() == 0) {
+                    const std::string det_id = short_id();
+                    saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
+                    if (frame_batch_n++) frame_batch << ",";
+                    frame_batch << faceDetJson(det_id, sv.camera_id, iso,
+                                               obj->confidence, x, y, w, h,
+                                               track_id, embedding_b64);
+                    ctx->hb_published++;
+                    st.published = 1;
+                    st.last_pub = now_tp;
+                    continue;
+                }
+
+                // (B) Stash the window's best. Crop is written at
+                // stash time (the frame won't exist later) and
+                // overwritten in place when a better one arrives.
+                if (quality > st.best_quality) {
+                    if (st.cand_event_id.empty()) st.cand_event_id = short_id();
+                    saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh,
+                                 st.cand_event_id);
+                    st.best_quality = quality;
+                    st.cand_iso = iso;
+                    st.cand_conf = obj->confidence;
+                    st.cand_x = x; st.cand_y = y; st.cand_w = w; st.cand_h = h;
+                    st.cand_embedding_b64 = embedding_b64;
+                }
+
+                // (C) Window close — emit the pending best. The
+                // UNTRACKED sentinel (no parent — tracker absent)
+                // can't distinguish people, so the budget must not
+                // starve them: window-rate limiting only.
+                const bool unbudgeted = (track_id == ~0ULL);
+                const int window_ms =
+                    (unbudgeted || st.published < g_face_capture.max_per_track)
+                        ? g_face_capture.interval_ms
+                        : FACE_KEEPALIVE_MS;
+                if (now_tp - st.last_pub >= std::chrono::milliseconds(window_ms) &&
+                    !st.cand_event_id.empty()) {
+                    if (frame_batch_n++) frame_batch << ",";
+                    frame_batch << faceDetJson(st.cand_event_id, sv.camera_id,
+                                               st.cand_iso, st.cand_conf,
+                                               st.cand_x, st.cand_y,
+                                               st.cand_w, st.cand_h,
+                                               track_id, st.cand_embedding_b64);
+                    ctx->hb_published++;
+                    st.published++;
+                    st.last_pub = now_tp;
+                    st.best_quality = -1.f;
+                    st.cand_event_id.clear();
+                }
+                continue;  // faces never fall through to the generic emit
+            }
 
             // Publish thinning (objects only): skip the crop + publish
             // work for a track that hasn't moved, changed class, or
@@ -638,6 +778,33 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     ++it;
                 }
             }
+            // Face state: a stale track with a pending window-best gets
+            // a departure flush — for a shorter-than-window walk-by the
+            // immediate first publish is the distant/blurry frame; the
+            // flush recovers the best close-up. cand_iso keeps the best
+            // frame's own timestamp (correct in replay mode too).
+            for (auto it = sv.face_pub.begin(); it != sv.face_pub.end();) {
+                FaceTrackState& st = it->second;
+                if (st.last_seen >= cutoff) {
+                    ++it;
+                    continue;
+                }
+                if (!st.cand_event_id.empty() && ctx->nats) {
+                    const std::string payload =
+                        "{\"camera_id\":\"" + json_escape(sv.camera_id) +
+                        "\",\"ts\":\"" + st.cand_iso + "\",\"batch\":[" +
+                        faceDetJson(st.cand_event_id, sv.camera_id,
+                                    st.cand_iso, st.cand_conf,
+                                    st.cand_x, st.cand_y, st.cand_w, st.cand_h,
+                                    it->first, st.cand_embedding_b64) +
+                        "]}";
+                    if (ctx->nats->Publish(
+                            ctx->subject_prefix + sv.camera_id, payload)) {
+                        ctx->hb_published++;
+                    }
+                }
+                it = sv.face_pub.erase(it);
+            }
         }
         std::cerr << "probe[" << ctx->group_id << "]: buffers=" << ctx->hb_buffers
                   << " batch_null=" << ctx->hb_batch_null
@@ -656,6 +823,14 @@ static const auto g_worker_process_start = std::chrono::steady_clock::now();
 static int g_worker_startup_grace_sec = 0;
 
 void SetWorkerStartupGraceSec(int sec) { g_worker_startup_grace_sec = sec; }
+
+void SetFaceCaptureParams(const FaceCaptureParams& p) {
+    g_face_capture = p;
+    std::cerr << "worker: face capture interval=" << p.interval_ms
+              << "ms max_per_track=" << p.max_per_track
+              << " min_conf=" << p.min_confidence
+              << " min_px=" << p.min_px << "\n";
+}
 
 namespace {
 

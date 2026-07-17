@@ -109,6 +109,35 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
     ],
   },
   {
+    group: "Face capture",
+    rows: [
+      {
+        key: "faces.capture.interval_ms",
+        label: "Capture window (ms)",
+        hint: "After a person's first face publishes immediately, only the best face per window is kept. Default 1500. Takes effect on pipeline restart.",
+        min: 250, max: 10000, step: 250,
+      },
+      {
+        key: "faces.capture.max_per_track",
+        label: "Max faces per appearance",
+        hint: "Budget per tracked person; after this, one face every 30s while they stay in frame. Default 12. Takes effect on pipeline restart.",
+        min: 1, max: 100, step: 1,
+      },
+      {
+        key: "faces.capture.min_confidence",
+        label: "Min face confidence",
+        hint: "Faces below this detector score are never captured. Default 0.55. Takes effect on pipeline restart.",
+        min: 0, max: 0.99, step: 0.05,
+      },
+      {
+        key: "faces.capture.min_px",
+        label: "Min face size (px)",
+        hint: "Faces smaller than this on the inference canvas are skipped — below ~30px the embedder output is noise. Default 30. Takes effect on pipeline restart.",
+        min: 10, max: 200, step: 5,
+      },
+    ],
+  },
+  {
     group: "Detections",
     rows: [
       {
@@ -133,6 +162,12 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
         label: "Min free disk %",
         hint: "Emergency-purge floor: oldest recordings are deleted when free space drops below this. Shown on the Storage page. Default 10.",
         min: 0, max: 50, step: 0.5,
+      },
+      {
+        key: "faces.thumbs_retention_days",
+        label: "Face thumbnail retention (days)",
+        hint: "Days to keep face crop JPEGs not attached to an enrolled person. Enrolled-evidence thumbnails are always kept. Default 30.",
+        min: 8, max: 365, step: 1,
       },
     ],
   },

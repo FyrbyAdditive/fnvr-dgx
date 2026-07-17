@@ -85,6 +85,8 @@ static int runWorkerGroup(const std::string& group_id,
 
     fnvr::SetWorkerStartupGraceSec(
         fnvr::ReadPipelineStartupGraceSec(cfg.database_url));
+    fnvr::SetFaceCaptureParams(
+        fnvr::ReadFaceCaptureParams(cfg.database_url));
 
     fnvr::GroupPipeline p(group_id, members, cfg.recordings_dir,
                           cfg.inference_config, cfg.use_deepstream,
@@ -407,6 +409,9 @@ int main(int argc, char** argv) {
         const bool use_face =
             [] { const char* e = std::getenv("FNVR_USE_FACEID");
                  return e && std::string(e) == "1"; }();
+        // Replay shares InferSrcProbe — same face-capture limiting.
+        fnvr::SetFaceCaptureParams(
+            fnvr::ReadFaceCaptureParams(fnvr::LoadFromEnv().database_url));
         return fnvr::RunReplayFile(
             argv[2], argv[3], std::atoll(argv[4]), use_anpr, use_face,
             cfg ? cfg : "/var/lib/fnvr/models/rfdetr/rfdetr.effective.txt",

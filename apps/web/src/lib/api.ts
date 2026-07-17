@@ -745,6 +745,11 @@ export type AdvancedSettings = {
   "faces.match_threshold": number;
   "faces.match_margin": number;
   "faces.negative_penalty_weight": number;
+  "faces.capture.interval_ms": number;
+  "faces.capture.max_per_track": number;
+  "faces.capture.min_confidence": number;
+  "faces.capture.min_px": number;
+  "faces.thumbs_retention_days": number;
   "detections.suppression_hamming_threshold": number;
   "detections.hot_hours": number;
   "storage.min_free_pct": number;

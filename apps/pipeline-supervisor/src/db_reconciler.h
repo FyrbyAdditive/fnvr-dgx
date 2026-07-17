@@ -52,4 +52,9 @@ bool ReadMtxProxyForCamera(
 // the UI during their first successful connect.
 int ReadPipelineStartupGraceSec(const std::string& database_url);
 
+// ReadFaceCaptureParams returns the faces.capture.* settings, clamped
+// to the api-server whitelist ranges. Fails open to defaults on any
+// connection/parse error. Resolved once per worker spawn.
+FaceCaptureParams ReadFaceCaptureParams(const std::string& database_url);
+
 }  // namespace fnvr

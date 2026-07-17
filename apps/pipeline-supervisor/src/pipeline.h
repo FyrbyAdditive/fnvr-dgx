@@ -19,6 +19,11 @@ namespace fnvr {
 // process at startup with the value from settings.pipeline.startup_grace_sec.
 void SetWorkerStartupGraceSec(int sec);
 
+// Set the face-capture policy (faces.capture.* settings) for this
+// worker process. Called once at startup — like the mute sets, the
+// value is a point-in-time snapshot; changes apply on restart.
+void SetFaceCaptureParams(const FaceCaptureParams& p);
+
 // Retro-analytics: replay one recording file through the detection
 // stack at max speed. Detections carry base_epoch_ms + buffer PTS as
 // their timestamp and publish on fnvr.events.retro_detection.<cam>.

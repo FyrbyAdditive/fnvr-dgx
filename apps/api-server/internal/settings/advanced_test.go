@@ -36,6 +36,19 @@ func TestValidateAdvancedValue(t *testing.T) {
 		{"detections.hot_hours", "24.5", false},
 		{"detections.suppression_hamming_threshold", "8", true},
 		{"detections.suppression_hamming_threshold", "17", false},
+		// face capture
+		{"faces.capture.interval_ms", "1500", true},
+		{"faces.capture.interval_ms", "100", false},
+		{"faces.capture.interval_ms", "10001", false},
+		{"faces.capture.max_per_track", "12", true},
+		{"faces.capture.max_per_track", "3.5", false},
+		{"faces.capture.max_per_track", "0", false},
+		{"faces.capture.min_confidence", "0.55", true},
+		{"faces.capture.min_confidence", "1.2", false},
+		{"faces.capture.min_px", "30", true},
+		{"faces.capture.min_px", "5", false},
+		{"faces.thumbs_retention_days", "30", true},
+		{"faces.thumbs_retention_days", "7", false}, // below the anti-race floor
 		// hh:mm
 		{"ml.cluster.batch_schedule", `"03:00"`, true},
 		{"ml.cluster.batch_schedule", `"23:59"`, true},

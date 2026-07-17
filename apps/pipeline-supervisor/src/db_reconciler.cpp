@@ -1,5 +1,6 @@
 #include "db_reconciler.h"
 
+#include <algorithm>
 #include <iostream>
 #include <string_view>
 
@@ -282,6 +283,44 @@ int ReadPipelineStartupGraceSec(const std::string& url) {
     PQclear(r);
     PQfinish(conn);
     return sec;
+}
+
+FaceCaptureParams ReadFaceCaptureParams(const std::string& url) {
+    FaceCaptureParams p;  // defaults mirror the api-server whitelist
+    PGconn* conn = PQconnectdb(url.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        PQfinish(conn);
+        return p;
+    }
+    const char* q =
+        "SELECT key, value::text FROM settings WHERE key IN ("
+        "'faces.capture.interval_ms','faces.capture.max_per_track',"
+        "'faces.capture.min_confidence','faces.capture.min_px')";
+    PGresult* r = PQexec(conn, q);
+    if (PQresultStatus(r) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(r); ++i) {
+            const std::string key = pgGetValueOrEmpty(r, i, 0);
+            const std::string val = pgGetValueOrEmpty(r, i, 1);
+            try {
+                // Clamps repeat the whitelist ranges so a hand-edited
+                // row can't push the probe into nonsense.
+                if (key == "faces.capture.interval_ms") {
+                    p.interval_ms = std::max(250, std::min(10000, std::stoi(val)));
+                } else if (key == "faces.capture.max_per_track") {
+                    p.max_per_track = std::max(1, std::min(100, std::stoi(val)));
+                } else if (key == "faces.capture.min_confidence") {
+                    p.min_confidence = std::max(0.0f, std::min(0.99f, std::stof(val)));
+                } else if (key == "faces.capture.min_px") {
+                    p.min_px = std::max(10, std::min(200, std::stoi(val)));
+                }
+            } catch (...) {
+                // keep the default for this key
+            }
+        }
+    }
+    PQclear(r);
+    PQfinish(conn);
+    return p;
 }
 
 bool ReadMtxProxyForCamera(
