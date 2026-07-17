@@ -182,8 +182,8 @@ static int runWorkerGroup(const std::string& group_id,
         // stick, cap 600s).
         const int heal_delay_sec = [] {
             const char* e = std::getenv("FNVR_HEAL_DELAY_SEC");
-            int v = e ? std::atoi(e) : 120;
-            return (v >= 30 && v <= 3600) ? v : 120;
+            int v = e ? std::atoi(e) : 10;
+            return (v >= 5 && v <= 3600) ? v : 10;
         }();
         // Push-watchdog arm time: judging relay ratios while TRT
         // engines load and seven RTSP sessions re-handshake produces

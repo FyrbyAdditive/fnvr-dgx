@@ -380,7 +380,11 @@ void Supervisor::workerMain(Worker* w) {
             continue;
         }
         if (pid == 0) {
-            const int heal_delay = std::min(120 << std::min(consecutive_heal_exits, 3), 600);
+            // First heal fast (WiFi/link blips recover in seconds);
+            // escalate only when heals don't stick.
+            static const int kHealLadder[] = {10, 60, 240, 600};
+            const int heal_delay =
+                kHealLadder[std::min(consecutive_heal_exits, 3)];
             setenv("FNVR_HEAL_DELAY_SEC", std::to_string(heal_delay).c_str(), 1);
             const char* argv0 = "/usr/local/bin/pipeline-supervisor";
             execl(argv0, argv0, "--worker-group",
