@@ -107,20 +107,23 @@ func (s *Store) ListClusterMembers(ctx context.Context, clusterID string) ([]Clu
 	return out, rows.Err()
 }
 
-// AssignClusterToPerson adds every cluster member's embedding to the
+// AssignClusterToPerson adds the cluster members' embeddings to the
 // given person (source="cluster-{first-8-of-id}-{detection_id}"),
-// marks the cluster row as enrolled, and returns the count of added
-// embeddings. Reuses AddEmbeddingsBulk so the matcher reload picks
-// the new embeddings up on its next 30s tick.
-func (s *Store) AssignClusterToPerson(ctx context.Context, clusterID, personID string) (int, error) {
+// marks the cluster row as enrolled, and returns (added, skipped)
+// counts. Reuses AddEmbeddingsBulk so the batch is diversity-pruned
+// and the matcher reload picks the new embeddings up on its next 30s
+// tick. Members are submitted most-central-first so the pruner keeps
+// the best exemplar and only genuinely different poses after it.
+func (s *Store) AssignClusterToPerson(ctx context.Context, clusterID, personID string) (int, int, error) {
 	// Fetch member embeddings directly from face_cluster_members
 	// (the vector is stored there in pgvector's text form).
 	rows, err := s.pool.Query(ctx, `
 		SELECT detection_id, embedding::text
-		FROM face_cluster_members WHERE cluster_id = $1`,
+		FROM face_cluster_members WHERE cluster_id = $1
+		ORDER BY similarity_to_centroid DESC NULLS LAST, added_at DESC`,
 		clusterID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	items := make([]struct {
 		Vector      []float32
@@ -136,7 +139,7 @@ func (s *Store) AssignClusterToPerson(ctx context.Context, clusterID, personID s
 		var vecStr string
 		if err := rows.Scan(&detID, &vecStr); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
 		v, err := ParseVectorLiteral(vecStr)
 		if err != nil {
@@ -154,20 +157,21 @@ func (s *Store) AssignClusterToPerson(ctx context.Context, clusterID, personID s
 	}
 	rows.Close()
 	if len(items) == 0 {
-		return 0, errors.New("cluster has no members")
+		return 0, 0, errors.New("cluster has no members")
 	}
-	n, err := s.AddEmbeddingsBulk(ctx, personID, items)
+	n, skipped, err := s.AddEmbeddingsBulk(ctx, personID, items)
 	if err != nil {
-		return n, err
+		return n, skipped, err
 	}
-	// Mark the cluster as enrolled so /clusters?unenrolled=true
-	// hides it on the next reload.
+	// Mark the cluster as enrolled so /clusters?unenrolled=true hides
+	// it on the next reload. added == 0 is still an enrolment: it
+	// means the person's pool already covers every member pose.
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE face_clusters SET enrolled_person_id = $2, updated_at = NOW()
 		WHERE id = $1`, clusterID, personID); err != nil {
-		return n, err
+		return n, skipped, err
 	}
-	return n, nil
+	return n, skipped, nil
 }
 
 // DeleteCluster drops a cluster and cascades its members. Does not

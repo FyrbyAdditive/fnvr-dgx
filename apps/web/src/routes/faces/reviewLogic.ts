@@ -58,6 +58,32 @@ export function nextLimit(current: number): number {
   return Math.min(480, current + 120);
 }
 
+// enrolToastMessage renders the outcome of an enrol action. The server
+// diversity-prunes batches (near-duplicates of the person's existing
+// pool or of each other are skipped), so "selected 23, enrolled 5" is
+// normal and the message must say why.
+export function enrolToastMessage(res: {
+  added: number;
+  skipped_near_duplicates?: number;
+  retro_matched?: number;
+}): string {
+  const skipped = res.skipped_near_duplicates ?? 0;
+  const retro = res.retro_matched ?? 0;
+  let msg: string;
+  if (res.added > 0) {
+    msg = `Enrolled ${res.added} face sample${res.added === 1 ? "" : "s"}`;
+    if (skipped > 0) msg += ` · ${skipped} near-duplicate${skipped === 1 ? "" : "s"} skipped`;
+  } else if (skipped > 0) {
+    msg = `No new samples — all ${skipped} were near-duplicates of the existing enrolment`;
+  } else {
+    msg = "No samples enrolled";
+  }
+  if (retro > 0) {
+    msg += ` · ${retro} earlier sighting${retro === 1 ? "" : "s"} auto-matched`;
+  }
+  return msg;
+}
+
 // Defensive parse of the loosely-typed cluster-status payload.
 export function parseClusterRunState(u: unknown): ClusterRunState | null {
   if (!u || typeof u !== "object") return null;

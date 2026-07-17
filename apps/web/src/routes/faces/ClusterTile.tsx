@@ -4,6 +4,7 @@ import { api, Cluster, ClusterMember } from "@/lib/api";
 import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { useToast } from "@/components/ui/Toast";
 import { PersonPicker } from "./PersonPicker";
+import { enrolToastMessage } from "./reviewLogic";
 
 // One unknown-face cluster (recurring stranger). Expand to see the
 // member sightings; enrol the whole cluster in one action.
@@ -37,12 +38,7 @@ export function ClusterTile({
     onSuccess: (res) => {
       setShowEnrol(false);
       onChanged();
-      toast.success(
-        `Enrolled cluster — ${res.added} embeddings added` +
-          (res.retro_matched > 0
-            ? ` · ${res.retro_matched} earlier sighting${res.retro_matched === 1 ? "" : "s"} auto-matched`
-            : ""),
-      );
+      toast.success(enrolToastMessage(res));
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "enrol failed")),
   });

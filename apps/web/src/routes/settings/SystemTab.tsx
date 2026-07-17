@@ -109,6 +109,23 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
     ],
   },
   {
+    group: "Face enrolment",
+    rows: [
+      {
+        key: "faces.enrol.dedup_similarity",
+        label: "Enrol dedup similarity",
+        hint: "Samples this similar to an already-enrolled one (or to each other) are skipped at enrol time — near-copies fake the matcher's top-3 corroboration. Default 0.90.",
+        min: 0.5, max: 0.999, step: 0.01,
+      },
+      {
+        key: "faces.enrol.max_per_action",
+        label: "Max samples per enrol",
+        hint: "Cap on new embeddings added by one enrol action (cluster or multi-select) after dedup, keeping the most representative first. Default 8.",
+        min: 1, max: 50, step: 1,
+      },
+    ],
+  },
+  {
     group: "Face capture",
     rows: [
       {

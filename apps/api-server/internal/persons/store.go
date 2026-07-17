@@ -441,27 +441,48 @@ func (s *Store) AllNegatives(ctx context.Context) ([]DismissedEmbedding, error) 
 
 // AddEmbeddingsBulk writes multiple embeddings for a single person in
 // one call — used by the "enrol this cluster" UI where the operator
-// names one representative thumbnail and wants all near-duplicate
-// members added too. Source strings are per-embedding so the caller
-// can stamp them with the source detection IDs.
+// names one representative thumbnail and wants the diverse members
+// added too. Source strings are per-embedding so the caller can stamp
+// them with the source detection IDs.
+//
+// The batch is diversity-pruned before insert (PruneEnrolBatch):
+// near-duplicates of the person's existing pool or of an earlier
+// batch entry are dropped, and each action adds at most
+// faces.enrol.max_per_action new samples. Item order is priority
+// order. Returns (added, near-duplicates+over-cap skipped).
 func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []struct {
 	Vector      []float32
 	Source      string
 	DetectionID int64
-}) (int, error) {
-	if len(items) == 0 {
-		return 0, nil
+}) (int, int, error) {
+	valid := items[:0:0]
+	for _, it := range items {
+		if len(it.Vector) == 512 {
+			valid = append(valid, it)
+		}
 	}
+	if len(valid) == 0 {
+		return 0, 0, nil
+	}
+	existing, err := s.personVectors(ctx, personID)
+	if err != nil {
+		return 0, 0, err
+	}
+	dedupSim, maxPerAction := s.enrolParams(ctx)
+	cands := make([][]float32, len(valid))
+	for i := range valid {
+		cands[i] = valid[i].Vector
+	}
+	keep, skipped := PruneEnrolBatch(existing, cands, dedupSim, maxPerAction)
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	n := 0
-	for _, it := range items {
-		if len(it.Vector) != 512 {
-			continue
-		}
+	for _, i := range keep {
+		it := valid[i]
 		var did any
 		if it.DetectionID > 0 {
 			did = it.DetectionID
@@ -470,11 +491,11 @@ func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []
 			INSERT INTO face_embeddings (person_id, embedding, source, detection_id)
 			VALUES ($1, $2::vector, $3, $4)`,
 			personID, vectorLiteral(it.Vector), it.Source, did); err != nil {
-			return n, err
+			return n, skipped, err
 		}
 		n++
 	}
-	return n, tx.Commit(ctx)
+	return n, skipped, tx.Commit(ctx)
 }
 
 // --- helpers ---

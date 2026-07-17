@@ -11,6 +11,7 @@ import {
   buildDismissItems,
   buildEnrolVectors,
   DismissReason,
+  enrolToastMessage,
   nextLimit,
 } from "./reviewLogic";
 
@@ -102,15 +103,12 @@ export function ReviewCard({ isAdmin }: { isAdmin: boolean }) {
       } catch {
         /* best-effort autohide */
       }
-      return { n: vectors.length, retro: res.retro_matched ?? 0 };
+      return res;
     },
-    onSuccess: ({ n, retro }) => {
+    onSuccess: (res) => {
       setShowBulkEnrol(false);
       invalidate();
-      toast.success(
-        `Enrolled ${n} face samples` +
-          (retro > 0 ? ` · ${retro} earlier sighting${retro === 1 ? "" : "s"} auto-matched` : ""),
-      );
+      toast.success(enrolToastMessage(res));
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "bulk enrol failed")),
   });

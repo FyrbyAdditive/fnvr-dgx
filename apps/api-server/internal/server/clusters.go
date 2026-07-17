@@ -193,16 +193,17 @@ func (s *Server) handleEnrolCluster(w http.ResponseWriter, r *http.Request) {
 		}
 		personID = created.ID
 	}
-	n, err := s.persons.AssignClusterToPerson(r.Context(), clusterID, personID)
+	n, skipped, err := s.persons.AssignClusterToPerson(r.Context(), clusterID, personID)
 	if err != nil {
 		slog.Error("enrol cluster", "err", err, "cluster_id", clusterID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"added":         n,
-		"person_id":     personID,
-		"retro_matched": s.runRetroMatch(r.Context()),
+		"added":                   n,
+		"skipped_near_duplicates": skipped,
+		"person_id":               personID,
+		"retro_matched":           s.runRetroMatch(r.Context()),
 	})
 }
 

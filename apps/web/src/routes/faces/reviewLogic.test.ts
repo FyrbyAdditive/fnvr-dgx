@@ -3,6 +3,7 @@ import type { RecentFace } from "@/lib/api";
 import {
   buildDismissItems,
   buildEnrolVectors,
+  enrolToastMessage,
   nextLimit,
   parseClusterRunState,
 } from "./reviewLogic";
@@ -69,5 +70,38 @@ describe("parseClusterRunState", () => {
     expect(parseClusterRunState({ state: "weird" })).toBeNull();
     expect(parseClusterRunState(null)).toBeNull();
     expect(parseClusterRunState("ok")).toBeNull();
+  });
+});
+
+describe("enrolToastMessage", () => {
+  it("plain add", () => {
+    expect(enrolToastMessage({ added: 3 })).toBe("Enrolled 3 face samples");
+    expect(enrolToastMessage({ added: 1 })).toBe("Enrolled 1 face sample");
+  });
+  it("mentions skipped near-duplicates", () => {
+    expect(enrolToastMessage({ added: 5, skipped_near_duplicates: 18 })).toBe(
+      "Enrolled 5 face samples · 18 near-duplicates skipped",
+    );
+    expect(enrolToastMessage({ added: 2, skipped_near_duplicates: 1 })).toBe(
+      "Enrolled 2 face samples · 1 near-duplicate skipped",
+    );
+  });
+  it("all-duplicates outcome is explicit", () => {
+    expect(enrolToastMessage({ added: 0, skipped_near_duplicates: 4 })).toBe(
+      "No new samples — all 4 were near-duplicates of the existing enrolment",
+    );
+  });
+  it("appends retro-match count", () => {
+    expect(
+      enrolToastMessage({ added: 5, skipped_near_duplicates: 2, retro_matched: 40 }),
+    ).toBe(
+      "Enrolled 5 face samples · 2 near-duplicates skipped · 40 earlier sightings auto-matched",
+    );
+    expect(enrolToastMessage({ added: 0, skipped_near_duplicates: 4, retro_matched: 1 })).toBe(
+      "No new samples — all 4 were near-duplicates of the existing enrolment · 1 earlier sighting auto-matched",
+    );
+  });
+  it("degenerate empty result", () => {
+    expect(enrolToastMessage({ added: 0 })).toBe("No samples enrolled");
   });
 });

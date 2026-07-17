@@ -5,7 +5,12 @@ import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { useToast } from "@/components/ui/Toast";
 import { formatRelativeAge } from "@/lib/format";
 import { PersonPicker } from "./PersonPicker";
-import { buildDismissItems, buildEnrolVectors, DismissReason } from "./reviewLogic";
+import {
+  buildDismissItems,
+  buildEnrolVectors,
+  DismissReason,
+  enrolToastMessage,
+} from "./reviewLogic";
 
 // One face group in the review queue (or the person-matches grid).
 // Touch-first: actions always visible, confirms via dialog, results
@@ -50,17 +55,14 @@ export function FaceTile({
       const res = await api.addPersonEmbeddingsBulk(pid, vectors);
       // Best-effort autohide — the enrolment itself has committed.
       try { await dismissAs("enrolled"); } catch { /* ignore */ }
-      return { n: vectors.length, retro: res.retro_matched ?? 0 };
+      return res;
     },
-    onSuccess: ({ n, retro }) => {
+    onSuccess: (res) => {
       setShowEnrol(false);
       qc.invalidateQueries({ queryKey: ["persons"] });
       qc.invalidateQueries({ queryKey: ["recent-faces"] });
       onChanged();
-      toast.success(
-        `Enrolled ${n} face sample${n === 1 ? "" : "s"}` +
-          (retro > 0 ? ` · ${retro} earlier sighting${retro === 1 ? "" : "s"} auto-matched` : ""),
-      );
+      toast.success(enrolToastMessage(res));
     },
     onError: (e) => toast.error(String((e as Error)?.message ?? "enrol failed")),
   });
