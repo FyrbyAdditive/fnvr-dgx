@@ -187,6 +187,18 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
         hint: "Smoothed failure score that raises a print_failure event; lower = more sensitive (and more false alerts on supports/complex geometry). Default 0.40.",
         min: 0.1, max: 0.99, step: 0.05,
       },
+      {
+        key: "printing.defect.min_box_confidence",
+        label: "Min box confidence",
+        hint: "Detections below this never count towards the failure score. Raise it if static scenery (cable looms, wiring) keeps a camera's score permanently elevated. Default 0.08 (Obico's serving threshold).",
+        min: 0.02, max: 0.5, step: 0.02,
+      },
+      {
+        key: "printing.defect.publish_threshold",
+        label: "Timeline publish threshold",
+        hint: "How confident a single spaghetti sighting must be to appear in the timeline/overlay. The failure score still sees everything above min box confidence. Default 0.2.",
+        min: 0.05, max: 0.95, step: 0.05,
+      },
     ],
   },
   {

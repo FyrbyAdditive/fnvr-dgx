@@ -54,6 +54,8 @@ var AdvancedWhitelist = []AdvancedSpec{
 	{Key: "faces.thumbs_retention_days", Kind: KindInt, Min: 8, Max: 365, Default: 30},
 	{Key: "printing.defect.interval_sec", Kind: KindInt, Min: 5, Max: 120, Default: 10},
 	{Key: "printing.defect.alert_threshold", Kind: KindFloat, Min: 0.1, Max: 0.99, Default: 0.40},
+	{Key: "printing.defect.min_box_confidence", Kind: KindFloat, Min: 0.02, Max: 0.5, Default: 0.08},
+	{Key: "printing.defect.publish_threshold", Kind: KindFloat, Min: 0.05, Max: 0.95, Default: 0.2},
 	// Storage (storage-manager purge cycle).
 	{Key: "storage.min_free_pct", Kind: KindFloat, Min: 0, Max: 50, Default: 10.0},
 	// ML (ml-worker nightly scheduler).

@@ -52,18 +52,22 @@ _ONNX_PATH = os.environ.get(
 )
 
 _INPUT = 416
-# Obico's serving threshold: boxes above this are "positive" and feed
-# the smoothed score (server.py THRESH = 0.08).
-_BOX_THRESH = 0.08
 _NMS_THRESH = 0.4
-# Raw spaghetti sightings only publish above this (keeps the timeline
-# from collecting one-frame flickers; the EWM still sees everything).
-_PUBLISH_THRESH = 0.2
-_EWM_ALPHA = 0.22  # ~ last 8 samples carry the weight
+_EWM_ALPHA = 0.22  # ~ last 8 samples carry the weight; interval is the knob
 
-# Defaults for the settings-backed knobs.
+# Defaults for the settings-backed knobs (printing.defect.* — clamps
+# mirror the advanced-settings whitelist; all re-read every cycle).
 _DEF_INTERVAL_SEC = 10
 _DEF_ALERT_THRESHOLD = 0.40
+# Obico's serving threshold: boxes above this are "positive" and feed
+# the smoothed score (their server.py THRESH = 0.08). Raising it is
+# the lever for scenes with static spaghetti-lookalikes (cable
+# bundles, wiring looms) that contribute a permanent score floor.
+_DEF_MIN_BOX_CONFIDENCE = 0.08
+# Raw spaghetti sightings only publish to the timeline above this
+# (keeps it free of one-frame flickers; the EWM still sees everything
+# above min_box_confidence).
+_DEF_PUBLISH_THRESHOLD = 0.2
 
 
 @dataclass
@@ -115,12 +119,13 @@ def _preprocess(img_bgr: np.ndarray) -> np.ndarray:
     return (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, ...]
 
 
-def _postprocess(boxes_out: np.ndarray, confs_out: np.ndarray) -> list[Box]:
+def _postprocess(boxes_out: np.ndarray, confs_out: np.ndarray,
+                 box_thresh: float) -> list[Box]:
     """The ONNX embeds the YOLO decode: boxes [1,845,1,4] normalised
     x1y1x2y2, confs [1,845,1]. Threshold + NMS (single class)."""
     boxes = boxes_out[0, :, 0, :]
     confs = confs_out[0, :, 0]
-    mask = confs > _BOX_THRESH
+    mask = confs > box_thresh
     boxes, confs = boxes[mask], confs[mask]
     if len(boxes) == 0:
         return []
@@ -177,12 +182,13 @@ def _infer_ort(blob: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return outs[0], outs[1]
 
 
-def detect(img_bgr: np.ndarray) -> list[Box]:
+def detect(img_bgr: np.ndarray,
+           box_thresh: float = _DEF_MIN_BOX_CONFIDENCE) -> list[Box]:
     blob = _preprocess(img_bgr)
     out = _infer_triton(blob)
     if out is None:
         out = _infer_ort(blob)
-    return _postprocess(out[0], out[1])
+    return _postprocess(out[0], out[1], box_thresh)
 
 
 def newest_settled_preview(camera_id: str, max_age_sec: float = 10.0) -> np.ndarray | None:
@@ -201,24 +207,35 @@ def newest_settled_preview(camera_id: str, max_age_sec: float = 10.0) -> np.ndar
     return cv2.imread(pick)
 
 
-def _read_settings() -> tuple[int, float]:
-    interval, thresh = _DEF_INTERVAL_SEC, _DEF_ALERT_THRESHOLD
+@dataclass
+class Params:
+    interval_sec: int = _DEF_INTERVAL_SEC
+    alert_threshold: float = _DEF_ALERT_THRESHOLD
+    min_box_confidence: float = _DEF_MIN_BOX_CONFIDENCE
+    publish_threshold: float = _DEF_PUBLISH_THRESHOLD
+
+
+def read_params() -> Params:
+    p = Params()
     try:
         with psycopg.connect(_DATABASE_URL, autocommit=True) as conn:
             rows = conn.execute(
                 """SELECT key, value FROM settings
-                   WHERE key IN ('printing.defect.interval_sec',
-                                 'printing.defect.alert_threshold')"""
+                   WHERE key LIKE 'printing.defect.%'"""
             ).fetchall()
         for k, v in rows:
             f = float(v if isinstance(v, (int, float)) else json.loads(str(v)))
             if k.endswith("interval_sec") and 5 <= f <= 120:
-                interval = int(f)
+                p.interval_sec = int(f)
             elif k.endswith("alert_threshold") and 0.1 <= f <= 0.99:
-                thresh = f
+                p.alert_threshold = f
+            elif k.endswith("min_box_confidence") and 0.02 <= f <= 0.5:
+                p.min_box_confidence = f
+            elif k.endswith("publish_threshold") and 0.05 <= f <= 0.95:
+                p.publish_threshold = f
     except Exception:
         log.debug("printmon: settings read failed — defaults", exc_info=True)
-    return interval, thresh
+    return p
 
 
 def _monitored_cameras() -> list[str]:
@@ -256,27 +273,27 @@ def _detection_json(camera_id: str, class_name: str, conf: float,
     return json.dumps(det).encode()
 
 
-def sample(camera_id: str, img_bgr: np.ndarray, alert_threshold: float) -> list[bytes]:
+def sample(camera_id: str, img_bgr: np.ndarray, p: Params) -> list[bytes]:
     """One monitoring step for one camera: detect, update EWM, return
     the NATS payloads to publish (0..2). Pure w.r.t. I/O so it unit-
     tests without a bus."""
-    boxes = detect(img_bgr)
+    boxes = detect(img_bgr, box_thresh=p.min_box_confidence)
     score = sum(b.conf for b in boxes)
     st = _states.setdefault(camera_id, _CamState())
     st.ewm = (1 - _EWM_ALPHA) * st.ewm + _EWM_ALPHA * score
 
     out: list[bytes] = []
-    strong = [b for b in boxes if b.conf >= _PUBLISH_THRESH]
+    strong = [b for b in boxes if b.conf >= p.publish_threshold]
     if strong:
         out.append(_detection_json(camera_id, "spaghetti", strong[0].conf,
                                    strong[0], st.ewm))
-    if st.ewm >= alert_threshold and not st.alerted:
+    if st.ewm >= p.alert_threshold and not st.alerted:
         st.alerted = True
         out.append(_detection_json(camera_id, "print_failure",
                                    min(0.99, st.ewm),
                                    strong[0] if strong else None, st.ewm))
         log.warning("printmon: %s PRINT FAILURE alert (ewm %.3f)", camera_id, st.ewm)
-    elif st.alerted and st.ewm < alert_threshold / 2:
+    elif st.alerted and st.ewm < p.alert_threshold / 2:
         st.alerted = False
         log.info("printmon: %s re-armed (ewm %.3f)", camera_id, st.ewm)
     return out
@@ -289,7 +306,7 @@ async def run() -> None:
     nc = None
     while True:
         try:
-            interval, alert_threshold = _read_settings()
+            params = read_params()
             cams = _monitored_cameras()
             if cams:
                 if nc is None or nc.is_closed:
@@ -298,12 +315,10 @@ async def run() -> None:
                     img = newest_settled_preview(cam)
                     if img is None:
                         continue
-                    payloads = await asyncio.to_thread(
-                        sample, cam, img, alert_threshold
-                    )
-                    for p in payloads:
-                        await nc.publish(f"fnvr.events.detection.{cam}", p)
-            await asyncio.sleep(interval)
+                    payloads = await asyncio.to_thread(sample, cam, img, params)
+                    for payload in payloads:
+                        await nc.publish(f"fnvr.events.detection.{cam}", payload)
+            await asyncio.sleep(params.interval_sec)
         except asyncio.CancelledError:
             if nc is not None:
                 try:

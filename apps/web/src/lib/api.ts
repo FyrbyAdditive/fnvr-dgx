@@ -752,6 +752,8 @@ export type AdvancedSettings = {
   "faces.thumbs_retention_days": number;
   "printing.defect.interval_sec": number;
   "printing.defect.alert_threshold": number;
+  "printing.defect.min_box_confidence": number;
+  "printing.defect.publish_threshold": number;
   "detections.suppression_hamming_threshold": number;
   "detections.hot_hours": number;
   "storage.min_free_pct": number;

@@ -175,8 +175,11 @@ async def printmon_test(
     if img is None:
         raise HTTPException(status_code=404, detail="no image available")
     try:
-        boxes = await asyncio.get_event_loop().run_in_executor(
-            None, printmon.detect, img
+        # Use the live settings so test output matches what the
+        # monitor loop would score.
+        params = await asyncio.to_thread(printmon.read_params)
+        boxes = await asyncio.to_thread(
+            printmon.detect, img, params.min_box_confidence
         )
     except Exception as e:
         log.exception("printmon test failed")
@@ -187,6 +190,12 @@ async def printmon_test(
             for b in boxes
         ],
         "score": sum(b.conf for b in boxes),
+        "params": {
+            "min_box_confidence": params.min_box_confidence,
+            "alert_threshold": params.alert_threshold,
+            "publish_threshold": params.publish_threshold,
+            "interval_sec": params.interval_sec,
+        },
     }
 
 
