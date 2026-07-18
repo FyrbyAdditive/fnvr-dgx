@@ -202,6 +202,9 @@ services:
       FNVR_TZ: "Europe/London"
     volumes:
       - fnvr-data:/var/lib/fnvr
+      # printmon reads the 1-fps preview ring the pipeline writes —
+      # same shared volume as the api reader (tmpfs-backed).
+      - fnvr-live:/var/lib/fnvr/live
 
   web:
     build:
