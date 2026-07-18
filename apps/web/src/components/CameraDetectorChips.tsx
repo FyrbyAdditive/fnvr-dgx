@@ -9,6 +9,7 @@ const KINDS: { value: string; label: string; title: string }[] = [
   { value: "object", label: "obj", title: "object detection" },
   { value: "anpr", label: "anpr", title: "number plates (ANPR)" },
   { value: "face", label: "face", title: "face ID" },
+  { value: "print_defect", label: "print", title: "print-failure monitoring (3D printers)" },
 ];
 
 export function CameraDetectorChips({

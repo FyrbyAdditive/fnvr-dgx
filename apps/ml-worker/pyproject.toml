@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "nats-py>=2.10,<3",
     "python-multipart>=0.0.18",
+    "tritonclient[http]>=2.51,<3",
 ]
 
 [build-system]

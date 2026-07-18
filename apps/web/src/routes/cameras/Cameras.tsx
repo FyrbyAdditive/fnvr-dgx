@@ -223,6 +223,7 @@ const DETECTOR_KINDS: { value: string; label: string }[] = [
   { value: "object", label: "object detection" },
   { value: "anpr", label: "number plates (ANPR)" },
   { value: "face", label: "face ID" },
+  { value: "print_defect", label: "print failure (3D printers)" },
 ];
 
 function DetectorToggle({ camera }: { camera: Camera }) {

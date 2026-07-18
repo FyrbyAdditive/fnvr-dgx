@@ -181,6 +181,7 @@ const KIND_OPTIONS: { value: string; label: string }[] = [
   { value: "object", label: "object detection" },
   { value: "anpr", label: "number plates (ANPR)" },
   { value: "face", label: "face ID" },
+  { value: "print_defect", label: "print failure" },
 ];
 
 function ZoneChip({ zone, onDelete }: { zone: Zone; onDelete: () => void }) {

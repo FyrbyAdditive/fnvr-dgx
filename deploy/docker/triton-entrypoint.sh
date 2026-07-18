@@ -33,6 +33,30 @@ fi
 printf 'platform: "tensorrt_plan"\nmax_batch_size: 0\n' \
     > "$REPO/rfdetr/config.pbtxt"
 
+# Print-failure detector (Obico 2nd-gen, 416x416 static batch-1) —
+# served for ml-worker's printmon. ONNX is baked into the pipeline
+# image (this service runs that image); engine cached on the volume.
+# Non-fatal: if anything fails, ml-worker falls back to CPU ORT.
+OBICO_ONNX=/opt/fnvr/printmon/obico_failure.onnx
+OBICO_ENGINE="$MODELS/printmon/obico_failure.onnx_b1_gpu0_fp16.engine"
+if [ -s "$OBICO_ONNX" ]; then
+    mkdir -p "$REPO/obico_failure/1" "$MODELS/printmon"
+    if [ ! -s "$OBICO_ENGINE" ]; then
+        echo "triton-entry: building $OBICO_ENGINE"
+        TRTEXEC=/usr/src/tensorrt/bin/trtexec
+        [ -x "$TRTEXEC" ] || TRTEXEC=trtexec
+        "$TRTEXEC" --onnx="$OBICO_ONNX" --saveEngine="$OBICO_ENGINE" \
+            --fp16 > /tmp/obico-build.log 2>&1 \
+            || { echo "triton-entry: obico engine build FAILED (ml-worker will use CPU)"; tail -3 /tmp/obico-build.log; }
+    fi
+    if [ -s "$OBICO_ENGINE" ] && ! cmp -s "$OBICO_ENGINE" "$REPO/obico_failure/1/model.plan"; then
+        cp -f "$OBICO_ENGINE" "$REPO/obico_failure/1/model.plan"
+        echo "triton-entry: refreshed obico_failure model.plan"
+    fi
+    printf 'platform: "tensorrt_plan"\nmax_batch_size: 0\n' \
+        > "$REPO/obico_failure/config.pbtxt"
+fi
+
 exec /opt/tritonserver/bin/tritonserver \
     --model-repository="$REPO" \
     --grpc-port=8001 --http-port=8000 \

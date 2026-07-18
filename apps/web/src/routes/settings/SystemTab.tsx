@@ -173,6 +173,23 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
     ],
   },
   {
+    group: "Print monitoring",
+    rows: [
+      {
+        key: "printing.defect.interval_sec",
+        label: "Check interval (s)",
+        hint: "How often each printer camera's preview is scored for print failures (Obico model). Default 10.",
+        min: 5, max: 120, step: 5,
+      },
+      {
+        key: "printing.defect.alert_threshold",
+        label: "Alert threshold",
+        hint: "Smoothed failure score that raises a print_failure event; lower = more sensitive (and more false alerts on supports/complex geometry). Default 0.40.",
+        min: 0.1, max: 0.99, step: 0.05,
+      },
+    ],
+  },
+  {
     group: "Detections",
     rows: [
       {

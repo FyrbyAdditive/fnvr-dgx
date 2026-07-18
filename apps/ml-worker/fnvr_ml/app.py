@@ -17,6 +17,7 @@ no published port. api-server is the only client.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -33,6 +34,7 @@ from . import drift as drift_ops
 from . import face_consumer
 from . import inference
 from . import migrate as migrate_ops
+from . import printmon
 from . import scheduler as sched
 
 logging.basicConfig(
@@ -44,21 +46,21 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Start APScheduler + the NATS face-embedding consumer on startup,
-    # stop both cleanly on shutdown.
-    import asyncio
-
+    # Start APScheduler + the NATS face-embedding consumer + the
+    # print-failure monitor on startup, stop all cleanly on shutdown.
     sched.start()
     consumer = asyncio.create_task(face_consumer.run())
+    monitor = asyncio.create_task(printmon.run())
     log.info("ml-worker ready")
     try:
         yield
     finally:
-        consumer.cancel()
-        try:
-            await consumer
-        except asyncio.CancelledError:
-            pass
+        for task in (consumer, monitor):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         sched.stop()
 
 
@@ -151,14 +153,49 @@ async def drift_check() -> dict[str, Any]:
     return report
 
 
+# --- /printmon-test -------------------------------------------------
+
+@app.post("/printmon-test")
+async def printmon_test(
+    camera_id: str | None = None,
+    file: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    """Run the print-failure detector once, against an uploaded JPEG
+    or a camera's current preview frame. Debug/verification only —
+    does NOT publish or touch the camera's EWM state."""
+    import cv2 as _cv2
+
+    if file is not None:
+        data = await file.read()
+        img = _cv2.imdecode(np.frombuffer(data, np.uint8), _cv2.IMREAD_COLOR)
+    elif camera_id:
+        img = printmon.newest_settled_preview(camera_id, max_age_sec=30)
+    else:
+        raise HTTPException(status_code=400, detail="camera_id or file required")
+    if img is None:
+        raise HTTPException(status_code=404, detail="no image available")
+    try:
+        boxes = await asyncio.get_event_loop().run_in_executor(
+            None, printmon.detect, img
+        )
+    except Exception as e:
+        log.exception("printmon test failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "boxes": [
+            {"conf": b.conf, "x1": b.x1, "y1": b.y1, "x2": b.x2, "y2": b.y2}
+            for b in boxes
+        ],
+        "score": sum(b.conf for b in boxes),
+    }
+
+
 # --- /migrate-embeddings --------------------------------------------
 
 @app.post("/migrate-embeddings")
 async def migrate_embeddings() -> dict[str, Any]:
     """Re-embed old-space (unaligned adaface) enrolments into the
     aligned TopoFR space. Idempotent; see migrate.py."""
-    import asyncio
-
     try:
         report = await asyncio.to_thread(migrate_ops.run)
     except Exception as e:

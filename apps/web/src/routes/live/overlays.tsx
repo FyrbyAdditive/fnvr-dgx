@@ -20,6 +20,7 @@ export function BBox({
 }) {
   const isPlate = d.kind === "anpr";
   const isFace = d.kind === "face";
+  const isPrintDefect = d.kind === "print_defect";
   const person = isFace ? d.attributes?.person : undefined;
   // Fixed-colour boxes for the special detectors so they stand apart
   // from the COCO palette: green for plates, sky-blue for matched
@@ -30,6 +31,8 @@ export function BBox({
     ? "#fbbf24"
     : isPlate
     ? "#22c55e"
+    : isPrintDefect
+    ? "#f97316"
     : person
     ? "#38bdf8"
     : colorForClass(d.class_name);

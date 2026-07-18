@@ -198,6 +198,10 @@ RUN mkdir -p /opt/fnvr/faceid; \
         'torch==2.7.1' 'torchvision==0.22.1' 'onnx>=1.17,<2' numpy
 COPY deploy/models-cache/scrfd_10g_bnkps.onnx /opt/fnvr/faceid/scrfd_10g_bnkps.onnx
 COPY deploy/models-cache/topofr_r100.onnx /opt/fnvr/faceid/topofr_r100.onnx
+# Print-failure detector (Obico 2nd-gen; tools/model-prep/fetch_obico_model.py).
+# Consumed by the triton service (which runs this image) — see
+# triton-entrypoint.sh; ml-worker holds a CPU-fallback copy.
+COPY deploy/models-cache/obico_failure.onnx /opt/fnvr/printmon/obico_failure.onnx
 # --- Model prep (Phase 3 refresh) ------------------------------------
 # Runs in the same torch install as the RetinaFace export above:
 #   - RF-DETR base+medium → nvinfer-ready ONNX (ImageNet norm baked in)

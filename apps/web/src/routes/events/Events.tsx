@@ -122,6 +122,7 @@ export function Events() {
             {detections.map((e) => {
               const isPlate = e.kind === "anpr";
               const isFace = e.kind === "face";
+              const isPrintDefect = e.kind === "print_defect";
               const person = isFace ? e.attributes?.person : undefined;
               // Primary label: plate text for ANPR, matched-person name
               // for face detections (falls back to "face" when the
@@ -129,6 +130,8 @@ export function Events() {
               // the raw class name.
               const primary = isPlate
                 ? e.attributes?.plate ?? "plate"
+                : isPrintDefect
+                ? (e.class_name === "print_failure" ? "PRINT FAILURE" : "spaghetti")
                 : person ?? e.class_name;
               const similarity = isFace ? e.attributes?.similarity : undefined;
               return (

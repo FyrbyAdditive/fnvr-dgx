@@ -23,8 +23,8 @@ export type DetectionEvent = {
    *  the object still being there. */
   arrived_at_ms: number;
   class_name: string;
-  /** "object" | "anpr" | "face". Absent on legacy payloads (treat as "object"). */
-  kind?: "object" | "anpr" | "face";
+  /** "object" | "anpr" | "face" | "print_defect". Absent on legacy payloads (treat as "object"). */
+  kind?: "object" | "anpr" | "face" | "print_defect";
   confidence: number;
   bbox: { x: number; y: number; w: number; h: number };
   track_id?: string;

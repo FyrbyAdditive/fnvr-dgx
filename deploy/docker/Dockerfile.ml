@@ -55,6 +55,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /opt/venv /opt/venv
 COPY apps/ml-worker/fnvr_ml /opt/fnvr_ml/fnvr_ml
+# Print-failure model (Obico 2nd-gen; tools/model-prep/fetch_obico_model.py).
+# This copy is the CPU fallback — the primary inference path is the
+# Triton service (GPU), which builds its engine from the pipeline
+# image's copy of the same ONNX.
+COPY deploy/models-cache/obico_failure.onnx /opt/fnvr/models/obico_failure.onnx
 WORKDIR /opt/fnvr_ml
 
 EXPOSE 8090
