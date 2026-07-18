@@ -29,8 +29,6 @@
 #  define FNVR_HAS_DEEPSTREAM 1
 #  include <gstnvdsmeta.h>
 #  include <nvdsmeta.h>
-// NvDsInferTensorMeta + NVDSINFER_TENSOR_OUTPUT_META for the face
-// embedder's output-tensor-meta extraction.
 #  include <gstnvdsinfer.h>
 // NvBufSurface + NvBufSurfTransform for in-probe face cropping:
 // we GPU-convert the batched NVMM buffer into a small pitch-linear
@@ -145,7 +143,6 @@ struct FaceTrackState {
     std::string cand_iso;  // best frame's ts (replay-safe)
     float       cand_conf = 0.f;
     float       cand_x = 0, cand_y = 0, cand_w = 0, cand_h = 0;
-    std::string cand_embedding_b64;
 };
 
 struct SourceView {
@@ -249,10 +246,9 @@ inline bool thinEnabled() {
 // detector object. Pgie = 1; the OCR (classifier) only updates
 // classifier_meta on the plate's obj_meta — it doesn't add new objs.
 constexpr unsigned PLATEDET_GIE_ID = 2;
-// SCRFD detector is gie-unique-id=4 in scrfd.txt (arcface is 5).
+// SCRFD detector is gie-unique-id=4 in scrfd.txt. (There is no
+// in-graph embedder any more — ml-worker embeds the published crop.)
 constexpr unsigned SCRFD_GIE_ID   = 4;
-// ArcFace's 512-d output lands on the face obj_meta's user meta.
-constexpr int      ARCFACE_DIM    = 512;
 // Long-dwell trickle once a track's face budget is spent. Not a
 // setting — one fewer knob; 2/min is plenty for "still here".
 constexpr int      FACE_KEEPALIVE_MS = 30000;
@@ -282,27 +278,17 @@ std::string base64_encode(const void* data, size_t n) {
     return out;
 }
 
-// extractFaceEmbedding finds the embedder's 512-d output on the face's
-// user-meta list and base64-encodes it. Returns empty string if the
-// embedder hasn't run on this object.
-std::string extractFaceEmbedding(NvDsObjectMeta* obj) {
-    for (NvDsMetaList* ul = obj->obj_user_meta_list; ul; ul = ul->next) {
-        auto* um = static_cast<NvDsUserMeta*>(ul->data);
-        if (!um) continue;
-        if (um->base_meta.meta_type != NVDSINFER_TENSOR_OUTPUT_META) continue;
-        auto* tm = static_cast<NvDsInferTensorMeta*>(um->user_meta_data);
-        if (!tm || tm->num_output_layers == 0) continue;
-        void* host_buf = tm->out_buf_ptrs_host ? tm->out_buf_ptrs_host[0] : nullptr;
-        if (!host_buf) continue;
-        auto& li = tm->output_layers_info[0];
-        unsigned total = 1;
-        for (unsigned d = 0; d < li.inferDims.numDims; d++) {
-            total *= li.inferDims.d[d];
-        }
-        if (total != ARCFACE_DIM) continue;
-        return base64_encode(host_buf, size_t(ARCFACE_DIM) * sizeof(float));
-    }
-    return {};
+// readFileB64 slurps a small file (a face-crop JPEG) and base64s it
+// for inline transport in the pending-face NATS message. saveFaceCrop
+// writes .tmp-then-rename, so a read that follows it sees a complete
+// file. Empty string on any failure.
+std::string readFileB64(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    std::string bytes((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    if (bytes.empty()) return {};
+    return base64_encode(bytes.data(), bytes.size());
 }
 
 // extractPlateText pulls the plate string from the obj_meta's
@@ -460,11 +446,13 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
 // publish, the window-close publish, and the departure flush, so a
 // stashed candidate serialises identically to a live one (including
 // its own per-object ts, which event-processor honours over the
-// batch envelope's).
+// batch envelope's). No attributes: ml-worker fills them (embedding,
+// embedding_model, quality signals) before the detection reaches
+// event-processor.
 std::string faceDetJson(const std::string& det_id, const std::string& camera_id,
                         const std::string& iso, float conf,
                         float x, float y, float w, float h,
-                        std::uint64_t track_id, const std::string& embedding_b64) {
+                        std::uint64_t track_id) {
     std::ostringstream js;
     js << "{"
        << "\"id\":\""         << det_id                  << "\","
@@ -475,10 +463,40 @@ std::string faceDetJson(const std::string& det_id, const std::string& camera_id,
        << "\"confidence\":"   << conf                    << ","
        << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
        <<          ",\"w\":"  << w << ",\"h\":" << h << "},"
-       << "\"track_id\":\""   << track_id                << "\","
-       << "\"attributes\":{\"embedding\":\"" << embedding_b64 << "\"}"
+       << "\"track_id\":\""   << track_id                << "\""
        << "}";
     return js.str();
+}
+
+// publishFacePending wraps a face detection + its saved crop JPEG into
+// the pending-embed envelope and publishes it on
+// fnvr.faces.pending.<camera_id> (JetStream). ml-worker aligns +
+// embeds the crop and republishes the enriched detection onto
+// reply_subject — the normal (or retro) detection subject — so
+// event-processor never knows the difference. Returns false when the
+// crop can't be read or the publish fails (the sighting is dropped;
+// the next window provides another).
+bool publishFacePending(ProbeCtx* ctx, const std::string& camera_id,
+                        const std::string& det_json,
+                        const std::string& crop_event_id) {
+    if (!ctx->nats) return false;
+    const std::string crop_b64 =
+        readFileB64(ctx->thumbs_dir + "/" + crop_event_id + ".jpg");
+    if (crop_b64.empty()) {
+        std::cerr << "probe[" << ctx->group_id << "]: face crop missing for "
+                  << crop_event_id << " — dropping pending publish\n";
+        return false;
+    }
+    std::string payload;
+    payload.reserve(det_json.size() + crop_b64.size() + 128);
+    payload += "{\"reply_subject\":\"";
+    payload += json_escape(ctx->subject_prefix + camera_id);
+    payload += "\",\"detection\":";
+    payload += det_json;
+    payload += ",\"crop_jpeg_b64\":\"";
+    payload += crop_b64;
+    payload += "\"}";
+    return ctx->nats->Publish("fnvr.faces.pending." + camera_id, payload);
 }
 
 GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
@@ -593,11 +611,11 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 if (plate.empty()) continue;
                 parent = parentVehicleClass(obj);
             }
-            std::string embedding_b64;
             if (is_face) {
                 // Quality gates. min_px: below ~30 canvas px the
-                // embedder output is noise. min_confidence: NEW —
-                // marginal SCRFD hits made poor training samples.
+                // downstream embedder's output is noise.
+                // min_confidence: marginal detector hits make poor
+                // training samples.
                 if (obj->rect_params.width < float(g_face_capture.min_px) ||
                     obj->rect_params.height < float(g_face_capture.min_px)) {
                     continue;
@@ -605,8 +623,6 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 if (obj->confidence < g_face_capture.min_confidence) {
                     continue;
                 }
-                embedding_b64 = extractFaceEmbedding(obj);
-                if (embedding_b64.empty()) continue;
             }
             const char* kind = is_plate ? "anpr" : is_face ? "face" : "object";
             // Faces and plates are SGIE children of tracked primary
@@ -628,16 +644,20 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     obj->rect_params.width * obj->rect_params.height *
                     obj->confidence;
 
-                // (A) First sighting — publish this frame now.
+                // (A) First sighting — publish this frame now (to the
+                // pending-embed subject; ml-worker forwards it).
                 if (st.published == 0 && st.cand_event_id.empty() &&
                     st.last_pub.time_since_epoch().count() == 0) {
                     const std::string det_id = short_id();
                     saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
-                    if (frame_batch_n++) frame_batch << ",";
-                    frame_batch << faceDetJson(det_id, sv.camera_id, iso,
-                                               obj->confidence, x, y, w, h,
-                                               track_id, embedding_b64);
-                    ctx->hb_published++;
+                    if (publishFacePending(
+                            ctx, sv.camera_id,
+                            faceDetJson(det_id, sv.camera_id, iso,
+                                        obj->confidence, x, y, w, h,
+                                        track_id),
+                            det_id)) {
+                        ctx->hb_published++;
+                    }
                     st.published = 1;
                     st.last_pub = now_tp;
                     continue;
@@ -654,7 +674,6 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     st.cand_iso = iso;
                     st.cand_conf = obj->confidence;
                     st.cand_x = x; st.cand_y = y; st.cand_w = w; st.cand_h = h;
-                    st.cand_embedding_b64 = embedding_b64;
                 }
 
                 // (C) Window close — emit the pending best. The
@@ -668,13 +687,15 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                         : FACE_KEEPALIVE_MS;
                 if (now_tp - st.last_pub >= std::chrono::milliseconds(window_ms) &&
                     !st.cand_event_id.empty()) {
-                    if (frame_batch_n++) frame_batch << ",";
-                    frame_batch << faceDetJson(st.cand_event_id, sv.camera_id,
-                                               st.cand_iso, st.cand_conf,
-                                               st.cand_x, st.cand_y,
-                                               st.cand_w, st.cand_h,
-                                               track_id, st.cand_embedding_b64);
-                    ctx->hb_published++;
+                    if (publishFacePending(
+                            ctx, sv.camera_id,
+                            faceDetJson(st.cand_event_id, sv.camera_id,
+                                        st.cand_iso, st.cand_conf,
+                                        st.cand_x, st.cand_y,
+                                        st.cand_w, st.cand_h, track_id),
+                            st.cand_event_id)) {
+                        ctx->hb_published++;
+                    }
                     st.published++;
                     st.last_pub = now_tp;
                     st.best_quality = -1.f;
@@ -712,11 +733,22 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
 
             const std::string det_id = short_id();
             if (is_face) {
+                // FNVR_FACE_CAPTURE=0 legacy path (limiting off): every
+                // face still routes through the pending-embed subject —
+                // only the LIMITING is bypassed, not the embed flow.
                 saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
+                if (publishFacePending(
+                        ctx, sv.camera_id,
+                        faceDetJson(det_id, sv.camera_id, iso,
+                                    obj->confidence, x, y, w, h, track_id),
+                        det_id)) {
+                    ctx->hb_published++;
+                }
+                continue;
             }
 
             std::uint64_t obj_phash = 0;
-            if (!is_face && !is_plate) {
+            if (!is_plate) {
                 obj_phash = saveObjectCropAndHash(*ctx, buf, frame,
                                                   cnx, cny, cnw, cnh, det_id);
             }
@@ -739,12 +771,8 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     js << ",\"parent_class\":\"" << json_escape(parent) << "\"";
                 }
                 js << "}";
-            } else if (is_face) {
-                js << ",\"attributes\":{"
-                   << "\"embedding\":\""     << embedding_b64       << "\""
-                   << "}";
             }
-            if (!is_plate && !is_face && obj_phash != 0) {
+            if (!is_plate && obj_phash != 0) {
                 js << ",\"phash\":\"" << uint64ToHex16(obj_phash) << "\"";
             }
             js << "}";
@@ -790,16 +818,13 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     continue;
                 }
                 if (!st.cand_event_id.empty() && ctx->nats) {
-                    const std::string payload =
-                        "{\"camera_id\":\"" + json_escape(sv.camera_id) +
-                        "\",\"ts\":\"" + st.cand_iso + "\",\"batch\":[" +
-                        faceDetJson(st.cand_event_id, sv.camera_id,
-                                    st.cand_iso, st.cand_conf,
-                                    st.cand_x, st.cand_y, st.cand_w, st.cand_h,
-                                    it->first, st.cand_embedding_b64) +
-                        "]}";
-                    if (ctx->nats->Publish(
-                            ctx->subject_prefix + sv.camera_id, payload)) {
+                    if (publishFacePending(
+                            ctx, sv.camera_id,
+                            faceDetJson(st.cand_event_id, sv.camera_id,
+                                        st.cand_iso, st.cand_conf,
+                                        st.cand_x, st.cand_y,
+                                        st.cand_w, st.cand_h, it->first),
+                            st.cand_event_id)) {
                         ctx->hb_published++;
                     }
                 }
@@ -1287,9 +1312,11 @@ GstElement* GroupPipeline::BuildPipeline() {
                 "nvinfer name=plateocr config-file-path=/etc/fnvr/nvinfer/plateocr.txt ! ";
         }
         if (wants_face) {
+            // Detection only — embedding moved out of the graph
+            // (ml-worker aligns + embeds the published crop; see
+            // docs/architecture/face-id.md).
             face_chain =
-                "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! "
-                "nvinfer name=embedder config-file-path=/etc/fnvr/nvinfer/adaface.txt ! ";
+                "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! ";
         }
 
         // Primary detector backend: in-process nvinfer (default) or
@@ -1475,9 +1502,11 @@ GstElement* GroupPipeline::BuildPipeline() {
         }
 
         // Detection probe on the LAST nvinfer in the active chain.
+        // (The face SGIE is last when face-id is on — the embedder
+        // element no longer exists.)
         if (nats_) {
-            GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "embedder");
-            const char* attach_name = "embedder";
+            GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "scrfd");
+            const char* attach_name = "scrfd";
             if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "plateocr"); attach_name = "plateocr"; }
             if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker"); attach_name = "tracker"; }
             if (!attach) { attach = gst_bin_get_by_name(GST_BIN(pipeline), "pgie"); attach_name = "pgie"; }
@@ -1578,9 +1607,9 @@ int RunReplayFile(const std::string& camera_id, const std::string& file,
             "nvinfer name=plateocr config-file-path=/etc/fnvr/nvinfer/plateocr.txt ! ";
     }
     if (use_face) {
+        // Detection only — embedding is ml-worker's job (aligned).
         face_chain =
-            "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! "
-            "nvinfer name=embedder config-file-path=/etc/fnvr/nvinfer/adaface.txt ! ";
+            "nvinfer name=scrfd  config-file-path=/var/lib/fnvr/nvinfer/scrfd.txt ! ";
     }
     p << "filesrc location=" << file << " ! qtdemux ! parsebin ! "
       << "nvv4l2decoder ! queue max-size-buffers=8 ! mux.sink_0 "
@@ -1644,7 +1673,7 @@ int RunReplayFile(const std::string& camera_id, const std::string& file,
     }
 
     // Detection probe on the last element of the active chain.
-    GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "embedder");
+    GstElement* attach = gst_bin_get_by_name(GST_BIN(pipeline), "scrfd");
     if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "plateocr");
     if (!attach) attach = gst_bin_get_by_name(GST_BIN(pipeline), "tracker");
     if (attach) {

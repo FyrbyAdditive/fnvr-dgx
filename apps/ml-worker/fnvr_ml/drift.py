@@ -96,6 +96,7 @@ def check() -> dict[str, Any]:
                 FROM persons p
                 JOIN face_embeddings fe ON fe.person_id = p.id
                 WHERE p.enabled = TRUE
+                  AND fe.model = 'topofr_r100'
                 ORDER BY p.id
                 """
             )

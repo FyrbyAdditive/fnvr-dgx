@@ -1,11 +1,14 @@
-# Face detector — RetinaFace MobileNet-0.25 (biubug6) running as a
-# secondary GIE on YOLO26's person-class crops. File kept named
-# scrfd.txt because the gst element name in pipeline.cpp is "scrfd";
-# we rewrote what it points at without changing the pipeline wiring.
+# Face detector — SCRFD-10G-bnkps (insightface, ICLR'22) running as a
+# secondary GIE on the primary detector's person-class crops. Replaced
+# RetinaFace MobileNet-0.25 in the 2026 face-stack modernisation: far
+# better recall on small/oblique faces and much tighter boxes (the old
+# detector's thumbs dir measured ~97% false positives).
 #
 # Runs on crops, not the whole frame, so we pay face-detect cost only
-# where a person actually is. Outputs one class: "face". ArcFace
-# downstream keys off gie-unique-id=4.
+# where a person actually is. Outputs one class: "face". This SGIE is
+# now bbox-only — embedding happens OUT of the graph (ml-worker
+# consumes the published crop, re-detects landmarks, aligns, embeds
+# TopoFR). See docs/architecture/face-id.md.
 
 [property]
 # GB10 unified memory: nvinfer's output-pool growth guard compares CUDA
@@ -14,22 +17,19 @@
 # batches and killing the group. 100 disables the broken check.
 max-gpu-mem-per=100
 gpu-id=0
-# RetinaFace preprocessing: subtract ImageNet-style means, no scale.
-net-scale-factor=1.0
-offsets=104.0;117.0;123.0
-# BGR (the .pth was trained on OpenCV BGR).
-model-color-format=1
-onnx-file=/var/lib/fnvr/models/faceid/face_detector.onnx
+# insightface SCRFD preprocessing: (x - 127.5) / 128, RGB.
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=0
+onnx-file=/var/lib/fnvr/models/faceid/scrfd_10g_bnkps.onnx
 # Match nvinfer's auto-derived name so subsequent boots can reuse
 # the built engine — without this nvinfer writes to the auto name
 # but then can't find model-engine-file on the next run and rebuilds.
-model-engine-file=/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine
+model-engine-file=/var/lib/fnvr/models/faceid/scrfd_10g_bnkps.onnx_b1_gpu0_fp16.engine
 labelfile-path=/etc/fnvr/nvinfer/scrfd.labels
 infer-dims=3;640;640
-# biubug6's export uses a fixed batch=1 graph (no dynamic_axes).
-# nvinfer refuses to use a built engine whose profile doesn't match
-# configured batch-size, so we must match the ONNX — batch=1 means
-# one face-detect call per person crop per frame. Orin eats it.
+# The insightface export is a fixed batch=1 graph — one face-detect
+# call per person crop per frame, same as the old detector.
 batch-size=1
 # 512MB workspace — TRT's per-tactic budget otherwise defaults tiny
 # and asserts "!cost.empty()" when every viable tactic gets skipped.
@@ -39,7 +39,7 @@ network-mode=2
 num-detected-classes=1
 # Distinct from pgie=1, lpdnet=2, lprnet=3.
 gie-unique-id=4
-# SGIE mode, operating on YOLO26's person class (class 0 in coco).
+# SGIE mode, operating on the primary detector's person class.
 process-mode=2
 operate-on-gie-id=1
 operate-on-class-ids=$PERSON_CLASS_ID
@@ -48,14 +48,18 @@ network-type=0
 cluster-mode=4
 maintain-aspect-ratio=1
 symmetric-padding=1
-# Order matters: parser reads these by index from output_layers_info.
-output-blob-names=bbox;conf;lmk
-parse-bbox-func-name=NvDsInferParseCustomRetinaface
-custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_retinaface.so
+# kps_* are in the graph but the parser only reads score_*/bbox_* —
+# landmarks are recovered crop-side in ml-worker (stock DS parsers
+# can't attach them to obj meta).
+output-blob-names=score_8;score_16;score_32;bbox_8;bbox_16;bbox_32;kps_8;kps_16;kps_32
+parse-bbox-func-name=NvDsInferParseCustomSCRFD
+custom-lib-path=/usr/local/lib/fnvr/libnvdsinfer_custom_impl_scrfd.so
 # Skip crops too small to yield a useful face.
 input-object-min-width=48
 input-object-min-height=48
 force-implicit-batch-dim=0
 
 [class-attrs-all]
-pre-cluster-threshold=0.5
+# SCRFD scores run lower than RetinaFace's softmax — 0.4 here; the
+# capture-side gate is faces.capture.min_confidence (settings).
+pre-cluster-threshold=0.4

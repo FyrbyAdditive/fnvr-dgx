@@ -46,13 +46,17 @@ func (s *Store) RetroMatch(ctx context.Context) (int, error) {
 	}
 	thresh, margin, negW := s.matchParams(ctx)
 
+	// embedding_model filter: only score probes from the current
+	// embedding space — old-space rows in the window would otherwise
+	// be compared cross-space (garbage cosines).
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, attributes->>'embedding'
 		FROM detections
 		WHERE kind = 'face'
 		  AND ts > $1
 		  AND attributes->>'person_id' IS NULL
-		  AND attributes ? 'embedding'`,
+		  AND attributes ? 'embedding'
+		  AND attributes->>'embedding_model' = 'topofr_r100'`,
 		time.Now().Add(-retroCandidateWindow))
 	if err != nil {
 		return 0, err
@@ -165,7 +169,7 @@ func scoreProbe(
 // matchParams reads the same settings rows the live matcher reloads,
 // with identical defaults and clamps.
 func (s *Store) matchParams(ctx context.Context) (thresh, margin, negW float64) {
-	thresh, margin, negW = 0.40, 0.05, 1.0
+	thresh, margin, negW = 0.55, 0.05, 1.0
 	read := func(key string, def, lo, hi float64) float64 {
 		var raw []byte
 		if err := s.pool.QueryRow(ctx,
@@ -178,7 +182,7 @@ func (s *Store) matchParams(ctx context.Context) (thresh, margin, negW float64) 
 		}
 		return v
 	}
-	thresh = read("faces.match_threshold", 0.40, 0.01, 0.99)
+	thresh = read("faces.match_threshold", 0.55, 0.01, 0.99)
 	margin = read("faces.match_margin", 0.05, 0, 0.5)
 	negW = read("faces.negative_penalty_weight", 1.0, 0, 2)
 	return

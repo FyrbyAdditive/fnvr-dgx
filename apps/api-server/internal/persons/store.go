@@ -227,11 +227,12 @@ func (s *Store) AddEmbedding(ctx context.Context, personID string, vector []floa
 	if detectionID > 0 {
 		did = detectionID
 	}
-	// model tag: everything enrolled since the DGX retarget embeds with
-	// AdaFace IR-101 (pipeline SGIE and ml-worker use the same ONNX).
+	// model tag: everything enrolled since the 2026 aligned-stack
+	// rework embeds with TopoFR R100 on ArcFace-aligned crops
+	// (ml-worker is the only embedder — live and upload paths share it).
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO face_embeddings (person_id, embedding, source, detection_id, model)
-		VALUES ($1, $2::vector, $3, $4, 'adaface_ir101')
+		VALUES ($1, $2::vector, $3, $4, 'topofr_r100')
 		RETURNING id::text, person_id::text, source, created_at, detection_id`,
 		personID, vecLit, source, did).
 		Scan(&e.ID, &e.PersonID, &e.Source, &e.CreatedAt, &e.DetectionID)
@@ -332,7 +333,7 @@ func (s *Store) AllEmbeddings(ctx context.Context) ([]EnrolledEmbedding, error) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.id::text, p.label, p.alert_on_match, e.embedding::text
 		FROM face_embeddings e JOIN persons p ON p.id = e.person_id
-		WHERE p.enabled = TRUE`)
+		WHERE p.enabled = TRUE AND e.model = 'topofr_r100'`)
 	if err != nil {
 		return nil, err
 	}
@@ -373,9 +374,10 @@ func (s *Store) Dismiss(ctx context.Context, detectionID string, vector []float3
 	}
 	vecLit := vectorLiteral(vector)
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO face_dismissals (detection_id, embedding, reason)
-		VALUES ($1, $2::vector, $3)
-		ON CONFLICT (detection_id) DO UPDATE SET reason = EXCLUDED.reason`,
+		INSERT INTO face_dismissals (detection_id, embedding, reason, model)
+		VALUES ($1, $2::vector, $3, 'topofr_r100')
+		ON CONFLICT (detection_id) DO UPDATE
+		SET reason = EXCLUDED.reason, model = EXCLUDED.model`,
 		detectionID, vecLit, reason)
 	return err
 }
@@ -417,7 +419,8 @@ func (s *Store) AllNegatives(ctx context.Context) ([]DismissedEmbedding, error) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT detection_id, reason, embedding::text
 		FROM face_dismissals
-		WHERE reason IN ('not_a_face', 'duplicate')`)
+		WHERE reason IN ('not_a_face', 'duplicate')
+		  AND model = 'topofr_r100'`)
 	if err != nil {
 		return nil, err
 	}
@@ -488,8 +491,8 @@ func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []
 			did = it.DetectionID
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO face_embeddings (person_id, embedding, source, detection_id)
-			VALUES ($1, $2::vector, $3, $4)`,
+			INSERT INTO face_embeddings (person_id, embedding, source, detection_id, model)
+			VALUES ($1, $2::vector, $3, $4, 'topofr_r100')`,
 			personID, vectorLiteral(it.Vector), it.Source, did); err != nil {
 			return n, skipped, err
 		}

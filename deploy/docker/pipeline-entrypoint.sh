@@ -178,10 +178,23 @@ FACEID_SRC=/opt/fnvr/faceid
 FACEID_DEST=/var/lib/fnvr/models/faceid
 mkdir -p "$FACEID_DEST"
 if [ -d "$FACEID_SRC" ]; then
+    # Content-compare (ANPR pattern), not cp -n: an image upgrade that
+    # changes an ONNX must also replace the volume copy and drop its
+    # cached engines, or nvinfer deserialises a stale engine.
     for f in "$FACEID_SRC"/*.onnx; do
         [ -f "$f" ] || continue
-        cp -n "$f" "$FACEID_DEST/"
+        dst="$FACEID_DEST/$(basename "$f")"
+        if ! cmp -s "$f" "$dst"; then
+            cp -f "$f" "$dst"
+            rm -f "${dst%.onnx}".onnx_b*_gpu0_*.engine
+            echo "entrypoint: refreshed $(basename "$f") (+ dropped stale engines)"
+        fi
     done
+    # 2026 aligned stack: the in-graph embedder and the RetinaFace
+    # detector are gone (ml-worker embeds TopoFR out-of-graph). Drop
+    # their obsolete volume copies + engines so nothing loads them.
+    rm -f "$FACEID_DEST"/face_detector.onnx* "$FACEID_DEST"/adaface.onnx* \
+          "$FACEID_DEST"/arcface.onnx*
     echo "entrypoint: faceid weights ready under $FACEID_DEST"
 fi
 

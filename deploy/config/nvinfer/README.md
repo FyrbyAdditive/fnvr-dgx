@@ -17,8 +17,7 @@ DeepStream `nvinfer` plugin configs for the bundled model slots.
 |---|---|---|
 | `lpdnet.txt` + `lpdnet.labels` | `settings.detector.anpr_enabled = true` | TAO LPDNet for US plates. |
 | `lprnet.txt` + `lprnet.labels` | Same as LPDNet | TAO LPRNet OCR. US format. |
-| `scrfd.txt` + `scrfd.labels` | `settings.detector.face_id_enabled = true` | Face detector, produces box + 5 landmarks. |
-| `arcface.txt` | Same as SCRFD | 512-d face embedder. |
+| `scrfd.txt.template` + `scrfd.labels` | `settings.detector.face_id_enabled = true` | SCRFD-10G face detector, bbox-only in-graph. No embedder SGIE — ml-worker aligns + embeds the published crop (docs/architecture/face-id.md). |
 
 ## Tracker
 

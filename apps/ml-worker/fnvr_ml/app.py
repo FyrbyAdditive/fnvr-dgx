@@ -30,7 +30,9 @@ from pydantic import BaseModel, Field
 
 from . import clusters as cluster_ops
 from . import drift as drift_ops
+from . import face_consumer
 from . import inference
+from . import migrate as migrate_ops
 from . import scheduler as sched
 
 logging.basicConfig(
@@ -42,12 +44,21 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Start APScheduler on startup, stop it cleanly on shutdown.
+    # Start APScheduler + the NATS face-embedding consumer on startup,
+    # stop both cleanly on shutdown.
+    import asyncio
+
     sched.start()
+    consumer = asyncio.create_task(face_consumer.run())
     log.info("ml-worker ready")
     try:
         yield
     finally:
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
         sched.stop()
 
 
@@ -85,6 +96,7 @@ async def detect_and_embed(
                 "bbox": {"x": f.x, "y": f.y, "w": f.w, "h": f.h},
                 "score": f.score,
                 "embedding": f.embedding,
+                "norm": f.norm,
             }
             for f in results
         ]
@@ -134,5 +146,21 @@ async def drift_check() -> dict[str, Any]:
         report = drift_ops.check()
     except Exception as e:
         log.exception("drift_check failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    return report
+
+
+# --- /migrate-embeddings --------------------------------------------
+
+@app.post("/migrate-embeddings")
+async def migrate_embeddings() -> dict[str, Any]:
+    """Re-embed old-space (unaligned adaface) enrolments into the
+    aligned TopoFR space. Idempotent; see migrate.py."""
+    import asyncio
+
+    try:
+        report = await asyncio.to_thread(migrate_ops.run)
+    except Exception as e:
+        log.exception("migrate_embeddings failed")
         raise HTTPException(status_code=500, detail=str(e))
     return report

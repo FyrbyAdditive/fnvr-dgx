@@ -48,3 +48,4 @@ models/engines/
 
 # Claude Code session artefacts
 .claude/
+deploy/models-cache/

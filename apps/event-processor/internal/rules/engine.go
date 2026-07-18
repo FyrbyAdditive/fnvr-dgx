@@ -1737,7 +1737,7 @@ func (e *Engine) loadFaceEnrolments(ctx context.Context) ([]enrolledEmbedding, e
 	rows, err := e.pool.Query(ctx, `
 		SELECT p.id::text, p.label, p.alert_on_match, fe.embedding::text
 		FROM face_embeddings fe JOIN persons p ON p.id = fe.person_id
-		WHERE p.enabled = TRUE AND fe.model = 'adaface_ir101'`)
+		WHERE p.enabled = TRUE AND fe.model = 'topofr_r100'`)
 	if err != nil {
 		// If the migration hasn't run yet the table doesn't exist;
 		// return empty so the rest of reload() still succeeds.
@@ -1768,7 +1768,7 @@ func (e *Engine) loadFaceEnrolments(ctx context.Context) ([]enrolledEmbedding, e
 // loadFaceThreshold reads settings.faces.match_threshold; defaults
 // 0.4 on any error / missing / out-of-range value.
 func loadFaceThreshold(ctx context.Context, pool *pgxpool.Pool) float64 {
-	const def = 0.40
+	const def = 0.55
 	var raw []byte
 	err := pool.QueryRow(ctx,
 		`SELECT value FROM settings WHERE key = 'faces.match_threshold'`).Scan(&raw)
@@ -1816,7 +1816,8 @@ func loadFaceMargin(ctx context.Context, pool *pgxpool.Pool) float64 {
 func (e *Engine) loadFaceNegatives(ctx context.Context) ([]dismissedEmbedding, error) {
 	rows, err := e.pool.Query(ctx,
 		`SELECT embedding::text FROM face_dismissals
-		 WHERE reason IN ('not_a_face', 'duplicate')`)
+		 WHERE reason IN ('not_a_face', 'duplicate')
+		   AND model = 'topofr_r100'`)
 	if err != nil {
 		if isRelationMissing(err) {
 			return nil, nil

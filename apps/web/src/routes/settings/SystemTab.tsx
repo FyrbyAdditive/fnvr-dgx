@@ -91,7 +91,7 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
       {
         key: "faces.match_threshold",
         label: "Match threshold",
-        hint: "Cosine-similarity floor for a face to match an enrolled person. Default 0.40.",
+        hint: "Cosine-similarity floor for a face to match an enrolled person. Default 0.55 (aligned TopoFR embeddings).",
         min: 0.01, max: 0.99, step: 0.01,
       },
       {

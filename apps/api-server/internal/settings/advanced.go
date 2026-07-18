@@ -30,7 +30,7 @@ type AdvancedSpec struct {
 
 var AdvancedWhitelist = []AdvancedSpec{
 	// Face matching (event-processor, ~30s reload).
-	{Key: "faces.match_threshold", Kind: KindFloat, Min: 0.01, Max: 0.99, Default: 0.40},
+	{Key: "faces.match_threshold", Kind: KindFloat, Min: 0.01, Max: 0.99, Default: 0.55},
 	{Key: "faces.match_margin", Kind: KindFloat, Min: 0, Max: 0.5, Default: 0.05},
 	{Key: "faces.negative_penalty_weight", Kind: KindFloat, Min: 0, Max: 2, Default: 1.0},
 	// Detections (event-processor + api-server/storage-manager).

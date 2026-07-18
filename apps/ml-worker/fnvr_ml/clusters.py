@@ -37,6 +37,10 @@ _LOOKBACK_HOURS = 24 * 7
 # merging distinct identities; ArcFace same-identity cosine usually
 # > 0.5 on well-lit frames.
 _CLUSTER_MATCH = 0.6
+# Only cluster embeddings from the current (aligned) space — must
+# match fnvr_ml.inference.EMBEDDING_MODEL (kept literal so this module
+# stays importable without pulling onnxruntime).
+_EMBEDDING_MODEL = "topofr_r100"
 
 
 def _decode_embedding_b64(b64: str) -> np.ndarray | None:
@@ -119,8 +123,12 @@ def batch_cluster_unmatched() -> dict[str, Any]:
         with conn.cursor() as cur:
             # Only face detections that never matched a person and
             # still carry an embedding. attributes->>'person_id'
-            # absent (null) is the unmatched signal; the pipeline
-            # writes the base64 embedding into attributes->>'embedding'.
+            # absent (null) is the unmatched signal; ml-worker's face
+            # consumer writes the base64 embedding + embedding_model
+            # into attributes. The model filter keeps old-space
+            # (unaligned adaface, no tag) rows out — cross-space
+            # cosines are garbage and would poison clusters during
+            # the transition window.
             cur.execute(
                 """
                 SELECT id, attributes->>'embedding'
@@ -129,10 +137,11 @@ def batch_cluster_unmatched() -> dict[str, Any]:
                   AND ts > NOW() - (%s::int || ' hours')::interval
                   AND (attributes->>'person_id') IS NULL
                   AND (attributes->>'embedding') IS NOT NULL
+                  AND (attributes->>'embedding_model') = %s
                 ORDER BY ts DESC
                 LIMIT 50000
                 """,
-                (_LOOKBACK_HOURS,),
+                (_LOOKBACK_HOURS, _EMBEDDING_MODEL),
             )
             rows = cur.fetchall()
 
