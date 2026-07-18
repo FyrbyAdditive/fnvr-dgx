@@ -213,10 +213,14 @@ void Supervisor::reconcileOnce() {
     std::string engine_path = readEnginePathFromInferConfig();
     std::vector<std::string> faceid_engines;
     if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
+        // Must track the engine names the scrfd.txt template derives —
+        // a stale name here silently stalls every group after the
+        // first for the full 30-min deadline (2026-07-18 incident:
+        // fleet ran 2 of 7 cameras because this list still named the
+        // deleted RetinaFace/AdaFace engines). The aligned stack has
+        // no in-graph embedder engine.
         faceid_engines.push_back(
-            "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine");
-        faceid_engines.push_back(
-            "/var/lib/fnvr/models/faceid/adaface.onnx_b16_gpu0_fp16.engine");
+            "/var/lib/fnvr/models/faceid/scrfd_10g_bnkps.onnx_b1_gpu0_fp16.engine");
     }
 
     bool first_start = true;
