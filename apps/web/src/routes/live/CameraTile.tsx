@@ -336,14 +336,14 @@ function AdminMenu({
       </button>
       {open && (
         <div
-          className="absolute bottom-8 right-0 z-30 w-52 rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl p-2 space-y-2 text-left"
+          className="absolute bottom-8 right-0 z-30 w-60 rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl p-2 space-y-2 text-left"
           onClick={(e) => e.stopPropagation()}
         >
           <div className="flex items-center justify-between gap-2 py-1">
             <span className="text-xs text-neutral-400">Camera</span>
             <CameraToggle cameraId={camera.id} enabled={camera.enabled} variant="inline" />
           </div>
-          <div className="flex items-center justify-between gap-2 py-1">
+          <div className="flex items-start justify-between gap-2 py-1">
             <span className="text-xs text-neutral-400">Detectors</span>
             <CameraDetectorChips
               cameraId={camera.id}

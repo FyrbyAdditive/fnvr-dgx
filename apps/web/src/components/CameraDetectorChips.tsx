@@ -81,7 +81,10 @@ export function CameraDetectorChips({
       : "border";
 
   return (
-    <div className="inline-flex gap-1">
+    // flex-wrap + justify-end: the chip set outgrew one row when the
+    // print-failure detector arrived — wrap inside whatever container
+    // hosts us instead of overflowing its background.
+    <div className="inline-flex flex-wrap justify-end gap-1">
       {KINDS.map((k) => {
         const active = effective.has(k.value);
         const colors = active
