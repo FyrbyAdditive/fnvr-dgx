@@ -1,38 +1,60 @@
 # fnvr-dgx
 
-Open-source NVR with embedded AI, heavily optimised for the **NVIDIA
-DGX Spark** (GB10 Grace Blackwell). Forked from
-[fyrbyAdditive/fnvr](https://github.com/fyrbyAdditive/fnvr), which
-targets the Jetson AGX Orin.
+An open-source network video recorder with real AI built in, tuned for
+the **NVIDIA DGX Spark** (GB10 Grace Blackwell). Point it at your
+cameras and it records everything, understands what it sees, and tells
+you when something matters — all on your own hardware, with no cloud,
+no subscription, and no footage leaving the building.
 
-A web-based network video recorder that:
+Forked from [fyrbyAdditive/fnvr](https://github.com/fyrbyAdditive/fnvr)
+(which targets the Jetson AGX Orin).
 
-- Ingests RTSP/ONVIF/USB cameras.
-- Runs CUDA-accelerated object detection, ANPR, and face identification on many streams at once via DeepStream 9.1.
-- Records to disk with per-camera retention + quota + emergency-purge.
-- Lets operators flag mis-identifications and clean up enrolment pools.
-- Exposes REST + SSE + Prometheus; integrates with Home Assistant, MQTT, webhooks, ntfy.
+## What it does
 
-**Status (2026-07-17).** The DGX Spark retarget is live on real
-hardware: platform port (DS 9.1 SBSA container, Hailo path removed,
-GPU-compute transforms), batched multi-camera mux with strike-based
-member resilience and self-healing push relays, model refresh
-(**RF-DETR base** primary detector — 3× the headroom of yolo26x with
-better recall — AdaFace IR-101 face embeddings, global ANPR),
-substream inference (zero main-stream decode), per-member Prometheus
-pipeline metrics, and 128 GB-unified-memory Postgres tuning. FP8
-quantisation was evaluated and rejected on output parity (fp16
-stays; see [tools/benchmark/](tools/benchmark/)). See
-[PLAN.md](PLAN.md) for the original milestone list.
+- **Watch everything live** — a WebRTC grid of all cameras with
+  sub-second latency and detection boxes drawn on the video.
+  Bandwidth-friendly proxy streams for the grid, full quality when you
+  enlarge a tile.
+- **Record everything, keep what fits** — continuous recording with
+  per-camera retention and quota, emergency purge before the disk
+  fills, and a timeline with recording/event/activity bands that
+  scrubs to the exact frame.
+- **Recognise objects** — RF-DETR object detection over every stream
+  (batched on the GPU via Triton), with per-camera detector selection,
+  class mutes, and one-click "not a real detection" flagging that
+  suppresses visually-similar false positives.
+- **Recognise faces** — SCRFD detection + ArcFace-aligned TopoFR
+  embeddings. Enrol from live sightings, clusters of recurring
+  strangers, or an uploaded photo; new enrolments retroactively claim
+  earlier sightings. Quality gates and diversity pruning keep
+  enrolment pools clean; one click erases a person (GDPR-style).
+- **Read number plates** — plate detection + OCR with a hotlist and
+  historical plate search.
+- **Watch your 3D printers** — spaghetti/print-failure detection
+  (Obico's community-proven model) on printer-pointed cameras, with
+  smoothed scoring so one noisy frame never pages you. Notify-only by
+  design.
+- **Alert on what matters** — a rules engine with zones, tripwires,
+  schedules, cross-camera sequences, cooldowns, and incident
+  threading; alarm states (home/away/disarmed) gate rules. Alerts fan
+  out to webhooks, ntfy, MQTT, and Home Assistant.
+- **Go back in time** — replay historical footage through today's
+  detectors (GPU-polite, throttles itself when live load is high).
+- **Improve the models** — draw label boxes on live tiles to build
+  training datasets from your own footage; weekly drift checks warn
+  when face matching degrades.
+- **Operate it like software you own** — REST + SSE APIs, Prometheus
+  metrics for every pipeline member, self-healing camera workers with
+  fault quarantine, and honest docs written from real incidents.
 
 ## Documentation
 
 All operator + developer docs live under [docs/](docs/). Start at [docs/README.md](docs/README.md).
 
 Highlights:
-- [Install](docs/operations/install.md) — host prep, first boot, adding a camera. (Being rewritten for DGX OS.)
+- [Install](docs/operations/install.md) — host prep, first boot, adding a camera.
 - [Architecture overview](docs/architecture/README.md) — services, data flow, bus subjects.
-- [Face-ID tuning](docs/operations/face-id.md) — enrolment, matcher knobs, troubleshooting.
+- [Face-ID](docs/architecture/face-id.md) — the aligned face stack, enrolment, matcher knobs.
 - [Troubleshooting](docs/operations/troubleshooting.md) — symptoms → fixes, mined from real incidents.
 - [Known issues](docs/operations/known-issues.md) — things we've hit that aren't yet fixable upstream.
 
@@ -56,17 +78,10 @@ docker compose --profile gpu up -d
 
 Open `http://<spark-ip>:8080`. Default login `admin / admin` — change it immediately.
 
-## Quick start — Mac / GPU-less (no pipeline)
-
-Works for exercising the web UI, rules, notifications, and the API. Pipeline container is skipped.
-
-```bash
-docker compose --profile lite -f deploy/docker/docker-compose.yml up -d
-open http://localhost:8080
-```
-
-Add `--profile dev` to bring up a synthetic RTSP source at `rtsp://mediamtx:8554/test`.
-
 ## License
 
-[AGPL-3.0-or-later](LICENSE).
+[AGPL-3.0-or-later](LICENSE). Bundled third-party model weights keep
+their own licences (see the model-prep scripts under
+[tools/model-prep/](tools/model-prep/) for provenance and pins);
+notably the SCRFD face detector and the Obico print-failure model are
+non-commercial/AGPL respectively — fine for personal self-hosting.
