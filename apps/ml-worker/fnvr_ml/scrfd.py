@@ -85,13 +85,22 @@ def _nms(dets: np.ndarray, iou: float) -> list[int]:
 def detect(img_bgr: np.ndarray, conf_thresh: float = 0.4, iou_thresh: float = 0.4) -> list[Face]:
     """Detect faces + landmarks. Letterboxes to 640x640 (top-left,
     matching the fixed-shape output tensors), maps results back to
-    source pixels, highest score first."""
+    source pixels, highest score first.
+
+    Never UPSCALES: SCRFD's anchors top out well under frame-filling
+    faces, so blowing a 256px face crop up to 640 pushes the face past
+    the largest scale and it goes undetected (measured 0.09-0.34 vs
+    0.41-0.76 at native size on real pipeline crops — exactly the
+    close-ups that matter most). Downscaling big uploads is unchanged."""
     sess = _load()
     src_h, src_w = img_bgr.shape[:2]
-    scale = _INPUT_SIZE / max(src_w, src_h)
+    scale = min(1.0, _INPUT_SIZE / max(src_w, src_h))
     new_w, new_h = int(src_w * scale), int(src_h * scale)
     canvas = np.zeros((_INPUT_SIZE, _INPUT_SIZE, 3), dtype=np.uint8)
-    canvas[:new_h, :new_w] = cv2.resize(img_bgr, (new_w, new_h))
+    if (new_w, new_h) == (src_w, src_h):
+        canvas[:new_h, :new_w] = img_bgr
+    else:
+        canvas[:new_h, :new_w] = cv2.resize(img_bgr, (new_w, new_h))
 
     rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32)
     blob = ((rgb - 127.5) / 128.0).transpose(2, 0, 1)[None, ...]
