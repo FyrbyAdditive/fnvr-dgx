@@ -58,7 +58,7 @@ def _enrich(detection: dict, crop_jpeg: bytes) -> dict:
     if face is None:
         detection["attributes"] = {"embed_status": "no_face"}
         return detection
-    vec, norm, roll, yaw = inference.embed_face(img, face)
+    vec, norm, roll, yaw, blur = inference.embed_face(img, face)
     detection["attributes"] = {
         "embedding": base64.b64encode(vec.astype("<f4").tobytes()).decode(),
         "embedding_model": inference.EMBEDDING_MODEL,
@@ -66,6 +66,7 @@ def _enrich(detection: dict, crop_jpeg: bytes) -> dict:
         "det_score": f"{face.score:.3f}",
         "roll": f"{roll:.1f}",
         "yaw": f"{yaw:.3f}",
+        "blur": f"{blur:.1f}",
     }
     return detection
 

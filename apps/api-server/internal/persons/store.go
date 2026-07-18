@@ -448,28 +448,44 @@ func (s *Store) AllNegatives(ctx context.Context) ([]DismissedEmbedding, error) 
 // added too. Source strings are per-embedding so the caller can stamp
 // them with the source detection IDs.
 //
-// The batch is diversity-pruned before insert (PruneEnrolBatch):
-// near-duplicates of the person's existing pool or of an earlier
-// batch entry are dropped, and each action adds at most
-// faces.enrol.max_per_action new samples. Item order is priority
-// order. Returns (added, near-duplicates+over-cap skipped).
+// The batch is quality-gated (filterEnrolQuality — turned/blurred/
+// marginal detections stay matchable but don't enter the pool) and
+// then diversity-pruned (PruneEnrolBatch): near-duplicates of the
+// person's existing pool or of an earlier batch entry are dropped,
+// and each action adds at most faces.enrol.max_per_action new
+// samples. Item order is priority order. Returns
+// (added, near-duplicates+over-cap skipped, quality-rejected).
 func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []struct {
 	Vector      []float32
 	Source      string
 	DetectionID int64
-}) (int, int, error) {
-	valid := items[:0:0]
+}) (int, int, int, error) {
+	ids := make([]int64, 0, len(items))
 	for _, it := range items {
-		if len(it.Vector) == 512 {
-			valid = append(valid, it)
+		if it.DetectionID > 0 {
+			ids = append(ids, it.DetectionID)
 		}
 	}
+	lowQuality := s.filterEnrolQuality(ctx, ids)
+
+	skippedQuality := 0
+	valid := items[:0:0]
+	for _, it := range items {
+		if len(it.Vector) != 512 {
+			continue
+		}
+		if it.DetectionID > 0 && lowQuality[it.DetectionID] {
+			skippedQuality++
+			continue
+		}
+		valid = append(valid, it)
+	}
 	if len(valid) == 0 {
-		return 0, 0, nil
+		return 0, 0, skippedQuality, nil
 	}
 	existing, err := s.personVectors(ctx, personID)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, skippedQuality, err
 	}
 	dedupSim, maxPerAction := s.enrolParams(ctx)
 	cands := make([][]float32, len(valid))
@@ -480,7 +496,7 @@ func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, skipped, err
+		return 0, skipped, skippedQuality, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	n := 0
@@ -494,11 +510,11 @@ func (s *Store) AddEmbeddingsBulk(ctx context.Context, personID string, items []
 			INSERT INTO face_embeddings (person_id, embedding, source, detection_id, model)
 			VALUES ($1, $2::vector, $3, $4, 'topofr_r100')`,
 			personID, vectorLiteral(it.Vector), it.Source, did); err != nil {
-			return n, skipped, err
+			return n, skipped, skippedQuality, err
 		}
 		n++
 	}
-	return n, skipped, tx.Commit(ctx)
+	return n, skipped, skippedQuality, tx.Commit(ctx)
 }
 
 // --- helpers ---

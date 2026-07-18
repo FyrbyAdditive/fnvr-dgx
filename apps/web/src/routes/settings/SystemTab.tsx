@@ -123,6 +123,24 @@ const ADVANCED_GROUPS: { group: string; rows: AdvancedRowSpec[] }[] = [
         hint: "Cap on new embeddings added by one enrol action (cluster or multi-select) after dedup, keeping the most representative first. Default 8.",
         min: 1, max: 50, step: 1,
       },
+      {
+        key: "faces.enrol.min_det_score",
+        label: "Enrol min detector score",
+        hint: "Samples below this face-detector confidence are excluded from enrolment (matching still uses them). Default 0.5.",
+        min: 0, max: 0.99, step: 0.05,
+      },
+      {
+        key: "faces.enrol.max_abs_yaw",
+        label: "Enrol max head turn",
+        hint: "Nose offset from the eye midpoint in interocular units; ~0 is frontal. Samples more turned than this don't enter the enrolment pool. Default 0.35.",
+        min: 0.05, max: 1, step: 0.05,
+      },
+      {
+        key: "faces.enrol.min_blur",
+        label: "Enrol min sharpness",
+        hint: "Laplacian variance of the aligned face; motion blur scores under ~30. Samples below the floor are excluded from enrolment. 0 disables. Default 30.",
+        min: 0, max: 500, step: 5,
+      },
     ],
   },
   {

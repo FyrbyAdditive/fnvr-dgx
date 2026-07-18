@@ -412,7 +412,7 @@ func (s *Server) handleAddPersonEmbeddingsBulk(w http.ResponseWriter, r *http.Re
 			DetectionID int64
 		}{Vector: it.Vector, Source: src, DetectionID: it.DetectionID})
 	}
-	n, skipped, err := s.persons.AddEmbeddingsBulk(r.Context(), id, items)
+	n, skipped, lowq, err := s.persons.AddEmbeddingsBulk(r.Context(), id, items)
 	if err != nil {
 		slog.Warn("bulk add embeddings", "err", err, "person_id", id)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -421,6 +421,7 @@ func (s *Server) handleAddPersonEmbeddingsBulk(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusCreated, map[string]int{
 		"added":                   n,
 		"skipped_near_duplicates": skipped,
+		"skipped_low_quality":     lowq,
 		"retro_matched":           s.runRetroMatch(r.Context()),
 	})
 }

@@ -105,3 +105,16 @@ describe("enrolToastMessage", () => {
     expect(enrolToastMessage({ added: 0 })).toBe("No samples enrolled");
   });
 });
+
+describe("enrolToastMessage quality gates", () => {
+  it("mentions low-quality skips", () => {
+    expect(
+      enrolToastMessage({ added: 4, skipped_near_duplicates: 2, skipped_low_quality: 3 }),
+    ).toBe("Enrolled 4 face samples · 2 near-duplicates skipped · 3 low-quality skipped");
+  });
+  it("all-low-quality outcome is explicit", () => {
+    expect(enrolToastMessage({ added: 0, skipped_low_quality: 5 })).toBe(
+      "No new samples — all 5 failed the quality gates (turned/blurred/marginal)",
+    );
+  });
+});

@@ -582,6 +582,7 @@ export const api = {
     req<{
       added: number;
       skipped_near_duplicates: number;
+      skipped_low_quality: number;
       person_id: string;
       retro_matched: number;
     }>(`/clusters/${id}/enrol`, {
@@ -612,6 +613,7 @@ export const api = {
     req<{
       added: number;
       skipped_near_duplicates: number;
+      skipped_low_quality: number;
       retro_matched: number;
     }>(`/persons/${id}/embeddings_bulk`, {
       method: "POST",
@@ -740,6 +742,9 @@ export type AdvancedSettings = {
   "faces.negative_penalty_weight": number;
   "faces.enrol.dedup_similarity": number;
   "faces.enrol.max_per_action": number;
+  "faces.enrol.min_det_score": number;
+  "faces.enrol.max_abs_yaw": number;
+  "faces.enrol.min_blur": number;
   "faces.capture.interval_ms": number;
   "faces.capture.max_per_track": number;
   "faces.capture.min_confidence": number;

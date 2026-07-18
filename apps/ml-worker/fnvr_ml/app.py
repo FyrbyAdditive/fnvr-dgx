@@ -97,6 +97,7 @@ async def detect_and_embed(
                 "score": f.score,
                 "embedding": f.embedding,
                 "norm": f.norm,
+                "blur": f.blur,
             }
             for f in results
         ]

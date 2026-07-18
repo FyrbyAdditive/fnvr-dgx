@@ -96,6 +96,18 @@ type Engine struct {
 	faceNegatives       []dismissedEmbedding
 	negPenaltyWeight    float64
 
+	// Track-level face aggregation: per (camera, person-track), an
+	// exponentially-decayed weighted mean of the track's recent
+	// embeddings. Matching decides on the AGGREGATE, not the single
+	// frame — video gives many correlated samples per appearance, and
+	// averaging them cancels per-frame noise (pose flicker, motion
+	// blur) that makes single-probe decisions jitter around the
+	// threshold. Guarded by aggMu (onDetection is effectively
+	// single-goroutine per subscription, but reload-time pruning runs
+	// on the ticker goroutine). Entries idle >60 s are pruned.
+	faceAggs map[string]*faceAgg
+	aggMu    sync.Mutex
+
 	// Object-flag suppression library. Keyed as
 	//   objectFlags[camera_id][class_original] = []phash
 	// so the per-detection check is an O(1) map lookup + a short
@@ -389,6 +401,7 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		enabledDetectors: map[string][]string{},
 		mutedClasses:     map[string]map[string]struct{}{},
 		cooldowns:         map[string]time.Time{},
+		faceAggs:          map[string]*faceAgg{},
 		tracks:            map[string]trackEntry{},
 		sequenceSightings: map[string][]sequenceSighting{},
 		objectFlags:       map[string]map[string][]uint64{},
@@ -546,6 +559,7 @@ func (e *Engine) periodicReload(ctx context.Context) {
 			if err := e.reload(ctx); err != nil {
 				slog.Warn("reload rules", "err", err)
 			}
+			e.pruneFaceAggs()
 		}
 	}
 }
@@ -964,6 +978,12 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if raw := d.Attributes["embedding"]; raw != "" {
 			probe := decodeEmbeddingBase64(raw)
 			if probe != nil {
+				// Track-level aggregation: fold this frame into the
+				// track's decayed mean and match the aggregate. The
+				// per-frame vector still lands in the row (the
+				// enrolment UI wants the frame's own embedding);
+				// only the accept/reject decision uses the mean.
+				probe = e.aggregateFaceProbe(d, probe)
 				// Group similarities by person.
 				simsByPerson := map[string][]float32{}
 				labelByPerson := map[string]enrolledEmbedding{}
@@ -2018,6 +2038,72 @@ func decodeEmbeddingBase64(s string) []float32 {
 	}
 	l2normalise(out)
 	return out
+}
+
+// faceAgg is one track's exponentially-decayed embedding mean.
+type faceAgg struct {
+	sum      [512]float64 // decayed weighted sum of unit probes
+	lastSeen time.Time
+}
+
+// aggFaceDecay per new sample — ~0.9 keeps an effective window of
+// roughly the last 10 samples, matching the capture limiter's
+// per-track budget. Not a setting: the whole point of aggregation is
+// fewer knobs that need tuning.
+const aggFaceDecay = 0.9
+
+// untrackedSentinel is DeepStream's "no tracker id" (~0ULL) as the
+// decimal string the pipeline stamps on track_id.
+const untrackedSentinel = "18446744073709551615"
+
+// aggregateFaceProbe folds a unit-norm probe into its track's decayed
+// mean and returns the normalised aggregate to match against. Weight
+// is the detector score when present (a 0.9-confidence face should
+// pull the mean harder than a 0.45 marginal one). Untracked or
+// track-less probes pass through unchanged — no key to aggregate on.
+func (e *Engine) aggregateFaceProbe(d Detection, probe []float32) []float32 {
+	if d.TrackID == "" || d.TrackID == untrackedSentinel {
+		return probe
+	}
+	w := 1.0
+	if s := d.Attributes["det_score"]; s != "" {
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f > 0 && f <= 1 {
+			w = f
+		}
+	}
+	e.aggMu.Lock()
+	defer e.aggMu.Unlock()
+	key := d.CameraID + "/" + d.TrackID
+	agg := e.faceAggs[key]
+	if agg == nil {
+		agg = &faceAgg{}
+		e.faceAggs[key] = agg
+	}
+	for i := range agg.sum {
+		agg.sum[i] = agg.sum[i]*aggFaceDecay + float64(probe[i])*w
+	}
+	agg.lastSeen = time.Now()
+
+	out := make([]float32, 512)
+	for i := range out {
+		out[i] = float32(agg.sum[i])
+	}
+	l2normalise(out)
+	return out
+}
+
+// pruneFaceAggs drops track aggregates idle for over a minute — the
+// capture keepalive publishes at least every 30 s while a person is
+// in frame, so 60 s of silence means the track is gone.
+func (e *Engine) pruneFaceAggs() {
+	cutoff := time.Now().Add(-time.Minute)
+	e.aggMu.Lock()
+	defer e.aggMu.Unlock()
+	for k, a := range e.faceAggs {
+		if a.lastSeen.Before(cutoff) {
+			delete(e.faceAggs, k)
+		}
+	}
 }
 
 // isRelationMissing true for Postgres 42P01 ("undefined table") —

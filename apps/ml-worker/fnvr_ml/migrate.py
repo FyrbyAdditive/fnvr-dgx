@@ -107,7 +107,7 @@ def run() -> dict[str, Any]:
                 entry["reason"] = "no face found in source image"
                 failed.append(entry)
                 continue
-            vec, norm, _roll, _yaw = inference.embed_face(img, face)
+            vec, norm, _roll, _yaw, _blur = inference.embed_face(img, face)
 
             conn.execute(
                 """

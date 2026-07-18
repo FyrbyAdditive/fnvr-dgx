@@ -40,6 +40,9 @@ var AdvancedWhitelist = []AdvancedSpec{
 	// pipeline restart is required for changes to take effect).
 	{Key: "faces.enrol.dedup_similarity", Kind: KindFloat, Min: 0.5, Max: 0.999, Default: 0.90},
 	{Key: "faces.enrol.max_per_action", Kind: KindInt, Min: 1, Max: 50, Default: 8},
+	{Key: "faces.enrol.min_det_score", Kind: KindFloat, Min: 0, Max: 0.99, Default: 0.5},
+	{Key: "faces.enrol.max_abs_yaw", Kind: KindFloat, Min: 0.05, Max: 1.0, Default: 0.35},
+	{Key: "faces.enrol.min_blur", Kind: KindFloat, Min: 0, Max: 500, Default: 30},
 	{Key: "faces.capture.interval_ms", Kind: KindInt, Min: 250, Max: 10000, Default: 1500},
 	{Key: "faces.capture.max_per_track", Kind: KindInt, Min: 1, Max: 100, Default: 12},
 	{Key: "faces.capture.min_confidence", Kind: KindFloat, Min: 0, Max: 0.99, Default: 0.55},

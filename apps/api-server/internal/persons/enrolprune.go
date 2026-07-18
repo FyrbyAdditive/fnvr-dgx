@@ -3,6 +3,8 @@ package persons
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"strconv"
 )
 
 // Enrolment diversity pruning: the matcher scores a probe by the mean
@@ -75,6 +77,79 @@ func (s *Store) enrolParams(ctx context.Context) (dedupSim float64, maxPerAction
 		}
 	}
 	return
+}
+
+// enrolQualityParams reads the enrolment quality gates (whitelist
+// defaults/clamps mirrored; fail open).
+func (s *Store) enrolQualityParams(ctx context.Context) (minDet, maxYaw, minBlur float64) {
+	minDet, maxYaw, minBlur = 0.5, 0.35, 30
+	read := func(key string, def, lo, hi float64) float64 {
+		var raw []byte
+		if err := s.pool.QueryRow(ctx,
+			`SELECT value FROM settings WHERE key = $1`, key).Scan(&raw); err != nil {
+			return def
+		}
+		var v float64
+		if json.Unmarshal(raw, &v) != nil || v < lo || v > hi {
+			return def
+		}
+		return v
+	}
+	minDet = read("faces.enrol.min_det_score", 0.5, 0, 0.99)
+	maxYaw = read("faces.enrol.max_abs_yaw", 0.35, 0.05, 1.0)
+	minBlur = read("faces.enrol.min_blur", 30, 0, 500)
+	return
+}
+
+// filterEnrolQuality drops candidate detection ids that fail the
+// quality gates, using the signals ml-worker stamped on the detection
+// rows (det_score, yaw, blur). MATCHING uses every sample — these
+// gates only protect the person's ENROLMENT pool from turned, blurred
+// or marginal faces that would dilute its top-3 corroboration.
+// Fail-open by design: ids with no row (hot-table pruned), no signals
+// (pre-rework rows), or a query error pass through — an operator who
+// can see the tile can enrol it.
+func (s *Store) filterEnrolQuality(ctx context.Context, ids []int64) map[int64]bool {
+	rejected := map[int64]bool{}
+	if len(ids) == 0 {
+		return rejected
+	}
+	minDet, maxYaw, minBlur := s.enrolQualityParams(ctx)
+	rows, err := s.pool.Query(ctx, `
+		SELECT id,
+		       attributes->>'det_score',
+		       attributes->>'yaw',
+		       attributes->>'blur'
+		FROM detections
+		WHERE id = ANY($1) AND kind = 'face'`, ids)
+	if err != nil {
+		return rejected
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var det, yaw, blur *string
+		if rows.Scan(&id, &det, &yaw, &blur) != nil {
+			continue
+		}
+		parse := func(p *string) (float64, bool) {
+			if p == nil {
+				return 0, false
+			}
+			v, err := strconv.ParseFloat(*p, 64)
+			return v, err == nil
+		}
+		if v, ok := parse(det); ok && v < minDet {
+			rejected[id] = true
+		}
+		if v, ok := parse(yaw); ok && math.Abs(v) > maxYaw {
+			rejected[id] = true
+		}
+		if v, ok := parse(blur); ok && v < minBlur {
+			rejected[id] = true
+		}
+	}
+	return rejected
 }
 
 // personVectors loads a person's current embedding pool for dedup.

@@ -65,16 +65,22 @@ export function nextLimit(current: number): number {
 export function enrolToastMessage(res: {
   added: number;
   skipped_near_duplicates?: number;
+  skipped_low_quality?: number;
   retro_matched?: number;
 }): string {
   const skipped = res.skipped_near_duplicates ?? 0;
+  const lowq = res.skipped_low_quality ?? 0;
   const retro = res.retro_matched ?? 0;
   let msg: string;
   if (res.added > 0) {
     msg = `Enrolled ${res.added} face sample${res.added === 1 ? "" : "s"}`;
     if (skipped > 0) msg += ` · ${skipped} near-duplicate${skipped === 1 ? "" : "s"} skipped`;
+    if (lowq > 0) msg += ` · ${lowq} low-quality skipped`;
   } else if (skipped > 0) {
     msg = `No new samples — all ${skipped} were near-duplicates of the existing enrolment`;
+    if (lowq > 0) msg += ` (${lowq} low-quality also skipped)`;
+  } else if (lowq > 0) {
+    msg = `No new samples — all ${lowq} failed the quality gates (turned/blurred/marginal)`;
   } else {
     msg = "No samples enrolled";
   }

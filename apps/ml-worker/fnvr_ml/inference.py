@@ -52,6 +52,7 @@ class Detection:
     norm: float  # pre-normalisation L2 norm — quality proxy
     roll: float  # degrees, eye-line
     yaw: float  # nose offset in interocular units (proxy, not degrees)
+    blur: float  # Laplacian variance of the aligned crop (higher = sharper)
 
 
 def _load_embedder() -> ort.InferenceSession:
@@ -83,12 +84,20 @@ def embed_aligned(aligned_bgr: np.ndarray) -> tuple[np.ndarray, float]:
     return raw / n, n
 
 
-def embed_face(img_bgr: np.ndarray, face: scrfd.Face) -> tuple[np.ndarray, float, float, float]:
-    """Align + embed one detected face. Returns (vector, norm, roll, yaw)."""
+def embed_face(
+    img_bgr: np.ndarray, face: scrfd.Face
+) -> tuple[np.ndarray, float, float, float, float]:
+    """Align + embed one detected face.
+    Returns (vector, norm, roll, yaw, blur). blur is the Laplacian
+    variance of the aligned 112x112 grey crop — sharpness on a
+    CONSISTENT canvas, so one threshold works across face sizes
+    (sharp ≈ 100+, motion blur < ~30)."""
     aligned = align.norm_crop(img_bgr, face.kps)
     vec, n = embed_aligned(aligned)
     roll, yaw = align.pose_proxies(face.kps)
-    return vec, n, roll, yaw
+    grey = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    blur = float(cv2.Laplacian(grey, cv2.CV_64F).var())
+    return vec, n, roll, yaw, blur
 
 
 def detect_and_embed(
@@ -107,7 +116,7 @@ def detect_and_embed(
     for f in scrfd.detect(img, conf_thresh=conf_thresh, iou_thresh=iou_thresh):
         if f.x2 - f.x1 < 8 or f.y2 - f.y1 < 8:
             continue
-        vec, n, roll, yaw = embed_face(img, f)
+        vec, n, roll, yaw, blur = embed_face(img, f)
         results.append(
             Detection(
                 x=f.x1 / src_w,
@@ -119,6 +128,7 @@ def detect_and_embed(
                 norm=n,
                 roll=roll,
                 yaw=yaw,
+                blur=blur,
             )
         )
     # Highest confidence first — the upload flow picks index 0 by default.
