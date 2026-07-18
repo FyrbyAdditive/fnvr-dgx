@@ -128,11 +128,26 @@ func (s *Server) handleRecentFaces(w http.ResponseWriter, r *http.Request) {
 				sim = float32(f)
 			}
 		}
+		// Only current-space embeddings are actionable: enrolling an
+		// old-space vector would poison the topofr_r100 pool with an
+		// incomparable embedding (confident false matches — the worst
+		// face-ID failure). Old rows keep their tiles for history but
+		// carry no vector, so the UI can't select them for enrol or
+		// negative training.
 		var vec []float32
-		if raw := attrs["embedding"]; raw != "" {
+		if raw := attrs["embedding"]; raw != "" &&
+			attrs["embedding_model"] == "topofr_r100" {
 			if b, err := base64.StdEncoding.DecodeString(raw); err == nil && len(b) == 512*4 {
 				vec = decodeFloat32Slice(b)
 			}
+		}
+		// The unmatched review queue exists to enrol/dismiss — rows
+		// with nothing actionable (old-space, stripped-by-retro-match,
+		// or embed-failed crops) would render as dead tiles that make
+		// selection counts lie ("Enrol 0 face samples"). Drop them
+		// from that view; the timeline still shows the sightings.
+		if onlyUnmatched && vec == nil {
+			continue
 		}
 		var bb faceBox
 		if len(d.BBox) > 0 {

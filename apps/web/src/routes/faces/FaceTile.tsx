@@ -99,7 +99,10 @@ export function FaceTile({
         ) : (
           <span className="text-xs text-neutral-600">no preview</span>
         )}
-        {onToggleSelect && isAdmin && (
+        {/* Selectable only when the row carries a current-space
+            embedding — a tile with no vector has nothing to enrol or
+            train on, and counting it would make the bulk bar lie. */}
+        {onToggleSelect && isAdmin && !!face.vector && (
           <label
             className="absolute top-1 left-1 bg-black/60 rounded px-1 py-0.5 flex items-center cursor-pointer"
             onClick={(e) => e.stopPropagation()}
