@@ -85,3 +85,13 @@ their own licences (see the model-prep scripts under
 [tools/model-prep/](tools/model-prep/) for provenance and pins);
 notably the SCRFD face detector and the Obico print-failure model are
 non-commercial/AGPL respectively — fine for personal self-hosting.
+
+-------
+<p></p>
+<p align="center">
+  <img src="docs/assets/FameLogo.png" alt="Fyrby Additive Manufacturing &amp; Engineering" width="280">
+</p>
+
+<p align="center">
+  Copyright 2026 Tim Ellis, Fyrby Additive Manufacturing &amp; Engineering
+</p>
