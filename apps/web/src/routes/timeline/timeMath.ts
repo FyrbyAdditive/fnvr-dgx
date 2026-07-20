@@ -88,3 +88,17 @@ export function estimateDurMs(s: Segment): number {
   const sec = Math.min(3600, Math.max(10, s.bytes / 750_000));
   return sec * 1000;
 }
+
+/** Compose a drag selection (fractions of the CURRENT visible window,
+ *  in any order) onto the existing zoom, producing the new zoom in
+ *  day fractions. Pure so nested-zoom math stays testable. */
+export function applyDragZoom(
+  zoom: { from: number; to: number },
+  a: number,
+  b: number,
+): { from: number; to: number } {
+  const lo = clampFrac(Math.min(a, b));
+  const hi = clampFrac(Math.max(a, b));
+  const span = zoom.to - zoom.from;
+  return { from: zoom.from + lo * span, to: zoom.from + hi * span };
+}

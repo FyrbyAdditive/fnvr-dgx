@@ -8,6 +8,7 @@ process.env.TZ = "Europe/London";
 
 import { describe, expect, it } from "vitest";
 import {
+  applyDragZoom,
   dayRange,
   dayRangeMs,
   fracToMs,
@@ -90,5 +91,21 @@ describe("formatting", () => {
     expect(msToHHMM(0)).toBe("00:00");
     expect(msToHHMM(13 * 3_600_000 + 5 * 60_000)).toBe("13:05");
     expect(msToHHMMSS(13 * 3_600_000 + 5 * 60_000 + 7_500)).toBe("13:05:07");
+  });
+});
+
+describe("applyDragZoom", () => {
+  it("zooms within the full day", () => {
+    expect(applyDragZoom({ from: 0, to: 1 }, 0.25, 0.75)).toEqual({ from: 0.25, to: 0.75 });
+  });
+  it("composes nested zooms", () => {
+    const z1 = applyDragZoom({ from: 0, to: 1 }, 0.5, 1);
+    expect(applyDragZoom(z1, 0, 0.5)).toEqual({ from: 0.5, to: 0.75 });
+  });
+  it("handles inverted drags", () => {
+    expect(applyDragZoom({ from: 0, to: 1 }, 0.75, 0.25)).toEqual({ from: 0.25, to: 0.75 });
+  });
+  it("clamps out-of-range fractions", () => {
+    expect(applyDragZoom({ from: 0.2, to: 0.6 }, -0.5, 1.5)).toEqual({ from: 0.2, to: 0.6 });
   });
 });

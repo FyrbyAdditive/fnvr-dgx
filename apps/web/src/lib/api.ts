@@ -211,7 +211,7 @@ export type HistoricDetection = {
   ts: string;
   class_name: string;
   /** "object" | "anpr" | "face". Absent on older rows (treat as "object"). */
-  kind?: "object" | "anpr" | "face";
+  kind?: "object" | "anpr" | "face" | "print_defect";
   confidence: number;
   bbox: { x: number; y: number; w: number; h: number };
   track_id?: string;

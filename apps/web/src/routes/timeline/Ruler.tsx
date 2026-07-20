@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { DetectionSummary, HistoricDetection, Incident, Segment } from "@/lib/api";
+import { SEVERITY_BG, severityColor } from "@/lib/severity";
 import { estimateDurMs, hourTicks, msToHHMMSS } from "./timeMath";
+import { useTimelinePointer } from "./useTimelinePointer";
 
 // Three-band day ruler:
 //   A  recording — blue segment coverage bars
@@ -14,7 +16,6 @@ import { estimateDurMs, hourTicks, msToHHMMSS } from "./timeMath";
 // them (incident/run buttons are the exception; they stopPropagation
 // on mousedown/up only, so click seeks but drag still zooms).
 
-const ZOOM_DRAG_THRESHOLD_PX = 6;
 const RUN_GAP_MS = 4_000; // track-run split threshold
 const RUN_LANES = 4;
 
@@ -22,12 +23,6 @@ const RUN_LANES = 4;
 const BAND_A = { top: 12, height: 18 };
 const BAND_B = { top: 36, height: 26 };
 const BAND_C = { top: 68, height: 24 };
-
-const SEVERITY_BG: Record<Incident["severity"], string> = {
-  critical: "bg-red-500/70 hover:bg-red-400/80",
-  warning: "bg-amber-400/70 hover:bg-amber-300/80",
-  info: "bg-blue-400/70 hover:bg-blue-300/80",
-};
 
 type Run = {
   startMs: number;
@@ -41,8 +36,6 @@ type Run = {
   thumbId: number | null;
   lane: number;
 };
-
-type Hover = { x: number; y: number; ms: number };
 
 export function Ruler({
   from,
@@ -123,12 +116,6 @@ export function Ruler({
     };
   };
 
-  const clientXToMs = (clientX: number) => {
-    const r = ref.current!.getBoundingClientRect();
-    const frac = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
-    return visFromMs + frac * visMs;
-  };
-
   // ---- render lists -----------------------------------------------------
 
   const segSpans = useMemo(() => {
@@ -195,9 +182,16 @@ export function Ruler({
     [from, to, visFromMs, visToMs],
   );
 
-  // ---- hover model ------------------------------------------------------
+  // ---- pointer: hover + drag-to-zoom / click-to-seek --------------------
 
-  const [hover, setHover] = useState<Hover | null>(null);
+  const { hover, dragRange, containerHandlers } = useTimelinePointer({
+    ref,
+    visFromMs,
+    visMs,
+    zoom,
+    onZoom,
+    onClickMs: (ms) => onSeek(ms),
+  });
 
   const hovered = useMemo(() => {
     if (!hover || !ref.current) return null;
@@ -228,68 +222,6 @@ export function Ruler({
     return null;
   }, [hover, containerW, segSpans, incSpans, buckets, runSpans, windowDetections]);
 
-  // ---- drag-to-zoom / click-to-seek ------------------------------------
-
-  const dragAnchorRef = useRef<number | null>(null); // clientX at mousedown
-  const [dragRange, setDragRange] = useState<{ startX: number; endX: number } | null>(null);
-
-  const clientXToVisFrac = (clientX: number) => {
-    const r = ref.current!.getBoundingClientRect();
-    return Math.max(0, Math.min(1, (clientX - r.left) / r.width));
-  };
-
-  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    dragAnchorRef.current = e.clientX;
-    setDragRange({ startX: e.clientX, endX: e.clientX });
-    // Ensure mouseup fires even if the user drags off the element.
-    ref.current?.setPointerCapture?.((e as any).pointerId ?? 1);
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    const r = ref.current?.getBoundingClientRect();
-    if (r) {
-      setHover({
-        x: e.clientX - r.left,
-        y: e.clientY - r.top,
-        ms: clientXToMs(e.clientX),
-      });
-    }
-    if (dragAnchorRef.current == null) return;
-    setDragRange({ startX: dragAnchorRef.current, endX: e.clientX });
-  };
-
-  const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
-    const anchor = dragAnchorRef.current;
-    dragAnchorRef.current = null;
-    setDragRange(null);
-    if (anchor == null) return;
-    const delta = Math.abs(e.clientX - anchor);
-    if (delta < ZOOM_DRAG_THRESHOLD_PX) {
-      // Plain click → seek, floored to a whole second so the playback
-      // request starts exactly where the readout said.
-      onSeek(Math.floor(clientXToMs(e.clientX) / 1000) * 1000);
-      return;
-    }
-    // Real drag → zoom.
-    const a = clientXToVisFrac(anchor);
-    const b = clientXToVisFrac(e.clientX);
-    const lo = Math.min(a, b);
-    const hi = Math.max(a, b);
-    onZoom({
-      from: zoom.from + lo * (zoom.to - zoom.from),
-      to: zoom.from + hi * (zoom.to - zoom.from),
-    });
-  };
-
-  const handleMouseLeave = () => {
-    setHover(null);
-    // A drag that leaves the element ends without zooming; state must
-    // not stick.
-    dragAnchorRef.current = null;
-    setDragRange(null);
-  };
-
   const stopMouse = (e: React.MouseEvent) => e.stopPropagation();
 
   const seekIncident = (inc: Incident) => {
@@ -306,10 +238,7 @@ export function Ruler({
     <div className="select-none">
       <div
         ref={ref}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseLeave}
+        {...containerHandlers}
         onDoubleClick={onResetZoom}
         className="relative h-36 bg-neutral-900 rounded cursor-crosshair overflow-hidden"
       >
@@ -516,7 +445,7 @@ function HoverInfo({
   hovered,
   containerW,
 }: {
-  hover: Hover;
+  hover: { x: number; y: number; ms: number };
   hovered:
     | ({ kind: "segment"; seg: Segment; startMs: number; endMs: number })
     | ({ kind: "incident"; inc: Incident; startMs: number; endMs: number })
@@ -556,17 +485,7 @@ function HoverInfo({
           {hovered.kind === "incident" && (
             <>
               <div className="font-medium">
-                <span
-                  className={
-                    hovered.inc.severity === "critical"
-                      ? "text-red-400"
-                      : hovered.inc.severity === "warning"
-                        ? "text-amber-300"
-                        : "text-blue-300"
-                  }
-                >
-                  ●{" "}
-                </span>
+                <span className={severityColor(hovered.inc.severity)}>●{" "}</span>
                 {hovered.inc.classes.join(" + ")} ×{hovered.inc.detection_count}
               </div>
               <div className="text-neutral-400 tabular-nums">

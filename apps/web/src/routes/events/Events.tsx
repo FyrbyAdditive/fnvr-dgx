@@ -1,3 +1,4 @@
+import { severityColor } from "@/lib/severity";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, Incident } from "@/lib/api";
@@ -169,12 +170,6 @@ export function Events() {
       </section>
     </div>
   );
-}
-
-function severityColor(s: string) {
-  if (s === "critical") return "text-red-400";
-  if (s === "warning") return "text-amber-400";
-  return "text-blue-400";
 }
 
 // IncidentSummary renders the two-line description of a (possibly
