@@ -41,6 +41,15 @@ OBICO_ONNX=/opt/fnvr/printmon/obico_failure.onnx
 OBICO_ENGINE="$MODELS/printmon/obico_failure.onnx_b1_gpu0_fp16.engine"
 if [ -s "$OBICO_ONNX" ]; then
     mkdir -p "$REPO/obico_failure/1" "$MODELS/printmon"
+    # Content-compare the baked ONNX against the volume copy so a
+    # model upgrade in the image invalidates the cached engine
+    # (learned from the 2025-12 weights refresh: engine staleness is
+    # silent otherwise).
+    if ! cmp -s "$OBICO_ONNX" "$MODELS/printmon/obico_failure.onnx"; then
+        cp -f "$OBICO_ONNX" "$MODELS/printmon/obico_failure.onnx"
+        rm -f "$OBICO_ENGINE"
+        echo "triton-entry: obico ONNX changed — dropped stale engine"
+    fi
     if [ ! -s "$OBICO_ENGINE" ]; then
         echo "triton-entry: building $OBICO_ENGINE"
         TRTEXEC=/usr/src/tensorrt/bin/trtexec
