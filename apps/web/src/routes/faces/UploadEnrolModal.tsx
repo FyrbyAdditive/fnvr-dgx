@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
 import { Dialog } from "@/components/ui/Dialog";
@@ -25,6 +25,13 @@ export function UploadEnrolModal({
   const { data: persons = [] } = useQuery({ queryKey: ["persons"], queryFn: api.listPersons });
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // Revoke the blob URL when it's replaced or the modal unmounts.
+  useEffect(
+    () => () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    },
+    [previewUrl],
+  );
   const [pickId, setPickId] = useState("");
   const [newLabel, setNewLabel] = useState("");
   const [faceIndex, setFaceIndex] = useState<number | null>(null);
@@ -91,7 +98,6 @@ export function UploadEnrolModal({
               setFile(f);
               setFaceIndex(null);
               setMultiFaces(null);
-              if (previewUrl) URL.revokeObjectURL(previewUrl);
               setPreviewUrl(f ? URL.createObjectURL(f) : null);
             }}
           />

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Camera, PipelineCameraMetrics } from "@/lib/api";
 import { DetectionEvent } from "@/lib/events";
 import { hasProxyStream } from "@/lib/streams";
@@ -86,6 +86,17 @@ export function CameraTile({
     status: "connecting",
     lastError: null,
   });
+  // Stable identity + bail-out on unchanged values: CameraContent's
+  // status effect depends on this callback, so an inline handler that
+  // stores a fresh object would re-render in a loop.
+  const handleStatusChange = useCallback(
+    (status: ConnectionStatus, lastError: string | null) => {
+      setConn((prev) =>
+        prev.status === status && prev.lastError === lastError ? prev : { status, lastError },
+      );
+    },
+    [],
+  );
 
   const latest = detections[0];
   const active = detections.length > 0;
@@ -159,7 +170,7 @@ export function CameraTile({
         onPreviewFps={showStats && !thumb ? setPreviewFps : undefined}
         quality={quality}
         hasProxy={hasProxyStream(camera)}
-        onStatusChange={(status, lastError) => setConn({ status, lastError })}
+        onStatusChange={handleStatusChange}
       />
 
       {/* Offline / failed treatment — dimmed grayscale poster with a
