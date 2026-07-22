@@ -3,16 +3,20 @@
 // RF-DETR is an NMS-free DETR: the export emits, per frame,
 //   boxes  [Q, 4]  — cx, cy, w, h, normalised to [0, 1]
 //   logits [Q, C]  — per-query class logits (sigmoid activation)
-// Layer identification is by trailing dimension (4 → boxes, else
-// logits), so output naming drift across rfdetr versions doesn't
-// matter. Confidence = sigmoid(max logit); one candidate per query;
-// cluster-mode=4 (no clustering) downstream.
+// Layer identification is by name when the export names its outputs
+// (boxes/dets vs logits/labels/scores), falling back to trailing
+// dimension (4 → boxes, else logits) for renamed exports. The dim
+// heuristic alone would swap the two on a C==4 head, where both
+// outputs end in 4. Confidence = sigmoid(max logit); one candidate
+// per query; cluster-mode=4 (no clustering) downstream.
 //
 // Build: CUDA_VER=... make   (see Makefile — mirrors DeepStream-Yolo's)
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "nvdsinfer_custom_impl.h"
@@ -33,14 +37,33 @@ extern "C" bool NvDsInferParseCustomRFDETR(
     const NvDsInferLayerInfo* boxes = nullptr;
     const NvDsInferLayerInfo* logits = nullptr;
 
+    // Names first — see header comment.
     for (const auto& l : outputLayersInfo) {
+        if (!l.layerName) continue;
+        std::string name(l.layerName);
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (!boxes && (name.find("box") != std::string::npos ||
+                       name.find("dets") != std::string::npos)) {
+            boxes = &l;
+        } else if (!logits && (name.find("logit") != std::string::npos ||
+                               name.find("label") != std::string::npos ||
+                               name.find("score") != std::string::npos ||
+                               name.find("class") != std::string::npos)) {
+            logits = &l;
+        }
+    }
+    // Trailing-dim fallback for exports whose names matched neither.
+    for (const auto& l : outputLayersInfo) {
+        if (&l == boxes || &l == logits) continue;
         if (l.inferDims.numDims < 1) continue;
         const unsigned last = l.inferDims.d[l.inferDims.numDims - 1];
         if (last == 4 && !boxes) boxes = &l;
         else if (!logits) logits = &l;
         else if (last != 4 && l.inferDims.numDims >= 2) logits = &l;
     }
-    if (!boxes || !logits || !boxes->buffer || !logits->buffer) return false;
+    if (!boxes || !logits || boxes == logits ||
+        !boxes->buffer || !logits->buffer) return false;
 
     // Trailing-dim products give Q and C robustly across [Q,C] vs
     // [1,Q,C] exports (nvinfer strips the batch dim, but be safe).

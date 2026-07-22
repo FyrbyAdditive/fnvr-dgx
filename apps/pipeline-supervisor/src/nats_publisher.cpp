@@ -47,6 +47,10 @@ void NatsPublisher::teardown() {
 }
 
 bool NatsPublisher::Publish(std::string_view subject, std::string_view payload, bool flush) {
+    // Whole-call lock: cheap for the hot flush=false path (publish is an
+    // in-memory enqueue) and required for the rebuild path below, which
+    // destroys conn_ out from under any concurrent publisher.
+    std::lock_guard<std::mutex> lock(mu_);
     // Guard against the silent-drop state: nats-c marks the connection
     // CLOSED after reconnect retries are exhausted, but natsConnection_*
     // calls may still return NATS_OK from the client-side queue. Detect

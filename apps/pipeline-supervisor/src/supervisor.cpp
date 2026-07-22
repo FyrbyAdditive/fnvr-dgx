@@ -318,11 +318,12 @@ void validateAllEngines(const std::string& pgie_engine_path) {
             256 * 1024);
     }
     if (const char* e = std::getenv("FNVR_USE_FACEID"); e && std::string(e) == "1") {
+        // Must track the engine name reconcileOnce gates on — the old
+        // RetinaFace/AdaFace names validated nothing (missing file =
+        // early return) and left a truncated SCRFD engine in place to
+        // crash-loop the next worker.
         validateEngineFile(
-            "/var/lib/fnvr/models/faceid/face_detector.onnx_b1_gpu0_fp16.engine",
-            256 * 1024);
-        validateEngineFile(
-            "/var/lib/fnvr/models/faceid/adaface.onnx_b16_gpu0_fp16.engine",
+            "/var/lib/fnvr/models/faceid/scrfd_10g_bnkps.onnx_b1_gpu0_fp16.engine",
             1 * 1024 * 1024);
     }
 }

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -23,6 +24,8 @@ public:
     NatsPublisher(const NatsPublisher&) = delete;
     NatsPublisher& operator=(const NatsPublisher&) = delete;
 
+    // Main-thread-only, before publisher threads spawn — reads conn_
+    // without mu_ on purpose.
     bool Connected() const { return conn_ != nullptr; }
 
     // Publish payload to the given subject. Returns true on success.
@@ -41,6 +44,13 @@ private:
     void teardown();
 
     std::string url_;
+    // Serialises Publish across threads (probe, bus, heartbeat/metrics,
+    // supervisor workers): the CLOSED-rebuild path tears down and
+    // recreates conn_, and cnats handles are only thread-safe once
+    // created — a concurrent publisher would race a Destroy. Also
+    // covers the log-rate-limit timestamps below. Not taken in the
+    // ctor/dtor: both run while no other thread holds the object.
+    std::mutex mu_;
     natsConnection* conn_ = nullptr;
     // Rate-limit noisy CLOSED-state log spam when the broker is actually
     // down for an extended window.

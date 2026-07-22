@@ -212,6 +212,13 @@ static int runWorkerGroup(const std::string& group_id,
                 now - playing_since >= std::chrono::seconds(90);
             if (!armed) {
                 last_window = now;  // windows start clean at arm time
+                for (size_t i = 0; i < n; i++) {
+                    // Counters too — otherwise the first armed window
+                    // spans everything since process start and scores
+                    // the lifetime average instead of the last 30 s.
+                    last_in[i]   = p.InputFramesForSource(i);
+                    last_push[i] = p.PushFramesForSource(i);
+                }
             }
             if (armed && p.Playing() &&
                 now - last_window >= std::chrono::seconds(30)) {
