@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -83,6 +84,7 @@ func runSeed() error {
 	}
 	defer pool.Close()
 	a := auth.NewStore(pool, 24*time.Hour)
+	defer a.Close()
 	created, err := a.BootstrapAdmin(ctx)
 	if err != nil {
 		return err
@@ -116,6 +118,7 @@ func runServe() error {
 	defer pool.Close()
 
 	authStore := auth.NewStore(pool, 24*time.Hour)
+	defer authStore.Close()
 	if created, err := authStore.BootstrapAdmin(ctx); err != nil {
 		return fmt.Errorf("bootstrap admin: %w", err)
 	} else if created {
@@ -198,7 +201,7 @@ func runServe() error {
 		MtxReconcile:  mtxReconcileCb,
 		Detections:    detections.NewStore(pool, segStore, cfg.DataDir+"/recordings"),
 		Plates:        plates.NewStore(pool),
-		Persons:       persons.NewStore(pool),
+		Persons:       persons.NewStore(pool, filepath.Join(cfg.DataDir, "thumbs", "faces")),
 		Flags:         flags.NewStore(pool),
 		Classes:       classes.NewStore(pool),
 		MLWorker:      mlworker.NewClient(),

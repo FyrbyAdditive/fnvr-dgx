@@ -185,7 +185,10 @@ func (s *Service) candidateSegments(cameraID string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
-		if filepath.Base(filepath.Dir(path)) != cameraID {
+		// MediaMTX records to <root>/live_<camera-id>/<timestamp>.mp4
+		// (recordPath %path = the stream path, which pipeline.cpp names
+		// live_<cam>). Accept a bare <camera-id> dir too for safety.
+		if parent := filepath.Base(filepath.Dir(path)); parent != "live_"+cameraID && parent != cameraID {
 			return nil
 		}
 		if filepath.Ext(path) != ".mp4" {

@@ -72,10 +72,14 @@ type Store struct {
 
 	mu       sync.RWMutex
 	sessions map[string]Session
+
+	done chan struct{}
 }
 
 func NewStore(pool *pgxpool.Pool, ttl time.Duration) *Store {
-	return &Store{pool: pool, ttl: ttl, sessions: map[string]Session{}}
+	s := &Store{pool: pool, ttl: ttl, sessions: map[string]Session{}, done: make(chan struct{})}
+	go s.janitor()
+	return s
 }
 
 // BootstrapAdmin creates the default admin/admin user if no users exist.
@@ -478,11 +482,52 @@ func (s *Store) Validate(token string) (Session, bool) {
 	s.mu.RLock()
 	sess, ok := s.sessions[token]
 	s.mu.RUnlock()
-	if !ok || time.Now().After(sess.ExpiresAt) {
+	if !ok {
+		return Session{}, false
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		// Evict on sight so dead sessions don't linger until the next
+		// sweep. Re-check under the write lock in case the token was
+		// re-issued between lock releases.
+		s.mu.Lock()
+		if cur, still := s.sessions[token]; still && cur.ExpiresAt.Equal(sess.ExpiresAt) {
+			delete(s.sessions, token)
+		}
+		s.mu.Unlock()
 		return Session{}, false
 	}
 	return sess, true
 }
+
+// janitor sweeps expired sessions — one map entry leaks per login
+// otherwise, for the life of the process. Expired bearer-cache entries
+// (resolveBearer) go with them; they re-resolve on next use.
+func (s *Store) janitor() {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+		}
+		s.sweep(time.Now())
+	}
+}
+
+// sweep drops sessions expired before cutoff. Split from the janitor
+// loop so tests can call it directly.
+func (s *Store) sweep(cutoff time.Time) {
+	s.mu.Lock()
+	for tok, sess := range s.sessions {
+		if cutoff.After(sess.ExpiresAt) {
+			delete(s.sessions, tok)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Store) Close() { close(s.done) }
 
 func randomToken() (string, error) {
 	b := make([]byte, 32)

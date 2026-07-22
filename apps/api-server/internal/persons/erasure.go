@@ -25,8 +25,9 @@ type ErasureReport struct {
 	EmbeddingsRemoved int       `json:"embeddings_removed"`
 }
 
-// ErasureRoot is where face thumbnails live on disk. Matches the
-// API server's cache path in server/faces.go.
+// ErasureRoot is the fallback thumbnail root when the Store was built
+// without one. Matches the default FNVR_DATA_DIR; deployments that
+// override DataDir get the real path via NewStore.
 const ErasureRoot = "/var/lib/fnvr/thumbs/faces"
 
 // Erase performs a record-purge erasure for a person. This is
@@ -86,8 +87,12 @@ func (s *Store) Erase(ctx context.Context, personID, actor string) (ErasureRepor
 	// 2. Best-effort thumbnail delete. A missing file is fine (the
 	//    cache is populated lazily); a permission error logs and
 	//    moves on rather than aborting the erasure.
+	thumbsRoot := s.thumbsRoot
+	if thumbsRoot == "" {
+		thumbsRoot = ErasureRoot
+	}
 	for _, id := range detectionIDs {
-		path := filepath.Join(ErasureRoot, strconv.FormatInt(id, 10)+".jpg")
+		path := filepath.Join(thumbsRoot, strconv.FormatInt(id, 10)+".jpg")
 		if err := os.Remove(path); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				slog.Warn("erasure: thumbnail remove",

@@ -575,7 +575,9 @@ func (s *Server) handleCreateCamera(w http.ResponseWriter, r *http.Request) {
 
 	// Best-effort announce to pipeline. If it fails we keep the DB row —
 	// pipeline-supervisor reconciles from the DB on reconnect.
-	if _, err := s.pipeline.AddCamera(ctxWithTimeout(r.Context()), pipeline.AddCameraArgs{
+	addCtx, cancel := ctxWithTimeout(r.Context())
+	defer cancel()
+	if _, err := s.pipeline.AddCamera(addCtx, pipeline.AddCameraArgs{
 		ID:            created.ID,
 		URL:           created.URL,
 		SubstreamURL:  created.Substream,
@@ -609,7 +611,9 @@ func (s *Server) handleDeleteCamera(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if _, err := s.pipeline.RemoveCamera(ctxWithTimeout(r.Context()), id); err != nil {
+	rmCtx, cancel := ctxWithTimeout(r.Context())
+	defer cancel()
+	if _, err := s.pipeline.RemoveCamera(rmCtx, id); err != nil {
 		slog.Warn("pipeline.RemoveCamera failed", "id", id, "err", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1085,7 +1089,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func ctxWithTimeout(parent context.Context) context.Context {
-	ctx, _ := context.WithTimeout(parent, 3*time.Second) //nolint:govet // short-lived, handler-scoped
-	return ctx
+func ctxWithTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, 3*time.Second)
 }

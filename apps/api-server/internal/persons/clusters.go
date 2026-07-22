@@ -211,12 +211,15 @@ func (s *Store) DismissClusterAsNotAFace(ctx context.Context, clusterID string) 
 	// 1. Seed face_dismissals with every member. reason='not_a_face'
 	//    so loadFaceNegatives() in event-processor picks them up on
 	//    the next 30 s reload.
+	// model must be written explicitly: the column default is the old
+	// adaface space, and both negative-loaders filter on topofr_r100 —
+	// rows tagged with the default are invisible to the matchers.
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO face_dismissals (detection_id, embedding, reason)
-		SELECT detection_id::text, embedding, 'not_a_face'
+		INSERT INTO face_dismissals (detection_id, embedding, reason, model)
+		SELECT detection_id::text, embedding, 'not_a_face', 'topofr_r100'
 		FROM face_cluster_members
 		WHERE cluster_id = $1
-		ON CONFLICT (detection_id) DO UPDATE SET reason = 'not_a_face'`,
+		ON CONFLICT (detection_id) DO UPDATE SET reason = 'not_a_face', model = 'topofr_r100'`,
 		clusterID)
 	if err != nil {
 		return 0, err

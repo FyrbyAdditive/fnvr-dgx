@@ -79,9 +79,17 @@ type DismissedEmbedding struct {
 	Vector      []float32
 }
 
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// thumbsRoot is where cached face-thumbnail JPEGs live — must match
+	// the write path in server/faces.go ({DataDir}/thumbs/faces) or
+	// right-to-erasure deletes from the wrong directory.
+	thumbsRoot string
+}
 
-func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func NewStore(pool *pgxpool.Pool, thumbsRoot string) *Store {
+	return &Store{pool: pool, thumbsRoot: thumbsRoot}
+}
 
 // --- Person CRUD ---
 

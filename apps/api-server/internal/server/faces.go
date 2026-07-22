@@ -227,7 +227,12 @@ func (s *Server) handleRecentFaces(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, r := range recs {
 			if len(r.vec) == 0 {
-				// No embedding — can't cluster; emit on its own.
+				// No embedding — can't cluster; emit on its own. Still
+				// counts against limit or the over-fetch multiplier leaks
+				// through on vec-less rows.
+				if len(clusters)+len(out) >= limit {
+					continue
+				}
 				out = append(out, r.resp)
 				continue
 			}

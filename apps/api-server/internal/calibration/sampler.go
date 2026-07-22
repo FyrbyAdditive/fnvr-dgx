@@ -4,8 +4,8 @@
 // deployment distribution quantise better than generic COCO samples.
 //
 // Design notes:
-//   - We walk /var/lib/fnvr/recordings/YYYY/MM/DD/HH/<camera>/rec.mp4
-//     (the hour-bucketed layout the pipeline writes).
+//   - We walk /var/lib/fnvr/recordings/live_<camera>/<timestamp>.mp4
+//     (the layout MediaMTX's recordPath writes).
 //   - Sampling is bucketed: the lookback window is split into
 //     TargetCount equal time buckets; we take at most one keyframe
 //     per bucket, round-robin across cameras so a chatty camera
@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ type Config struct {
 	// ModelDir is the yolo26 model cache. Samples land under
 	// ModelDir/calib_images/. Defaults to /var/lib/fnvr/models/yolo26.
 	ModelDir string
-	// RecordingsRoot is the hour-bucketed recordings root.
+	// RecordingsRoot is the MediaMTX recordings root.
 	// Defaults to /var/lib/fnvr/recordings.
 	RecordingsRoot string
 	// LookbackHours is how far back to reach for source frames.
@@ -159,18 +160,23 @@ func SampleFromRecordings(ctx context.Context, cfg Config) (Result, error) {
 	return result, nil
 }
 
-// recordingEntry is one rec.mp4 we might sample from.
+// recordingEntry is one segment mp4 we might sample from.
 type recordingEntry struct {
 	Path   string
 	Camera string
-	// StartedAt is when the pipeline opened this mp4 — derived from
-	// the YYYY/MM/DD/HH directory path, truncated to the hour.
+	// StartedAt is when MediaMTX opened this segment — parsed from the
+	// filename timestamp (accurate to the microsecond).
 	StartedAt time.Time
 }
 
-// enumerateRecentRecordings walks the hour-bucketed tree and returns
-// a per-camera slice of recordings within the last `hours` hours,
-// newest first. Cheap — only stat directories, not mp4 contents.
+// mtxSegmentRe matches MediaMTX's recordPath filename pattern
+// (%Y-%m-%d_%H-%M-%S-%f, 6-digit microseconds) — the same parse as
+// storage-manager's indexNewSegments.
+var mtxSegmentRe = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})-(\d{6})\.mp4$`)
+
+// enumerateRecentRecordings walks the MediaMTX recordings layout
+// (<root>/live_<camera-id>/<timestamp>.mp4) and returns a per-camera
+// slice of recordings within the last `hours` hours, newest first.
 func enumerateRecentRecordings(root string, hours int) (map[string][]recordingEntry, error) {
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	out := make(map[string][]recordingEntry)
@@ -179,28 +185,33 @@ func enumerateRecentRecordings(root string, hours int) (map[string][]recordingEn
 			// Keep going past permission / missing-dir hiccups.
 			return nil
 		}
-		if d.IsDir() || filepath.Base(path) != "rec.mp4" {
+		if d.IsDir() {
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
+		match := mtxSegmentRe.FindStringSubmatch(d.Name())
+		if match == nil {
 			return nil
 		}
-		// Expect YYYY/MM/DD/HH/<camera>/rec.mp4 → 5 parts before the
-		// filename.
-		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) != 6 {
+		// Parent dir is live_<camera-id> (pipeline.cpp's rtspclientsink
+		// path); anything else (e.g. MediaMTX's test path) isn't a
+		// camera recording.
+		parent := filepath.Base(filepath.Dir(path))
+		const livePrefix = "live_"
+		if !strings.HasPrefix(parent, livePrefix) {
 			return nil
 		}
-		t, perr := time.Parse("2006-01-02 15",
-			fmt.Sprintf("%s-%s-%s %s", parts[0], parts[1], parts[2], parts[3]))
+		cam := parent[len(livePrefix):]
+		// UTC to match the container clock MediaMTX names files with.
+		t, perr := time.Parse(
+			"2006-01-02_15-04-05.000000",
+			match[1]+"_"+match[2]+"-"+match[3]+"-"+match[4]+"."+match[5],
+		)
 		if perr != nil {
 			return nil
 		}
 		if t.Before(cutoff) {
 			return nil
 		}
-		cam := parts[4]
 		out[cam] = append(out[cam], recordingEntry{
 			Path: path, Camera: cam, StartedAt: t,
 		})
