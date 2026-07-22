@@ -119,7 +119,10 @@ async def cluster(req: ClusterRequest) -> dict[str, Any]:
         # Nothing to cluster — return all-noise.
         return {"labels": [-1] * len(req.embeddings)}
     try:
-        labels = cluster_ops.hdbscan_labels(
+        # to_thread: HDBSCAN is CPU-heavy and would stall the loop that
+        # runs face_consumer/printmon and answers /healthz.
+        labels = await asyncio.to_thread(
+            cluster_ops.hdbscan_labels,
             np.asarray(req.embeddings, dtype=np.float32),
             min_cluster_size=req.min_cluster_size,
         )
@@ -134,7 +137,7 @@ async def cluster(req: ClusterRequest) -> dict[str, Any]:
 @app.post("/batch-cluster")
 async def batch_cluster() -> dict[str, Any]:
     try:
-        report = cluster_ops.batch_cluster_unmatched()
+        report = await asyncio.to_thread(cluster_ops.batch_cluster_unmatched)
     except Exception as e:
         log.exception("batch_cluster failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -146,7 +149,10 @@ async def batch_cluster() -> dict[str, Any]:
 @app.post("/drift-check")
 async def drift_check() -> dict[str, Any]:
     try:
-        report = drift_ops.check()
+        # to_thread also keeps drift's asyncio.run-based NATS publish
+        # off the event-loop thread, where it would raise and be
+        # swallowed as a warning.
+        report = await asyncio.to_thread(drift_ops.check)
     except Exception as e:
         log.exception("drift_check failed")
         raise HTTPException(status_code=500, detail=str(e))

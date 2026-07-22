@@ -253,8 +253,8 @@ def _monitored_cameras() -> list[str]:
 
 def _detection_json(camera_id: str, class_name: str, conf: float,
                     box: Box | None, ewm: float) -> bytes:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    ts = datetime.now(timezone.utc)
+    now = ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
     bbox = (
         {"x": box.x1, "y": box.y1, "w": box.x2 - box.x1, "h": box.y2 - box.y1}
         if box

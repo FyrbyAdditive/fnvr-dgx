@@ -58,7 +58,20 @@ def _publish_alert(payload: dict[str, Any]) -> None:
             finally:
                 await nc.drain()
 
-        asyncio.run(_go())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_go())
+        else:
+            # Called from the event-loop thread (callers should route
+            # check() through to_thread, but don't lose the alert if
+            # one doesn't): asyncio.run would raise here, so publish
+            # from a short-lived thread instead.
+            import threading
+
+            t = threading.Thread(target=lambda: asyncio.run(_go()), daemon=True)
+            t.start()
+            t.join(timeout=5)
     except Exception as e:
         log.warning("NATS drift alert publish failed: %s", e)
 
@@ -174,11 +187,15 @@ def check() -> dict[str, Any]:
         }
 
         if baseline is None:
-            # First run — store as baseline. No alert.
+            # First run — store as baseline. No alert. Upsert: the row
+            # is seeded by migration 0021, but a plain UPDATE would
+            # silently store nothing if it's ever absent and drift
+            # alerts would never arm.
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE settings SET value = %s WHERE key = %s",
-                    (json.dumps(current), "ml.drift.baseline_self_match"),
+                    "INSERT INTO settings (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    ("ml.drift.baseline_self_match", json.dumps(current)),
                 )
             report["status"] = "baseline_set"
             log.info("drift check: baseline set to %.4f", current)

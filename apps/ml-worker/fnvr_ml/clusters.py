@@ -208,12 +208,14 @@ def batch_cluster_unmatched() -> dict[str, Any]:
             # within _CLUSTER_MATCH cosine; reuse its id. Otherwise
             # insert a new row.
             best_id: str | None = None
+            best_j = -1
             best_sim = -1.0
-            for cid, cvec in existing:
+            for j, (cid, cvec) in enumerate(existing):
                 sim = float(np.dot(centroid, cvec))
                 if sim > best_sim:
                     best_sim = sim
                     best_id = cid
+                    best_j = j
             with conn.cursor() as cur:
                 rep_det = int(detection_ids[idx[0]])
                 if best_id is not None and best_sim >= _CLUSTER_MATCH:
@@ -235,6 +237,10 @@ def batch_cluster_unmatched() -> dict[str, Any]:
                         ),
                     )
                     cluster_uuid = best_id
+                    # Claimed: remove from the candidate pool so a
+                    # second label this batch can't also claim it and
+                    # silently merge two distinct clusters.
+                    existing.pop(best_j)
                     report["preserved_clusters"] += 1
                 else:
                     cur.execute(
