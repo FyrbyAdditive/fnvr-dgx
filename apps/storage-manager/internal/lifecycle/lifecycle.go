@@ -55,6 +55,20 @@ type Config struct {
 type Manager struct {
 	cfg  Config
 	pool *pgxpool.Pool
+
+	// indexed memoises the (size, mtime) last upserted per segment
+	// path. A closed segment never changes again, yet the walk used to
+	// re-upsert every file on disk each scan — thousands of no-op
+	// write transactions per tick at steady state. Only new files and
+	// still-growing (open) segments hit Postgres now. Single walker
+	// goroutine — no locking. Restart heals any external DB surgery
+	// (cold start re-upserts everything once).
+	indexed map[string]segMeta
+}
+
+type segMeta struct {
+	size  int64
+	mtime time.Time
 }
 
 func New(ctx context.Context, cfg Config) (*Manager, error) {
@@ -272,7 +286,11 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 	// %f produces 6-digit microseconds.
 	mtxRe := regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})-(\d{6})\.mp4$`)
 
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	if m.indexed == nil {
+		m.indexed = map[string]segMeta{}
+	}
+	seen := make(map[string]struct{}, len(m.indexed))
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -307,6 +325,11 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 		if err != nil {
 			return nil
 		}
+		if prev, ok := m.indexed[path]; ok &&
+			prev.size == st.Size() && prev.mtime.Equal(st.ModTime()) {
+			seen[path] = struct{}{}
+			return nil
+		}
 		// ended_at = mtime; updated each scan as MediaMTX appends.
 		// Codec is unknown without ffprobe; the pipeline's rtspclientsink
 		// passthrough preserves source codec, but we don't record that
@@ -326,11 +349,28 @@ func (m *Manager) indexNewSegments(ctx context.Context) error {
 			      duration_ms = GREATEST(0, EXTRACT(EPOCH FROM
 			                    (EXCLUDED.ended_at - segments.started_at))*1000)::int`,
 			cameraID, path, startedAt, mtime, st.Size())
-		if err != nil && !strings.Contains(err.Error(), "foreign key") {
-			slog.Debug("segment insert", "err", err, "path", path)
+		if err != nil {
+			if !strings.Contains(err.Error(), "foreign key") {
+				slog.Debug("segment insert", "err", err, "path", path)
+			}
+			// Not cached — failed rows (e.g. FK on a not-yet-created
+			// camera) retry next scan, exactly as before.
+			return nil
 		}
+		m.indexed[path] = segMeta{size: st.Size(), mtime: st.ModTime()}
+		seen[path] = struct{}{}
 		return nil
 	})
+	// Drop cache entries for files retention (or an operator) removed
+	// so the map tracks the on-disk population, not all paths ever.
+	if walkErr == nil {
+		for p := range m.indexed {
+			if _, ok := seen[p]; !ok {
+				delete(m.indexed, p)
+			}
+		}
+	}
+	return walkErr
 }
 
 func (m *Manager) applyRetention(ctx context.Context) error {
