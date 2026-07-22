@@ -80,6 +80,7 @@ type Engine struct {
 	// costs ~50µs per face detection — cheaper than anything
 	// fancier to maintain.
 	faceEnrolments   []enrolledEmbedding
+	facePersons      []personEnrolments
 	faceMatchThresh  float64
 	// faceMarginThresh is the minimum gap between the top-scoring
 	// person and the runner-up before a multi-person match is
@@ -306,9 +307,24 @@ type Schedule struct {
 type compiledRule struct {
 	Rule
 	classes  map[string]struct{}
+	// loc is the schedule's timezone, resolved once at compile.
+	// time.LoadLocation re-reads tzdata on every call, and inSchedule
+	// runs per rule per detection — far too hot for a tz parse.
+	loc *time.Location
 	// sequence is nil for single-camera rules. Populated only when
 	// reload() parses a Kind=="sequence" rule with at least two steps.
 	sequence *compiledSequence
+}
+
+// scheduleLocation resolves a schedule's timezone with the same
+// fallback inSchedule historically used (bad/empty tz = UTC).
+func scheduleLocation(s Schedule) *time.Location {
+	if s.Timezone != "" {
+		if l, err := time.LoadLocation(s.Timezone); err == nil {
+			return l
+		}
+	}
+	return time.UTC
 }
 
 // compiledSequence holds the parsed step list + window duration for a
@@ -365,6 +381,29 @@ type enrolledEmbedding struct {
 	Label        string
 	AlertOnMatch bool
 	Vector       []float32 // normalised, len=512
+}
+
+// personEnrolments is faceEnrolments pre-grouped by person at reload.
+// The matcher runs per face detection; regrouping there allocated two
+// maps per frame for a grouping that only changes every 30s.
+type personEnrolments struct {
+	rep     enrolledEmbedding // person metadata (identical on every row)
+	vectors [][]float32
+}
+
+func groupEnrolmentsByPerson(enrols []enrolledEmbedding) []personEnrolments {
+	idx := make(map[string]int, 8)
+	out := make([]personEnrolments, 0, 8)
+	for _, en := range enrols {
+		i, ok := idx[en.PersonID]
+		if !ok {
+			i = len(out)
+			idx[en.PersonID] = i
+			out = append(out, personEnrolments{rep: en})
+		}
+		out[i].vectors = append(out[i].vectors, en.Vector)
+	}
+	return out
 }
 
 // dismissedEmbedding is an operator-flagged false-positive (or
@@ -615,7 +654,7 @@ func (e *Engine) reload(ctx context.Context) error {
 		for _, c := range r.Definition.Classes {
 			cls[c] = struct{}{}
 		}
-		cr := compiledRule{Rule: r, classes: cls}
+		cr := compiledRule{Rule: r, classes: cls, loc: scheduleLocation(r.Definition.Schedule)}
 		if r.Definition.Kind == "sequence" {
 			seq, serr := compileSequence(r.Definition)
 			if serr != nil {
@@ -797,6 +836,7 @@ func (e *Engine) reload(ctx context.Context) error {
 	e.mutedClasses = muted
 	e.hotlist = hotlist
 	e.faceEnrolments = enrols
+	e.facePersons = groupEnrolmentsByPerson(enrols)
 	e.faceMatchThresh = thresh
 	e.faceMarginThresh = margin
 	e.faceNegatives = negs
@@ -889,7 +929,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	allowed := e.enabledDetectors[d.CameraID]
 	muted := e.mutedClasses[d.CameraID]
 	hotlist := e.hotlist
-	faceEnrolments := e.faceEnrolments
+	facePersons := e.facePersons
 	faceThresh := e.faceMatchThresh
 	faceMargin := e.faceMarginThresh
 	faceNegatives := e.faceNegatives
@@ -974,7 +1014,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 	// the system unmatchable on a noisy negatives pool.
 	var matchedPerson enrolledEmbedding
 	var matchedSim float32
-	if d.Kind == "face" && len(faceEnrolments) > 0 {
+	if d.Kind == "face" && len(facePersons) > 0 {
 		if raw := d.Attributes["embedding"]; raw != "" {
 			probe := decodeEmbeddingBase64(raw)
 			if probe != nil {
@@ -984,22 +1024,19 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 				// enrolment UI wants the frame's own embedding);
 				// only the accept/reject decision uses the mean.
 				probe = e.aggregateFaceProbe(d, probe)
-				// Group similarities by person.
-				simsByPerson := map[string][]float32{}
-				labelByPerson := map[string]enrolledEmbedding{}
-				for i := range faceEnrolments {
-					enrol := faceEnrolments[i]
-					s := cosineSim(probe, enrol.Vector)
-					simsByPerson[enrol.PersonID] = append(simsByPerson[enrol.PersonID], s)
-					labelByPerson[enrol.PersonID] = enrol
-				}
 
 				type personScore struct {
 					label enrolledEmbedding
 					topK  float32 // mean of the top-3 cosines (or best-of-N when pool < 3)
 				}
-				scores := make([]personScore, 0, len(simsByPerson))
-				for pid, sims := range simsByPerson {
+				scores := make([]personScore, 0, len(facePersons))
+				sims := make([]float32, 0, 16)
+				for pi := range facePersons {
+					p := &facePersons[pi]
+					sims = sims[:0]
+					for _, v := range p.vectors {
+						sims = append(sims, cosineSim(probe, v))
+					}
 					sort.Slice(sims, func(i, j int) bool { return sims[i] > sims[j] })
 					k := 3
 					if len(sims) < k {
@@ -1010,7 +1047,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 						sum += sims[i]
 					}
 					scores = append(scores, personScore{
-						label: labelByPerson[pid],
+						label: p.rep,
 						topK:  sum / float32(k),
 					})
 				}
@@ -1222,6 +1259,9 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		}
 	}
 
+	// One alarm-state read per detection — it's the same atomic value
+	// for every rule in this pass.
+	alarmState := e.currentAlarmState()
 	for _, r := range rules {
 		// Sequence rules are handled below; the per-detection loop
 		// applies only to the original single-camera kind.
@@ -1231,7 +1271,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if !ruleMatchesCamera(&r.Definition, d.CameraID) {
 			continue
 		}
-		if !ruleMatchesAlarmState(&r.Definition, e.currentAlarmState()) {
+		if !ruleMatchesAlarmState(&r.Definition, alarmState) {
 			continue
 		}
 		if d.Confidence < r.Definition.MinConfidence {
@@ -1242,7 +1282,7 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 				continue
 			}
 		}
-		if !inSchedule(r.Definition.Schedule, d.TS) {
+		if !inSchedule(r.Definition.Schedule, r.loc, d.TS) {
 			continue
 		}
 		if r.Definition.ZoneID != "" {
@@ -1284,10 +1324,10 @@ func (e *Engine) onDetection(ctx context.Context, d Detection) error {
 		if r.sequence == nil {
 			continue
 		}
-		if !ruleMatchesAlarmState(&r.Definition, e.currentAlarmState()) {
+		if !ruleMatchesAlarmState(&r.Definition, alarmState) {
 			continue
 		}
-		if !inSchedule(r.Definition.Schedule, d.TS) {
+		if !inSchedule(r.Definition.Schedule, r.loc, d.TS) {
 			continue
 		}
 		if err := e.evalSequence(ctx, r, d); err != nil {
@@ -2228,15 +2268,12 @@ func indexFrom(s, sub string, from int) int {
 
 // --- helpers ---
 
-func inSchedule(s Schedule, t time.Time) bool {
+func inSchedule(s Schedule, loc *time.Location, t time.Time) bool {
 	if s.StartMinute == 0 && s.EndMinute == 0 && len(s.Days) == 0 {
 		return true // unset = always
 	}
-	loc := time.UTC
-	if s.Timezone != "" {
-		if l, err := time.LoadLocation(s.Timezone); err == nil {
-			loc = l
-		}
+	if loc == nil {
+		loc = time.UTC
 	}
 	local := t.In(loc)
 	if len(s.Days) > 0 {
