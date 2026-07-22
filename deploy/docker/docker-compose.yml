@@ -11,10 +11,20 @@
 #   docker compose --profile gpu up -d       # DGX Spark
 #   docker compose --profile lite up -d      # Mac / GPU-less workstations
 
+# Bounded container logs: a 24/7 appliance with default json-file
+# logging grows until the disk fills (which then takes recording and
+# Postgres with it). 10m x 5 keeps ~50MB of recent logs per service.
+x-logging: &fnvr-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 name: fnvr
 
 services:
   postgres:
+    logging: *fnvr-logging
     image: pgvector/pgvector:pg18
     restart: unless-stopped
     environment:
@@ -66,6 +76,7 @@ services:
       retries: 20
 
   nats:
+    logging: *fnvr-logging
     image: nats:2-alpine
     restart: unless-stopped
     command: ["-js", "-m", "8222"]
@@ -78,6 +89,7 @@ services:
   # mqtt` and be running in 5 seconds. In production, use an external
   # broker (or at minimum edit mosquitto.conf below to require auth).
   mosquitto:
+    logging: *fnvr-logging
     profiles: ["mqtt"]
     image: eclipse-mosquitto:2
     restart: unless-stopped
@@ -88,6 +100,7 @@ services:
       - mosquitto-data:/mosquitto/data
 
   api:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.api
@@ -126,6 +139,7 @@ services:
       - "8081:8081"
 
   events:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.events
@@ -151,6 +165,7 @@ services:
       - fnvr-data:/var/lib/fnvr
 
   notifications:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.notifications
@@ -165,6 +180,7 @@ services:
       FNVR_NATS_URL: "nats://nats:4222"
 
   storage:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.storage
@@ -186,6 +202,7 @@ services:
   # Reachable on the docker bridge at http://ml-worker:8090; no
   # published port — api-server is the only client.
   ml-worker:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.ml
@@ -207,6 +224,7 @@ services:
       - fnvr-live:/var/lib/fnvr/live
 
   web:
+    logging: *fnvr-logging
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.web
@@ -223,6 +241,7 @@ services:
   # the host registers no `nvidia` docker runtime, so `runtime: nvidia`
   # would fail here.
   pipeline:
+    logging: *fnvr-logging
     profiles: ["gpu"]
     build:
       context: ../../
@@ -269,6 +288,7 @@ services:
   # and — when v4l2 cams are present — a USB→RTSP bridge so pipeline-supervisor
   # can treat local cameras with the proven RTSP code path.
   mediamtx:
+    logging: *fnvr-logging
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
     environment:
@@ -295,6 +315,7 @@ services:
   # copy + one CUDA context instead of per-worker duplicates. Workers
   # fall back is manual: set the setting back to nvinfer + restart.
   triton:
+    logging: *fnvr-logging
     profiles: ["gpu"]
     image: fnvr-pipeline
     restart: unless-stopped
@@ -322,6 +343,7 @@ services:
   # otherwise idle while someone scrubs the timeline. The web timeline
   # falls back to :9995 when MediaSource can't do hvc1.
   transcoder:
+    logging: *fnvr-logging
     profiles: ["gpu"]
     image: fnvr-pipeline
     restart: unless-stopped
@@ -350,6 +372,7 @@ services:
   # DB use that URL; pipeline-supervisor then hits it via the working RTSP
   # code path — sidestepping the direct v4l2 SIGSEGV-after-NVENC-init bug.
   usb-bridge:
+    logging: *fnvr-logging
     # Only started when explicitly requested (`--profile usb`): without
     # the profile gate, a missing /dev/video0 (no USB cam plugged in)
     # makes docker refuse to (re)create the container, which bleeds into
@@ -373,6 +396,7 @@ services:
 
   # Companion that pushes a synthetic looped stream into mediamtx.
   testsrc:
+    logging: *fnvr-logging
     profiles: ["dev", "lite"]
     image: linuxserver/ffmpeg:latest
     restart: unless-stopped
