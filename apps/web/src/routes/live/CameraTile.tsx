@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { Camera, PipelineCameraMetrics } from "@/lib/api";
 import { DetectionEvent } from "@/lib/events";
 import { hasProxyStream } from "@/lib/streams";
@@ -26,7 +26,14 @@ export type TileDrag = {
 // One camera cell. All four layout variants share the same DOM shape
 // (only chrome density changes) so React never remounts a tile — and
 // its WHEP session — when the layout or focus changes.
-export function CameraTile({
+//
+// memo: the Live mosaic re-renders on every detection flush and
+// overlay tick; tiles whose props are untouched (idle cameras) must
+// not reconcile their whole WHEP subtree each time. Live.tsx keeps
+// every prop identity-stable for exactly this reason.
+export const CameraTile = memo(CameraTileImpl);
+
+function CameraTileImpl({
   camera,
   detections,
   inferenceFps,

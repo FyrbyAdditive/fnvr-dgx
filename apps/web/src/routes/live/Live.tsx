@@ -14,6 +14,11 @@ import { applyOrder, gridColCount, gridColsForCount, moveId, visibleCameras } fr
 // drag-reorder + hide, keyboard nav, and a per-camera enlarged modal —
 // all preferences persisted per browser (useLivePrefs).
 
+// Stable identity for idle tiles: memo(CameraTile) can only skip a
+// tile whose detections prop hasn't changed, and `?? []` would hand
+// every idle tile a fresh array per render.
+const NO_DETECTIONS: DetectionEvent[] = [];
+
 export function Live() {
   const { data: me } = useMe();
   const isAdmin = !!me?.is_admin;
@@ -45,8 +50,20 @@ export function Live() {
   // on its own — the 500ms tick below re-runs it so an idle scene
   // prunes its last boxes instead of freezing them on screen.
   const [tick, setTick] = useState(0);
+  const newestArrivalRef = useRef(0);
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => (t + 1) & 0xffff), 500);
+    newestArrivalRef.current = events[0]?.arrived_at_ms ?? 0;
+  }, [events]);
+  useEffect(() => {
+    const id = setInterval(() => {
+      // Tick only while a recent event can still affect an overlay
+      // (2s bbox age, 5s fps window, + margin). Once the last event
+      // has aged out of both, ticking is pure re-render churn — an
+      // idle wall stops rendering entirely.
+      if (Date.now() - newestArrivalRef.current < 6000) {
+        setTick((t) => (t + 1) & 0xffff);
+      }
+    }, 500);
     return () => clearInterval(id);
   }, []);
   const boxesByCamera = useMemo(() => {
@@ -99,6 +116,32 @@ export function Live() {
   // Single-camera enlarged view. Null = no modal; the mosaic keeps
   // streaming behind it so closing feels instant.
   const [enlargedCamId, setEnlargedCamId] = useState<string | null>(null);
+
+  // Per-camera callbacks with permanent identity, so memo(CameraTile)
+  // can skip untouched tiles. Handlers read live values through
+  // liveStateRef — identity never changes, behaviour always tracks
+  // the latest render (no stale closures on skipped renders).
+  const liveStateRef = useRef({ setFocusCam, toggleHidden, setFocusQuality, focusQuality: prefs.focusQuality });
+  liveStateRef.current = { setFocusCam, toggleHidden, setFocusQuality, focusQuality: prefs.focusQuality };
+  const camHandlersRef = useRef(
+    new Map<string, { onEnlarge: () => void; onSelect: () => void; onHide: () => void; onToggleHq: () => void }>(),
+  );
+  const handlersFor = (id: string) => {
+    let h = camHandlersRef.current.get(id);
+    if (!h) {
+      h = {
+        onEnlarge: () => setEnlargedCamId(id),
+        onSelect: () => liveStateRef.current.setFocusCam(id),
+        onHide: () => liveStateRef.current.toggleHidden(id),
+        onToggleHq: () =>
+          liveStateRef.current.setFocusQuality(
+            liveStateRef.current.focusQuality === "full" ? "proxy" : "full",
+          ),
+      };
+      camHandlersRef.current.set(id, h);
+    }
+    return h;
+  };
   const enlargedCam = enlargedCamId
     ? cameras.find((c) => c.id === enlargedCamId) ?? null
     : null;
@@ -161,8 +204,18 @@ export function Live() {
   const [dragArmedId, setDragArmedId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropHint, setDropHint] = useState<{ id: string; before: boolean } | null>(null);
-  const dragFor = (id: string): TileDrag | undefined => {
-    if (prefs.layout !== "auto") return undefined;
+  // Memoized per camera: outside an active drag these objects keep
+  // their identity across renders, so memo(CameraTile) can skip. Mid-
+  // drag the map rebuilds per state change — those renders are the
+  // drag affordances updating, which is the point.
+  const dragByCam = useMemo(() => {
+    const m = new Map<string, TileDrag>();
+    if (prefs.layout !== "auto") return m;
+    for (const c of visible) m.set(c.id, makeDrag(c.id));
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefs.layout, visible, dragArmedId, draggingId, dropHint, ordered]);
+  function makeDrag(id: string): TileDrag {
     return {
       armed: dragArmedId === id,
       dragging: draggingId === id,
@@ -196,13 +249,23 @@ export function Live() {
         setDropHint(null);
       },
     };
-  };
+  }
+
+  // Stable grid-position styles for the Focus layout (fresh object
+  // literals would defeat the tile memo).
+  const focusStyles = useMemo(() => {
+    const span = Math.max(1, visible.length - 1);
+    return {
+      focus: { gridColumn: 1, gridRow: `1 / span ${span}` } as React.CSSProperties,
+      thumb: { gridColumn: 2 } as React.CSSProperties,
+    };
+  }, [visible.length]);
 
   const tileFor = (c: (typeof visible)[number], variant: "auto" | "focus" | "thumb" | "wall", style?: React.CSSProperties) => (
     <CameraTile
       key={c.id}
       camera={c}
-      detections={boxesByCamera.get(c.id) ?? []}
+      detections={boxesByCamera.get(c.id) ?? NO_DETECTIONS}
       inferenceFps={fpsByCamera.get(c.id) ?? 0}
       metrics={metricsFor(c.id)}
       showStats={prefs.showStats}
@@ -214,16 +277,12 @@ export function Live() {
         variant === "focus" && prefs.focusQuality === "full" ? "auto" : "proxy"
       }
       style={style}
-      onEnlarge={() => setEnlargedCamId(c.id)}
-      onSelect={variant === "thumb" ? () => setFocusCam(c.id) : undefined}
-      onHide={() => toggleHidden(c.id)}
+      onEnlarge={handlersFor(c.id).onEnlarge}
+      onSelect={variant === "thumb" ? handlersFor(c.id).onSelect : undefined}
+      onHide={handlersFor(c.id).onHide}
       hqOn={variant === "focus" ? prefs.focusQuality === "full" : undefined}
-      onToggleHq={
-        variant === "focus"
-          ? () => setFocusQuality(prefs.focusQuality === "full" ? "proxy" : "full")
-          : undefined
-      }
-      drag={dragFor(c.id)}
+      onToggleHq={variant === "focus" ? handlersFor(c.id).onToggleHq : undefined}
+      drag={dragByCam.get(c.id)}
     />
   );
 
@@ -303,9 +362,7 @@ export function Live() {
             tileFor(
               c,
               c.id === focusCamId ? "focus" : "thumb",
-              c.id === focusCamId
-                ? { gridColumn: 1, gridRow: `1 / span ${Math.max(1, visible.length - 1)}` }
-                : { gridColumn: 2 },
+              c.id === focusCamId ? focusStyles.focus : focusStyles.thumb,
             ),
           )}
         </div>
@@ -325,7 +382,7 @@ export function Live() {
       {enlargedCam && (
         <EnlargedCameraModal
           camera={enlargedCam}
-          detections={boxesByCamera.get(enlargedCam.id) ?? []}
+          detections={boxesByCamera.get(enlargedCam.id) ?? NO_DETECTIONS}
           metrics={metricsFor(enlargedCam.id)}
           showStats={prefs.showStats}
           isAdmin={isAdmin}

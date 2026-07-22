@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { DetectionEvent } from "@/lib/events";
 import { ConnectionStatus, useWhepStream, WhepStatus } from "./useWhepStream";
 import { useStreamQuality } from "./useStreamQuality";
@@ -26,7 +26,9 @@ import { BBox, FlagPopover, ManualLabelPopover } from "./overlays";
 // passes the state in. The drawer commits a rect by opening
 // ManualLabelPopover here; the parent's drawing flag flips back to
 // false via onDrawingChange when commit happens.
-export function CameraContent({
+export const CameraContent = memo(CameraContentImpl);
+
+function CameraContentImpl({
   cameraId,
   name,
   detections,

@@ -67,11 +67,34 @@ export function useDetectionStream(onEvent: (d: DetectionEvent) => void) {
  */
 export function useRecentDetections(limit = 100) {
   const [events, setEvents] = useState<DetectionEvent[]>([]);
+  // Coalesce SSE bursts into one state flush per animation frame: one
+  // inference frame publishes N messages across cameras, and flushing
+  // per message re-renders every consumer N times for the same paint.
+  const pendingRef = useRef<DetectionEvent[]>([]);
+  const rafRef = useRef<number | null>(null);
   useDetectionStream((d) => {
-    setEvents((prev) => {
-      const next = [d, ...prev];
-      return next.length > limit ? next.slice(0, limit) : next;
+    const pending = pendingRef.current;
+    pending.push(d);
+    // Bound the staging buffer (rAF doesn't fire in hidden tabs);
+    // only the newest `limit` can survive the flush anyway.
+    if (pending.length > limit) pending.splice(0, pending.length - limit);
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      const batch = pendingRef.current;
+      pendingRef.current = [];
+      setEvents((prev) => {
+        // Batch arrived oldest→newest; the buffer is newest-first.
+        const next = [...batch.reverse(), ...prev];
+        return next.length > limit ? next.slice(0, limit) : next;
+      });
     });
   });
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
   return events;
 }

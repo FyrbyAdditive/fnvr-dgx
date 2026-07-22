@@ -1,8 +1,9 @@
+import { memo, useMemo } from "react";
 import { severityColor } from "@/lib/severity";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, Incident } from "@/lib/api";
-import { useRecentDetections } from "@/lib/events";
+import { DetectionEvent, useRecentDetections } from "@/lib/events";
 import { useMe } from "@/lib/me";
 
 export function Events() {
@@ -28,7 +29,10 @@ export function Events() {
     queryFn: api.listCameras,
     refetchInterval: 30_000,
   });
-  const cameraNameById = new Map(cameras.map((c) => [c.id, c.name]));
+  const cameraNameById = useMemo(
+    () => new Map(cameras.map((c) => [c.id, c.name])),
+    [cameras],
+  );
   const cameraLabel = (id: string | null | undefined) =>
     id ? (cameraNameById.get(id) ?? id) : "system";
   const ack = useMutation({
@@ -120,57 +124,65 @@ export function Events() {
           <p className="text-neutral-500 text-sm">Listening on SSE…</p>
         ) : (
           <ul className="divide-y divide-neutral-800 rounded border border-neutral-800 text-sm max-h-[70vh] overflow-auto">
-            {detections.map((e) => {
-              const isPlate = e.kind === "anpr";
-              const isFace = e.kind === "face";
-              const isPrintDefect = e.kind === "print_defect";
-              const person = isFace ? e.attributes?.person : undefined;
-              // Primary label: plate text for ANPR, matched-person name
-              // for face detections (falls back to "face" when the
-              // embedding didn't cross the match threshold), otherwise
-              // the raw class name.
-              const primary = isPlate
-                ? e.attributes?.plate ?? "plate"
-                : isPrintDefect
-                ? (e.class_name === "print_failure" ? "PRINT FAILURE" : "spaghetti")
-                : person ?? e.class_name;
-              const similarity = isFace ? e.attributes?.similarity : undefined;
-              return (
-                <li key={e.id} className="p-2 grid grid-cols-[8rem_1fr_6rem] gap-2">
-                  <span className="text-neutral-500 tabular-nums">
-                    {new Date(e.ts).toLocaleTimeString()}
-                  </span>
-                  <span>
-                    <span
-                      className={`font-medium ${
-                        isPlate
-                          ? "text-emerald-400"
-                          : person
-                          ? "text-sky-400"
-                          : ""
-                      }`}
-                    >
-                      {primary}
-                    </span>
-                    {similarity && (
-                      <span className="text-neutral-500 text-xs">
-                        {" "}({Math.round(Number(similarity) * 100)}%)
-                      </span>
-                    )}
-                    <span className="text-neutral-500"> · {cameraLabel(e.camera_id)}</span>
-                  </span>
-                  <span className="text-right tabular-nums text-neutral-400">
-                    {(e.confidence * 100).toFixed(0)}%
-                  </span>
-                </li>
-              );
-            })}
+            {detections.map((e) => (
+              <DetectionRow key={e.id} e={e} cameraName={cameraLabel(e.camera_id)} />
+            ))}
           </ul>
         )}
       </section>
     </div>
   );
 }
+
+// One detection row. memo'd: the list prepends on every SSE flush,
+// and without this every existing row re-reconciles each time. Event
+// objects are immutable once buffered, so identity comparison holds.
+const DetectionRow = memo(function DetectionRow({
+  e,
+  cameraName,
+}: {
+  e: DetectionEvent;
+  cameraName: string;
+}) {
+  const isPlate = e.kind === "anpr";
+  const isFace = e.kind === "face";
+  const isPrintDefect = e.kind === "print_defect";
+  const person = isFace ? e.attributes?.person : undefined;
+  // Primary label: plate text for ANPR, matched-person name for face
+  // detections (falls back to "face" when the embedding didn't cross
+  // the match threshold), otherwise the raw class name.
+  const primary = isPlate
+    ? e.attributes?.plate ?? "plate"
+    : isPrintDefect
+    ? (e.class_name === "print_failure" ? "PRINT FAILURE" : "spaghetti")
+    : person ?? e.class_name;
+  const similarity = isFace ? e.attributes?.similarity : undefined;
+  return (
+    <li className="p-2 grid grid-cols-[8rem_1fr_6rem] gap-2">
+      <span className="text-neutral-500 tabular-nums">
+        {new Date(e.ts).toLocaleTimeString()}
+      </span>
+      <span>
+        <span
+          className={`font-medium ${
+            isPlate ? "text-emerald-400" : person ? "text-sky-400" : ""
+          }`}
+        >
+          {primary}
+        </span>
+        {similarity && (
+          <span className="text-neutral-500 text-xs">
+            {" "}({Math.round(Number(similarity) * 100)}%)
+          </span>
+        )}
+        <span className="text-neutral-500"> · {cameraName}</span>
+      </span>
+      <span className="text-right tabular-nums text-neutral-400">
+        {(e.confidence * 100).toFixed(0)}%
+      </span>
+    </li>
+  );
+});
 
 // IncidentSummary renders the two-line description of a (possibly
 // merged) incident. Line 1 is the human-friendly classes-on-camera
