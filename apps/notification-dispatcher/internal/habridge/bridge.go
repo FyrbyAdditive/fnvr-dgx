@@ -47,11 +47,15 @@ type Bridge struct {
 	running bool
 	cancel  context.CancelFunc
 	release func() // hub release
+	wg      sync.WaitGroup
 
-	// Per-camera motion-OFF timers + published-camera set.
-	motionMu      sync.Mutex
-	motionTimers  map[string]*time.Timer
-	announcedCams map[string]struct{}
+	// Per-camera motion/incident-OFF timers + published-camera set.
+	// motionMu also guards announcedCams (written by the reconcile
+	// goroutine, reset by Stop).
+	motionMu       sync.Mutex
+	motionTimers   map[string]*time.Timer
+	incidentTimers map[string]*time.Timer
+	announcedCams  map[string]struct{}
 }
 
 type detection struct {
@@ -76,12 +80,22 @@ type cameraState struct {
 
 func New(pool *pgxpool.Pool, nc *nats.Conn, hub *mqtthub.Hub) *Bridge {
 	return &Bridge{
-		pool:          pool,
-		nc:            nc,
-		hub:           hub,
-		motionTimers:  map[string]*time.Timer{},
-		announcedCams: map[string]struct{}{},
+		pool:           pool,
+		nc:             nc,
+		hub:            hub,
+		motionTimers:   map[string]*time.Timer{},
+		incidentTimers: map[string]*time.Timer{},
+		announcedCams:  map[string]struct{}{},
 	}
+}
+
+// config returns a copy of the active config. cfg is written by Start
+// while the reconcile goroutine and NATS callbacks read it — always go
+// through here outside the Start path.
+func (b *Bridge) config() Config {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
 }
 
 // Start brings the bridge up against the given config. Returns nil and
@@ -115,7 +129,11 @@ func (b *Bridge) Start(parent context.Context, cfg Config) error {
 	if err := b.announceCameras(ctx, client); err != nil {
 		slog.Warn("ha bridge: initial announce", "err", err)
 	}
-	go b.runCameraReconcile(ctx, client)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.runCameraReconcile(ctx, client)
+	}()
 
 	// Subscribe to NATS streams. Use the accepted-detections subject
 	// that event-processor republishes after suppression so flagged
@@ -152,7 +170,9 @@ func (b *Bridge) Start(parent context.Context, cfg Config) error {
 	}
 
 	// On ctx cancel, unsubscribe.
+	b.wg.Add(1)
 	go func() {
+		defer b.wg.Done()
 		<-ctx.Done()
 		detSub.Unsubscribe()
 		incSub.Unsubscribe()
@@ -165,26 +185,42 @@ func (b *Bridge) Start(parent context.Context, cfg Config) error {
 // Stop halts the bridge and releases its broker connection. Idempotent.
 func (b *Bridge) Stop() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.running {
+		b.mu.Unlock()
 		return
 	}
-	if b.cancel != nil {
-		b.cancel()
+	cancel := b.cancel
+	release := b.release
+	b.cancel = nil
+	b.release = nil
+	b.running = false
+	// Unlock before waiting: the reconcile goroutine takes b.mu via
+	// config(), so waiting under the lock would deadlock.
+	b.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
-	if b.release != nil {
-		b.release()
-		b.release = nil
+	// Wait for the reconcile + unsubscribe goroutines before releasing
+	// the hub client so nothing publishes on a released connection.
+	b.wg.Wait()
+	if release != nil {
+		release()
 	}
-	// Cancel outstanding motion timers.
+	// Cancel outstanding timers and reset per-run state. Replacing the
+	// maps also defuses already-fired AfterFunc callbacks — they re-check
+	// map identity before publishing.
 	b.motionMu.Lock()
 	for _, t := range b.motionTimers {
 		t.Stop()
 	}
 	b.motionTimers = map[string]*time.Timer{}
-	b.motionMu.Unlock()
+	for _, t := range b.incidentTimers {
+		t.Stop()
+	}
+	b.incidentTimers = map[string]*time.Timer{}
 	b.announcedCams = map[string]struct{}{}
-	b.running = false
+	b.motionMu.Unlock()
 	slog.Info("ha bridge: stopped")
 }
 
@@ -233,13 +269,18 @@ func (b *Bridge) announceCameras(ctx context.Context, client mqtt.Client) error 
 		}
 		b.publishDiscovery(client, id, name, model)
 	}
+	// Swap the announced set under lock (Stop resets it concurrently);
+	// publish the clears outside the lock.
+	b.motionMu.Lock()
+	prev := b.announcedCams
+	b.announcedCams = current
+	b.motionMu.Unlock()
 	// Drop stale announcements.
-	for prevID := range b.announcedCams {
+	for prevID := range prev {
 		if _, still := current[prevID]; !still {
 			b.clearDiscovery(client, prevID)
 		}
 	}
-	b.announcedCams = current
 	return nil
 }
 
@@ -263,7 +304,8 @@ type haEntity struct {
 // discovery format) advertising all six entities per camera. Retained
 // so HA sees them on its next restart.
 func (b *Bridge) publishDiscovery(client mqtt.Client, id, name, model string) {
-	tp := b.cfg.TopicPrefix
+	cfg := b.config()
+	tp := cfg.TopicPrefix
 	devID := "fnvr_" + sanitiseID(id)
 	avail := mqtthub.AvailabilityTopic()
 	mk := func(platform, suffix, stateTopic, deviceClass string) haEntity {
@@ -310,7 +352,7 @@ func (b *Bridge) publishDiscovery(client mqtt.Client, id, name, model string) {
 		"qos":          "1",
 	}
 	raw, _ := json.Marshal(payload)
-	topic := fmt.Sprintf("%s/device/%s/config", b.cfg.DiscoveryPrefix, devID)
+	topic := fmt.Sprintf("%s/device/%s/config", cfg.DiscoveryPrefix, devID)
 	client.Publish(topic, 1, true, raw)
 }
 
@@ -319,7 +361,7 @@ func (b *Bridge) publishDiscovery(client mqtt.Client, id, name, model string) {
 // an empty payload on a previously-retained config as a delete.
 func (b *Bridge) clearDiscovery(client mqtt.Client, id string) {
 	devID := "fnvr_" + sanitiseID(id)
-	topic := fmt.Sprintf("%s/device/%s/config", b.cfg.DiscoveryPrefix, devID)
+	topic := fmt.Sprintf("%s/device/%s/config", b.config().DiscoveryPrefix, devID)
 	client.Publish(topic, 1, true, []byte{})
 }
 
@@ -329,7 +371,7 @@ func (b *Bridge) onDetection(client mqtt.Client, d detection) {
 	if d.CameraID == "" {
 		return
 	}
-	tp := b.cfg.TopicPrefix
+	tp := b.config().TopicPrefix
 	base := fmt.Sprintf("%s/%s", tp, d.CameraID)
 	// Always publish the freshest class + confidence — these aren't
 	// latency-sensitive on HA's side (it just shows the value) so
@@ -348,22 +390,37 @@ func (b *Bridge) onIncident(client mqtt.Client, inc incident) {
 	if inc.CameraID == "" {
 		return
 	}
-	tp := b.cfg.TopicPrefix
-	client.Publish(fmt.Sprintf("%s/%s/incident", tp, inc.CameraID), 1, true, []byte("ON"))
+	topic := fmt.Sprintf("%s/%s/incident", b.config().TopicPrefix, inc.CameraID)
+	client.Publish(topic, 1, true, []byte("ON"))
 	// Auto-clear after 5 minutes so HA doesn't stay stuck-on forever
 	// even if the operator never acks via the UI. The next incident
-	// on the same camera resets the timer.
-	go func() {
-		time.Sleep(5 * time.Minute)
-		client.Publish(fmt.Sprintf("%s/%s/incident", tp, inc.CameraID), 1, true, []byte("OFF"))
-	}()
+	// on the same camera resets the timer; the identity re-check in
+	// the callback keeps a stale fired timer from clearing early or
+	// publishing after Stop.
+	b.motionMu.Lock()
+	defer b.motionMu.Unlock()
+	if existing := b.incidentTimers[inc.CameraID]; existing != nil {
+		existing.Stop()
+	}
+	var t *time.Timer
+	t = time.AfterFunc(5*time.Minute, func() {
+		b.motionMu.Lock()
+		if b.incidentTimers[inc.CameraID] != t {
+			b.motionMu.Unlock()
+			return
+		}
+		delete(b.incidentTimers, inc.CameraID)
+		b.motionMu.Unlock()
+		client.Publish(topic, 1, true, []byte("OFF"))
+	})
+	b.incidentTimers[inc.CameraID] = t
 }
 
 func (b *Bridge) onCameraState(client mqtt.Client, cs cameraState) {
 	if cs.CameraID == "" {
 		return
 	}
-	tp := b.cfg.TopicPrefix
+	tp := b.config().TopicPrefix
 	client.Publish(fmt.Sprintf("%s/%s/camera_state", tp, cs.CameraID), 1, true, []byte(cs.State))
 }
 
@@ -371,7 +428,8 @@ func (b *Bridge) onCameraState(client mqtt.Client, cs cameraState) {
 // subsequent detection resets the timer. Only publishes the ON edge
 // once per quiet-period so broker pressure stays low.
 func (b *Bridge) setMotion(client mqtt.Client, cameraID string, on bool) {
-	topic := fmt.Sprintf("%s/%s/motion", b.cfg.TopicPrefix, cameraID)
+	// config() before motionMu — lock order is b.mu → motionMu.
+	topic := fmt.Sprintf("%s/%s/motion", b.config().TopicPrefix, cameraID)
 	b.motionMu.Lock()
 	defer b.motionMu.Unlock()
 	existing := b.motionTimers[cameraID]
@@ -382,12 +440,20 @@ func (b *Bridge) setMotion(client mqtt.Client, cameraID string, on bool) {
 		} else {
 			existing.Stop()
 		}
-		b.motionTimers[cameraID] = time.AfterFunc(5*time.Second, func() {
+		var t *time.Timer
+		t = time.AfterFunc(5*time.Second, func() {
 			b.motionMu.Lock()
+			if b.motionTimers[cameraID] != t {
+				// A newer detection re-armed while this callback was
+				// waiting on the lock — leave the fresh timer alone.
+				b.motionMu.Unlock()
+				return
+			}
 			delete(b.motionTimers, cameraID)
 			b.motionMu.Unlock()
 			client.Publish(topic, 0, true, []byte("OFF"))
 		})
+		b.motionTimers[cameraID] = t
 	}
 }
 
