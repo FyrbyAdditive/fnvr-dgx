@@ -13,6 +13,8 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -90,12 +92,15 @@ GroupPipeline::~GroupPipeline() { Stop(); }
 #if FNVR_HAS_DEEPSTREAM
 namespace {
 
-// Generate a short random ID (no UUID lib dependency).
+// Generate a short random ID (no UUID lib dependency). snprintf %llx
+// prints the same variable-width lowercase hex the old ostringstream
+// did, without constructing a stream per detection.
 std::string short_id() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::ostringstream os;
-    os << std::hex << rng();
-    return os.str();
+    char b[24];
+    std::snprintf(b, sizeof b, "%llx",
+                  static_cast<unsigned long long>(rng()));
+    return std::string(b);
 }
 
 // Legacy nvstreammux with enable-padding=1 letterboxes each source
@@ -147,10 +152,19 @@ struct FaceTrackState {
 
 struct SourceView {
     std::string                 camera_id;
-    std::set<std::string>       muted_classes;
+    std::unordered_set<std::string> muted_classes;
     std::atomic<std::uint64_t>* frames = nullptr;
-    std::map<std::uint64_t, TrackPubState> track_pub;
-    std::map<std::uint64_t, FaceTrackState> face_pub;
+    // Derived once by finalizeSourceViews — these strings appear in
+    // every published detection and were previously re-escaped /
+    // re-concatenated per object.
+    std::string camera_id_json;   // json_escape(camera_id)
+    std::string det_subject;      // subject_prefix + camera_id
+    std::string det_subject_json; // json_escape(det_subject), the reply_subject
+    std::string faces_subject;    // "fnvr.faces.pending." + camera_id
+    // O(1) per-object track lookups; iteration order is only used by
+    // the prune pass, which is order-independent.
+    std::unordered_map<std::uint64_t, TrackPubState> track_pub;
+    std::unordered_map<std::uint64_t, FaceTrackState> face_pub;
     // Letterbox mapping, computed lazily from the first frame's
     // source_frame_{width,height} (runtime truth beats the probe).
     bool  lb_ready = false;
@@ -213,6 +227,26 @@ std::string json_escape(std::string_view s) {
         }
     }
     return out;
+}
+
+// Append a float with ostream-default formatting (%g ≡ 6 significant
+// digits) — keeps the wire bytes identical to the ostringstreams this
+// replaced, without a stream construction per detection.
+inline void appendG(std::string& s, double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%g", v);
+    s += b;
+}
+
+// finalizeSourceViews computes the per-camera constant strings after
+// subject_prefix is final. Call once per ProbeCtx, before attach.
+void finalizeSourceViews(ProbeCtx* ctx) {
+    for (auto& sv : ctx->sources) {
+        sv.camera_id_json   = json_escape(sv.camera_id);
+        sv.det_subject      = ctx->subject_prefix + sv.camera_id;
+        sv.det_subject_json = json_escape(sv.det_subject);
+        sv.faces_subject    = "fnvr.faces.pending." + sv.camera_id;
+    }
 }
 
 // Publish-thinning knobs (env-overridable). Keepalive must stay well
@@ -449,23 +483,26 @@ std::uint64_t saveObjectCropAndHash(const ProbeCtx& ctx, GstBuffer* gst_buf,
 // batch envelope's). No attributes: ml-worker fills them (embedding,
 // embedding_model, quality signals) before the detection reaches
 // event-processor.
-std::string faceDetJson(const std::string& det_id, const std::string& camera_id,
+std::string faceDetJson(const std::string& det_id,
+                        const std::string& camera_id_json,
                         const std::string& iso, float conf,
                         float x, float y, float w, float h,
                         std::uint64_t track_id) {
-    std::ostringstream js;
-    js << "{"
-       << "\"id\":\""         << det_id                  << "\","
-       << "\"camera_id\":\""  << json_escape(camera_id)  << "\","
-       << "\"ts\":\""         << iso                     << "\","
-       << "\"class_name\":\"face\","
-       << "\"kind\":\"face\","
-       << "\"confidence\":"   << conf                    << ","
-       << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
-       <<          ",\"w\":"  << w << ",\"h\":" << h << "},"
-       << "\"track_id\":\""   << track_id                << "\""
-       << "}";
-    return js.str();
+    std::string js;
+    js.reserve(256);
+    js += "{\"id\":\"";          js += det_id;
+    js += "\",\"camera_id\":\""; js += camera_id_json;
+    js += "\",\"ts\":\"";        js += iso;
+    js += "\",\"class_name\":\"face\",\"kind\":\"face\",\"confidence\":";
+    appendG(js, conf);
+    js += ",\"bbox\":{\"x\":"; appendG(js, x);
+    js += ",\"y\":";           appendG(js, y);
+    js += ",\"w\":";           appendG(js, w);
+    js += ",\"h\":";           appendG(js, h);
+    js += "},\"track_id\":\"";
+    js += std::to_string(track_id);
+    js += "\"}";
+    return js;
 }
 
 // publishFacePending wraps a face detection + its saved crop JPEG into
@@ -476,7 +513,7 @@ std::string faceDetJson(const std::string& det_id, const std::string& camera_id,
 // event-processor never knows the difference. Returns false when the
 // crop can't be read or the publish fails (the sighting is dropped;
 // the next window provides another).
-bool publishFacePending(ProbeCtx* ctx, const std::string& camera_id,
+bool publishFacePending(ProbeCtx* ctx, const SourceView& sv,
                         const std::string& det_json,
                         const std::string& crop_event_id) {
     if (!ctx->nats) return false;
@@ -490,13 +527,13 @@ bool publishFacePending(ProbeCtx* ctx, const std::string& camera_id,
     std::string payload;
     payload.reserve(det_json.size() + crop_b64.size() + 128);
     payload += "{\"reply_subject\":\"";
-    payload += json_escape(ctx->subject_prefix + camera_id);
+    payload += sv.det_subject_json;
     payload += "\",\"detection\":";
     payload += det_json;
     payload += ",\"crop_jpeg_b64\":\"";
     payload += crop_b64;
     payload += "\"}";
-    return ctx->nats->Publish("fnvr.faces.pending." + camera_id, payload);
+    return ctx->nats->Publish(sv.faces_subject, payload);
 }
 
 GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
@@ -562,7 +599,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         // object — 10-50x fewer messages under daytime load, and the
         // consumer can multi-row INSERT. Consumers accept both the
         // legacy single-object shape and this batch shape.
-        std::ostringstream frame_batch;
+        std::string frame_batch;
         int frame_batch_n = 0;
 
         for (NvDsMetaList* ol = frame->obj_meta_list; ol; ol = ol->next) {
@@ -651,8 +688,8 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                     const std::string det_id = short_id();
                     saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
                     if (publishFacePending(
-                            ctx, sv.camera_id,
-                            faceDetJson(det_id, sv.camera_id, iso,
+                            ctx, sv,
+                            faceDetJson(det_id, sv.camera_id_json, iso,
                                         obj->confidence, x, y, w, h,
                                         track_id),
                             det_id)) {
@@ -688,8 +725,8 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 if (now_tp - st.last_pub >= std::chrono::milliseconds(window_ms) &&
                     !st.cand_event_id.empty()) {
                     if (publishFacePending(
-                            ctx, sv.camera_id,
-                            faceDetJson(st.cand_event_id, sv.camera_id,
+                            ctx, sv,
+                            faceDetJson(st.cand_event_id, sv.camera_id_json,
                                         st.cand_iso, st.cand_conf,
                                         st.cand_x, st.cand_y,
                                         st.cand_w, st.cand_h, track_id),
@@ -738,8 +775,8 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 // only the LIMITING is bypassed, not the embed flow.
                 saveFaceCrop(*ctx, buf, frame, cnx, cny, cnw, cnh, det_id);
                 if (publishFacePending(
-                        ctx, sv.camera_id,
-                        faceDetJson(det_id, sv.camera_id, iso,
+                        ctx, sv,
+                        faceDetJson(det_id, sv.camera_id_json, iso,
                                     obj->confidence, x, y, w, h, track_id),
                         det_id)) {
                     ctx->hb_published++;
@@ -753,41 +790,54 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                                                   cnx, cny, cnw, cnh, det_id);
             }
 
-            std::ostringstream js;
-            js << "{"
-               << "\"id\":\""         << det_id                    << "\","
-               << "\"camera_id\":\""  << json_escape(sv.camera_id) << "\","
-               << "\"ts\":\""         << iso                       << "\","
-               << "\"class_name\":\"" << json_escape(label)        << "\","
-               << "\"kind\":\""       << kind                      << "\","
-               << "\"confidence\":"   << obj->confidence           << ","
-               << "\"bbox\":{\"x\":"  << x << ",\"y\":" << y
-               <<          ",\"w\":"  << w << ",\"h\":" << h << "},"
-               << "\"track_id\":\""   << track_id                  << "\"";
+            // Emitted straight into the batch string — no per-object
+            // stream construction, and the constant camera_id is
+            // escaped once at attach, not per detection.
+            if (frame_batch.empty()) frame_batch.reserve(1024);
+            if (frame_batch_n++) frame_batch += ',';
+            frame_batch += "{\"id\":\"";          frame_batch += det_id;
+            frame_batch += "\",\"camera_id\":\""; frame_batch += sv.camera_id_json;
+            frame_batch += "\",\"ts\":\"";        frame_batch += iso;
+            frame_batch += "\",\"class_name\":\"";frame_batch += json_escape(label);
+            frame_batch += "\",\"kind\":\"";      frame_batch += kind;
+            frame_batch += "\",\"confidence\":";  appendG(frame_batch, obj->confidence);
+            frame_batch += ",\"bbox\":{\"x\":";   appendG(frame_batch, x);
+            frame_batch += ",\"y\":";             appendG(frame_batch, y);
+            frame_batch += ",\"w\":";             appendG(frame_batch, w);
+            frame_batch += ",\"h\":";             appendG(frame_batch, h);
+            frame_batch += "},\"track_id\":\"";   frame_batch += std::to_string(track_id);
+            frame_batch += '"';
             if (is_plate) {
-                js << ",\"attributes\":{"
-                   << "\"plate\":\""         << json_escape(plate)  << "\"";
+                frame_batch += ",\"attributes\":{\"plate\":\"";
+                frame_batch += json_escape(plate);
+                frame_batch += '"';
                 if (!parent.empty()) {
-                    js << ",\"parent_class\":\"" << json_escape(parent) << "\"";
+                    frame_batch += ",\"parent_class\":\"";
+                    frame_batch += json_escape(parent);
+                    frame_batch += '"';
                 }
-                js << "}";
+                frame_batch += '}';
             }
             if (!is_plate && obj_phash != 0) {
-                js << ",\"phash\":\"" << uint64ToHex16(obj_phash) << "\"";
+                frame_batch += ",\"phash\":\"";
+                frame_batch += uint64ToHex16(obj_phash);
+                frame_batch += '"';
             }
-            js << "}";
-            if (frame_batch_n++) frame_batch << ",";
-            frame_batch << js.str();
+            frame_batch += '}';
             ctx->hb_published++;
         }
         if (frame_batch_n > 0 && ctx->nats) {
-            std::string payload = "{\"camera_id\":\"" +
-                                  json_escape(sv.camera_id) +
-                                  "\",\"ts\":\"" + iso +
-                                  "\",\"batch\":[" + frame_batch.str() +
-                                  "]}";
-            std::string subj = ctx->subject_prefix + sv.camera_id;
-            if (!ctx->nats->Publish(subj, payload)) {
+            std::string payload;
+            payload.reserve(frame_batch.size() + sv.camera_id_json.size() +
+                            iso.size() + 48);
+            payload += "{\"camera_id\":\"";
+            payload += sv.camera_id_json;
+            payload += "\",\"ts\":\"";
+            payload += iso;
+            payload += "\",\"batch\":[";
+            payload += frame_batch;
+            payload += "]}";
+            if (!ctx->nats->Publish(sv.det_subject, payload)) {
                 ctx->hb_published -= frame_batch_n;
             }
         }
@@ -819,8 +869,8 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
                 }
                 if (!st.cand_event_id.empty() && ctx->nats) {
                     if (publishFacePending(
-                            ctx, sv.camera_id,
-                            faceDetJson(st.cand_event_id, sv.camera_id,
+                            ctx, sv,
+                            faceDetJson(st.cand_event_id, sv.camera_id_json,
                                         st.cand_iso, st.cand_conf,
                                         st.cand_x, st.cand_y,
                                         st.cand_w, st.cand_h, it->first),
@@ -1522,10 +1572,12 @@ GstElement* GroupPipeline::BuildPipeline() {
                     for (auto& s : sources_) {
                         SourceView sv;
                         sv.camera_id     = s->cam.id;
-                        sv.muted_classes = s->cam.muted_classes;
+                        sv.muted_classes = {s->cam.muted_classes.begin(),
+                                            s->cam.muted_classes.end()};
                         sv.frames        = &s->frames;
                         ctx->sources.push_back(std::move(sv));
                     }
+                    finalizeSourceViews(ctx);
                     if (use_face_id_) {
                         ctx->thumbs_dir = "/var/lib/fnvr/thumbs/faces";
                         std::error_code _ec;
@@ -1688,6 +1740,7 @@ int RunReplayFile(const std::string& camera_id, const std::string& file,
             SourceView sv;
             sv.camera_id = camera_id;
             ctx->sources.push_back(std::move(sv));
+            finalizeSourceViews(ctx);
             if (use_face) {
                 ctx->thumbs_dir = "/var/lib/fnvr/thumbs/faces";
                 std::error_code _ec;

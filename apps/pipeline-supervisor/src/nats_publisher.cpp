@@ -47,6 +47,9 @@ void NatsPublisher::teardown() {
 }
 
 bool NatsPublisher::Publish(std::string_view subject, std::string_view payload, bool flush) {
+    // Null-terminated copy for cnats, built before taking the lock so
+    // the allocation doesn't extend the critical section.
+    std::string subj(subject);
     // Whole-call lock: cheap for the hot flush=false path (publish is an
     // in-memory enqueue) and required for the rebuild path below, which
     // destroys conn_ out from under any concurrent publisher.
@@ -66,7 +69,6 @@ bool NatsPublisher::Publish(std::string_view subject, std::string_view payload, 
             return false;
         }
     }
-    std::string subj(subject);
     natsStatus s = natsConnection_Publish(conn_, subj.c_str(), payload.data(),
                                           static_cast<int>(payload.size()));
     if (s != NATS_OK) {

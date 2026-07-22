@@ -161,7 +161,10 @@ bool gpuPath(NvBufSurface* in_surf, unsigned batch_id,
     }
 
     if (out_ahash) {
-        SyncGpuTransformStream();
+        // Same thread-local stream the encode path drained above —
+        // only sync when no JPEG write already did (a sync of an idle
+        // stream is still a driver round-trip on the streaming thread).
+        if (out_path.empty()) SyncGpuTransformStream();
         if (NvBufSurfaceMap(dst, 0, 0, NVBUF_MAP_READ) != 0) return false;
         NvBufSurfaceSyncForCpu(dst, 0, 0);
         const auto* y =

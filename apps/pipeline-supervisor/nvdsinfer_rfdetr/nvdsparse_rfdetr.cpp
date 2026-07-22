@@ -79,6 +79,20 @@ extern "C" bool NvDsInferParseCustomRFDETR(
     const float W = float(networkInfo.width);
     const float H = float(networkInfo.height);
 
+    // Precompute per-class logit-space thresholds so rejection needs no
+    // sigmoid: sigmoid is strictly monotonic, so best_logit < logit(thr)
+    // is exactly conf < thr. Only survivors (a handful of the ~300
+    // queries) pay the expf for their reported confidence.
+    const auto& thrs = detectionParams.perClassPreclusterThreshold;
+    std::vector<float> logit_thr(thrs.size());
+    for (size_t c = 0; c < thrs.size(); c++) {
+        const float t = thrs[c];
+        if (t <= 0.f) logit_thr[c] = -1e30f;       // accept-all
+        else if (t >= 1.f) logit_thr[c] = 1e30f;   // reject-all
+        else logit_thr[c] = std::log(t / (1.f - t));
+    }
+    const float def_logit_thr = std::log(0.3f / (1.f - 0.3f));
+
     objectList.reserve(Q / 4);
     for (unsigned q = 0; q < Q; q++) {
         // Per-query best class.
@@ -88,12 +102,10 @@ extern "C" bool NvDsInferParseCustomRFDETR(
             const float v = s[q * C + c];
             if (v > best_logit) { best_logit = v; best = c; }
         }
+        const float lthr =
+            best < logit_thr.size() ? logit_thr[best] : def_logit_thr;
+        if (best_logit < lthr) continue;
         const float conf = sigmoidf(best_logit);
-        float thr = 0.3f;
-        if (best < detectionParams.perClassPreclusterThreshold.size()) {
-            thr = detectionParams.perClassPreclusterThreshold[best];
-        }
-        if (conf < thr) continue;
 
         const float cx = b[q * 4 + 0] * W;
         const float cy = b[q * 4 + 1] * H;
