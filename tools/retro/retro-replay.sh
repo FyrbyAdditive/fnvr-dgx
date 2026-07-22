@@ -37,8 +37,13 @@ touch "$DONE"
 [ -d "$REC" ] || { echo "retro: no recordings dir $REC"; exit 1; }
 
 gpu_sm() {
-    nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
-        2>/dev/null | head -1 || echo 0
+    local v
+    v=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
+        2>/dev/null | head -1 | tr -d '[:space:]')
+    # Default empty → 0: when nvidia-smi is absent/erroring, head still
+    # exits 0 on empty input, and an empty string breaks the -ge/-lt
+    # gates below (a paused replay would then never resume).
+    echo "${v:-0}"
 }
 
 total=0 done_n=0 skip_n=0 fail_n=0

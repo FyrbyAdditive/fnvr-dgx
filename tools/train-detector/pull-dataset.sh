@@ -9,7 +9,9 @@
 set -euo pipefail
 
 ORIN="${ORIN:-${FNVR_ORIN_HOST:-tim@172.16.4.23}}"
-SRC="/var/lib/docker/volumes/fnvr-data/_data/datasets/objects/"
+# Volume name carries the compose project prefix (`name: fnvr` →
+# fnvr_fnvr-data), same as quant.sh. Override for hosts that differ.
+SRC="${FNVR_DATA_VOLUME_PATH:-/var/lib/docker/volumes/fnvr_fnvr-data/_data}/datasets/objects/"
 DST="${1:-./dataset}"
 
 mkdir -p "$DST"

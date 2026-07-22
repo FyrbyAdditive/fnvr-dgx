@@ -1,0 +1,12 @@
+// Workspace so `go test ./apps/...` (Taskfile test:go) and gopls work
+// from the repo root — the four services are separate modules with no
+// root go.mod. Per-app Docker builds copy only their own directory and
+// never see this file.
+go 1.25.7
+
+use (
+	./apps/api-server
+	./apps/event-processor
+	./apps/notification-dispatcher
+	./apps/storage-manager
+)

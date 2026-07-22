@@ -13,9 +13,15 @@ tasks:
       - task --list
 
   dev:
-    desc: Bring the full stack up in dev mode (Jetson)
+    desc: Bring the stack up WITHOUT GPU services (use dev:gpu for inference)
     cmds:
       - "{{.COMPOSE}} up -d"
+      - echo "UI at http://localhost:8080"
+
+  dev:gpu:
+    desc: Bring the full stack up including the GPU pipeline (DGX/Jetson)
+    cmds:
+      - "{{.COMPOSE}} --profile gpu up -d"
       - echo "UI at http://localhost:8080"
 
   dev:lite:
@@ -56,7 +62,7 @@ tasks:
   test:go:
     desc: Run Go tests
     cmds:
-      - go test ./apps/api-server/... ./apps/event-processor/... ./apps/storage-manager/... ./apps/notification-dispatcher/... ./apps/webrtc-signaling/...
+      - go test ./apps/api-server/... ./apps/event-processor/... ./apps/storage-manager/... ./apps/notification-dispatcher/...
 
   test:web:
     desc: Run web tests
