@@ -146,12 +146,22 @@ def _postprocess(boxes_out: np.ndarray, confs_out: np.ndarray,
     return out
 
 
+_triton_client = None
+
+
 def _infer_triton(blob: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    global _triton_dead_logged
+    global _triton_dead_logged, _triton_client
     try:
         import tritonclient.http as tc
 
-        client = tc.InferenceServerClient(url=_TRITON_URL, network_timeout=5.0)
+        # Reuse one client across ticks — a fresh client per detect()
+        # was a new TCP connection per camera per interval, forever.
+        with _lock:
+            if _triton_client is None:
+                _triton_client = tc.InferenceServerClient(
+                    url=_TRITON_URL, network_timeout=5.0
+                )
+            client = _triton_client
         inp = tc.InferInput("input", list(blob.shape), "FP32")
         inp.set_data_from_numpy(blob)
         res = client.infer(
@@ -162,6 +172,9 @@ def _infer_triton(blob: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         _triton_dead_logged = False
         return res.as_numpy("boxes"), res.as_numpy("confs")
     except Exception as e:
+        # Drop the cached client so the next attempt reconnects fresh.
+        with _lock:
+            _triton_client = None
         if not _triton_dead_logged:
             log.warning("printmon: triton unavailable (%s) — CPU ORT fallback", e)
             _triton_dead_logged = True
@@ -215,14 +228,37 @@ class Params:
     publish_threshold: float = _DEF_PUBLISH_THRESHOLD
 
 
+# Long-lived autocommit connection for the per-tick settings/camera
+# reads. Two fresh connects (auth + teardown) every interval was pure
+# churn; sequential use from to_thread workers is safe, and any error
+# drops the connection so the next tick reconnects.
+_pg_conn: psycopg.Connection | None = None
+
+
+def _db() -> psycopg.Connection:
+    global _pg_conn
+    if _pg_conn is None or _pg_conn.closed:
+        _pg_conn = psycopg.connect(_DATABASE_URL, autocommit=True)
+    return _pg_conn
+
+
+def _reset_db() -> None:
+    global _pg_conn
+    try:
+        if _pg_conn is not None:
+            _pg_conn.close()
+    except Exception:
+        pass
+    _pg_conn = None
+
+
 def read_params() -> Params:
     p = Params()
     try:
-        with psycopg.connect(_DATABASE_URL, autocommit=True) as conn:
-            rows = conn.execute(
-                """SELECT key, value FROM settings
-                   WHERE key LIKE 'printing.defect.%'"""
-            ).fetchall()
+        rows = _db().execute(
+            """SELECT key, value FROM settings
+               WHERE key LIKE 'printing.defect.%'"""
+        ).fetchall()
         for k, v in rows:
             f = float(v if isinstance(v, (int, float)) else json.loads(str(v)))
             if k.endswith("interval_sec") and 5 <= f <= 120:
@@ -234,19 +270,20 @@ def read_params() -> Params:
             elif k.endswith("publish_threshold") and 0.05 <= f <= 0.95:
                 p.publish_threshold = f
     except Exception:
+        _reset_db()
         log.debug("printmon: settings read failed — defaults", exc_info=True)
     return p
 
 
 def _monitored_cameras() -> list[str]:
     try:
-        with psycopg.connect(_DATABASE_URL, autocommit=True) as conn:
-            rows = conn.execute(
-                """SELECT id FROM cameras
-                   WHERE enabled AND 'print_defect' = ANY(enabled_detectors)"""
-            ).fetchall()
+        rows = _db().execute(
+            """SELECT id FROM cameras
+               WHERE enabled AND 'print_defect' = ANY(enabled_detectors)"""
+        ).fetchall()
         return [r[0] for r in rows]
     except Exception:
+        _reset_db()
         log.warning("printmon: camera query failed", exc_info=True)
         return []
 
@@ -306,8 +343,10 @@ async def run() -> None:
     nc = None
     while True:
         try:
-            params = read_params()
-            cams = _monitored_cameras()
+            # to_thread: these are blocking DB reads and this loop
+            # shares the event loop with the face consumer + API.
+            params = await asyncio.to_thread(read_params)
+            cams = await asyncio.to_thread(_monitored_cameras)
             if cams:
                 if nc is None or nc.is_closed:
                     nc = await nats.connect(_NATS_URL, name="fnvr-ml-printmon")

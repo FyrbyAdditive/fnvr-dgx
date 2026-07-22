@@ -256,30 +256,28 @@ def batch_cluster_unmatched() -> dict[str, Any]:
                     cluster_uuid = cur.fetchone()[0]  # type: ignore[index]
                     report["new_clusters"] += 1
 
-                # Bulk insert members. executemany over a small
-                # clustered batch is plenty fast at our scale.
-                member_rows = []
-                for i in idx:
-                    sim_to_centroid = float(np.dot(mat[i], centroid))
-                    member_rows.append(
-                        (
-                            cluster_uuid,
-                            int(detection_ids[i]),
-                            _vec_literal(mat[i]),
-                            sim_to_centroid,
+                # Bulk insert members via COPY — one stream instead of
+                # a round-trip per row (matters at 50k members). One
+                # matmul computes every member's similarity. Conflicts
+                # are impossible here: membership was wiped above,
+                # each cluster is claimed at most once per run, and
+                # detection_ids are unique within a batch.
+                sims = mat[idx] @ centroid
+                with cur.copy(
+                    "COPY face_cluster_members "
+                    "(cluster_id, detection_id, embedding, "
+                    "similarity_to_centroid) FROM STDIN"
+                ) as cp:
+                    for j, i in enumerate(idx):
+                        cp.write_row(
+                            (
+                                cluster_uuid,
+                                int(detection_ids[i]),
+                                _vec_literal(mat[i]),
+                                float(sims[j]),
+                            )
                         )
-                    )
-                cur.executemany(
-                    """
-                    INSERT INTO face_cluster_members
-                        (cluster_id, detection_id, embedding,
-                         similarity_to_centroid)
-                    VALUES (%s, %s, %s::vector, %s)
-                    ON CONFLICT (cluster_id, detection_id) DO NOTHING
-                    """,
-                    member_rows,
-                )
-                report["members_written"] += len(member_rows)
+                report["members_written"] += len(idx)
             report["clusters_written"] += 1
 
         # Prune any unenrolled cluster that now has zero members
