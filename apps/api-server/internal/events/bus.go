@@ -48,8 +48,10 @@ type Detection struct {
 type Bus struct {
 	nc *nats.Conn
 
+	// Subscribers receive fully-built SSE frames: the frame is
+	// serialised once per detection, not once per connected client.
 	mu          sync.RWMutex
-	subscribers map[chan Detection]struct{}
+	subscribers map[chan []byte]struct{}
 }
 
 func NewBus(url string) (*Bus, error) {
@@ -61,7 +63,7 @@ func NewBus(url string) (*Bus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
 	}
-	return &Bus{nc: nc, subscribers: map[chan Detection]struct{}{}}, nil
+	return &Bus{nc: nc, subscribers: map[chan []byte]struct{}{}}, nil
 }
 
 func (b *Bus) Start(ctx context.Context) error {
@@ -75,7 +77,18 @@ func (b *Bus) Start(ctx context.Context) error {
 			slog.Warn("events: bad detection payload", "err", err)
 			return
 		}
-		b.fanout(d)
+		// Re-marshal through the struct (rather than passing msg.Data
+		// through) so the wire shape stays exactly what clients have
+		// always received; but do it once here, not per subscriber.
+		buf, err := json.Marshal(d)
+		if err != nil {
+			return
+		}
+		frame := make([]byte, 0, len(buf)+len(sseFramePrefix)+2)
+		frame = append(frame, sseFramePrefix...)
+		frame = append(frame, buf...)
+		frame = append(frame, '\n', '\n')
+		b.fanout(frame)
 	})
 	if err != nil {
 		return err
@@ -88,21 +101,24 @@ func (b *Bus) Start(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bus) fanout(d Detection) {
+const sseFramePrefix = "event: detection\ndata: "
+
+func (b *Bus) fanout(frame []byte) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for ch := range b.subscribers {
 		select {
-		case ch <- d:
+		case ch <- frame:
 		default:
 			// Drop rather than block — slow client problem, not ours.
 		}
 	}
 }
 
-// Subscribe returns a channel that receives all detections plus a cleanup fn.
-func (b *Bus) Subscribe() (<-chan Detection, func()) {
-	ch := make(chan Detection, 64)
+// Subscribe returns a channel of ready-to-write SSE frames plus a
+// cleanup fn.
+func (b *Bus) Subscribe() (<-chan []byte, func()) {
+	ch := make(chan []byte, 64)
 	b.mu.Lock()
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
@@ -141,12 +157,11 @@ func (b *Bus) SSEHandler(w http.ResponseWriter, r *http.Request) {
 		case <-ping.C:
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
-		case d, open := <-ch:
+		case frame, open := <-ch:
 			if !open {
 				return
 			}
-			buf, _ := json.Marshal(d)
-			fmt.Fprintf(w, "event: detection\ndata: %s\n\n", buf)
+			_, _ = w.Write(frame)
 			flusher.Flush()
 		}
 	}
