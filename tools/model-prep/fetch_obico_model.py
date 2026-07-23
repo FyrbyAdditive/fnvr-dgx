@@ -33,6 +33,10 @@ import urllib.request
 URL = "https://tsd-pub-static.s3.us-east-1.amazonaws.com/ml-models/model-weights-ef79dacfd0051ab526f3002d5f5f9912.darknet"
 SHA256 = "3e6f7e3f166aa3a0ac08620949df71df853ac4b63af537f116be604bba54b292"
 CFG_URL = "https://raw.githubusercontent.com/TheSpaghettiDetective/obico-server/master/ml_api/model/model.cfg"
+# Integrity pin for the darknet cfg (fetched from a mutable branch). Set
+# to the known-good sha256 to enforce; empty = warn-and-print so a
+# maintainer can pin it after a verified run.
+CFG_SHA256 = ""
 
 
 def main() -> None:
@@ -51,6 +55,16 @@ def main() -> None:
 
     print(f"downloading {CFG_URL}")
     urllib.request.urlretrieve(CFG_URL, args.cfg_out)
+    ch = hashlib.sha256()
+    with open(args.cfg_out, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            ch.update(chunk)
+    cfg_sha = ch.hexdigest()
+    if CFG_SHA256:
+        assert cfg_sha == CFG_SHA256, f"cfg sha mismatch: {cfg_sha}"
+    else:
+        print(f"WARNING: CFG_URL is unpinned. Downloaded cfg sha256={cfg_sha} "
+              "— set CFG_SHA256 to this value to pin it.")
 
     print(
         "next: tools/model-prep/convert_obico_darknet.py "

@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 
 from . import clusters as cluster_ops
@@ -66,6 +66,28 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="fnvr ml-worker", lifespan=_lifespan)
 
+# Shared secret: api-server presents X-FNVR-Internal on every call. The
+# container is docker-internal only, but a compromised peer (e.g. a
+# container decoding untrusted RTSP) could otherwise reach these
+# DB-mutating / compute-heavy endpoints. When the secret is unset (dev),
+# the check no-ops and a warning is logged once.
+_SHARED_SECRET = os.environ.get("FNVR_ML_SHARED_SECRET", "")
+_warned_no_secret = False
+
+
+async def require_internal(x_fnvr_internal: str = Header(default="")) -> None:
+    global _warned_no_secret
+    if not _SHARED_SECRET:
+        if not _warned_no_secret:
+            log.warning("FNVR_ML_SHARED_SECRET unset — internal endpoints are UNAUTHENTICATED")
+            _warned_no_secret = True
+        return
+    if x_fnvr_internal != _SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+_INTERNAL = [Depends(require_internal)]
+
 
 # --- /healthz -------------------------------------------------------
 
@@ -76,7 +98,7 @@ async def healthz() -> dict[str, Any]:
 
 # --- /detect-and-embed ---------------------------------------------
 
-@app.post("/detect-and-embed")
+@app.post("/detect-and-embed", dependencies=_INTERNAL)
 async def detect_and_embed(
     file: UploadFile = File(...),
 ) -> dict[str, Any]:
@@ -113,8 +135,19 @@ class ClusterRequest(BaseModel):
     min_cluster_size: int = Field(default=3, ge=2, le=50)
 
 
-@app.post("/cluster")
+_MAX_CLUSTER_EMBEDDINGS = 50000
+_MAX_EMBEDDING_DIM = 512
+
+
+@app.post("/cluster", dependencies=_INTERNAL)
 async def cluster(req: ClusterRequest) -> dict[str, Any]:
+    # Bound the work so a caller can't OOM the sidecar with a giant body.
+    if len(req.embeddings) > _MAX_CLUSTER_EMBEDDINGS:
+        raise HTTPException(status_code=413,
+                            detail=f"too many embeddings (max {_MAX_CLUSTER_EMBEDDINGS})")
+    if any(len(v) > _MAX_EMBEDDING_DIM for v in req.embeddings):
+        raise HTTPException(status_code=400,
+                            detail=f"embedding dimension exceeds {_MAX_EMBEDDING_DIM}")
     if len(req.embeddings) < req.min_cluster_size:
         # Nothing to cluster — return all-noise.
         return {"labels": [-1] * len(req.embeddings)}
@@ -134,7 +167,7 @@ async def cluster(req: ClusterRequest) -> dict[str, Any]:
 
 # --- /batch-cluster -------------------------------------------------
 
-@app.post("/batch-cluster")
+@app.post("/batch-cluster", dependencies=_INTERNAL)
 async def batch_cluster() -> dict[str, Any]:
     try:
         report = await asyncio.to_thread(cluster_ops.batch_cluster_unmatched)
@@ -146,7 +179,7 @@ async def batch_cluster() -> dict[str, Any]:
 
 # --- /drift-check ---------------------------------------------------
 
-@app.post("/drift-check")
+@app.post("/drift-check", dependencies=_INTERNAL)
 async def drift_check() -> dict[str, Any]:
     try:
         # to_thread also keeps drift's asyncio.run-based NATS publish
@@ -161,7 +194,7 @@ async def drift_check() -> dict[str, Any]:
 
 # --- /printmon-test -------------------------------------------------
 
-@app.post("/printmon-test")
+@app.post("/printmon-test", dependencies=_INTERNAL)
 async def printmon_test(
     camera_id: str | None = None,
     file: UploadFile | None = File(default=None),
@@ -207,7 +240,7 @@ async def printmon_test(
 
 # --- /migrate-embeddings --------------------------------------------
 
-@app.post("/migrate-embeddings")
+@app.post("/migrate-embeddings", dependencies=_INTERNAL)
 async def migrate_embeddings() -> dict[str, Any]:
     """Re-embed old-space (unaligned adaface) enrolments into the
     aligned TopoFR space. Idempotent; see migrate.py."""

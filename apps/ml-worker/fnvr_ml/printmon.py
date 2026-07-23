@@ -27,6 +27,7 @@ import glob
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -208,6 +209,10 @@ def newest_settled_preview(camera_id: str, max_age_sec: float = 10.0) -> np.ndar
     """Newest-but-one preview ring frame (mirrors api-server
     snapshot.go: the newest may still be mid-write on some
     filesystems; ours are atomic but the convention is harmless)."""
+    # camera_id is a slug (api-server slugifies it); reject anything
+    # else so a crafted id can't traverse out of _LIVE_DIR via the glob.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", camera_id or ""):
+        return None
     files = sorted(
         glob.glob(os.path.join(_LIVE_DIR, f"{camera_id}.*.jpg")),
         key=os.path.getmtime,

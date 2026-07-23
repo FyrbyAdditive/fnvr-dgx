@@ -42,6 +42,23 @@ type DetectResponse struct {
 // BatchClusterReport is what /batch-cluster returns.
 type BatchClusterReport map[string]any
 
+// internalAuthRT stamps the shared-secret header on every ml-worker
+// request so the sidecar's internal endpoints can reject callers
+// without it. No-op when the secret is unset (dev).
+type internalAuthRT struct {
+	secret string
+	base   http.RoundTripper
+}
+
+func (t internalAuthRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.secret == "" {
+		return t.base.RoundTrip(r)
+	}
+	r2 := r.Clone(r.Context())
+	r2.Header.Set("X-FNVR-Internal", t.secret)
+	return t.base.RoundTrip(r2)
+}
+
 // NewClient resolves the base URL from FNVR_ML_WORKER_URL, falling
 // back to the docker-internal DNS name.
 func NewClient() *Client {
@@ -54,7 +71,13 @@ func NewClient() *Client {
 		// 60s timeout: /detect-and-embed runs onnxruntime on CPU
 		// which can be slow on first-request cold start (model
 		// load). /batch-cluster over ≤50k embeddings also fits.
-		http: &http.Client{Timeout: 60 * time.Second},
+		http: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: internalAuthRT{
+				secret: os.Getenv("FNVR_ML_SHARED_SECRET"),
+				base:   http.DefaultTransport,
+			},
+		},
 	}
 }
 

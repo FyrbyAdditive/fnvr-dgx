@@ -528,6 +528,32 @@ func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {
 // from the camera) so the UI can distinguish "never reported" from
 // "heartbeat went stale X minutes ago" — the latter is the diagnostic
 // we kept missing.
+// validateSourceURL guards the camera source URL before it ever reaches
+// the pipeline's gst_parse_launch string. gst-launch terminates an
+// unquoted location= at whitespace, so a URL containing a space (or '!')
+// could inject extra GStreamer elements. Require a known network scheme
+// and reject whitespace / control / gst-delimiter characters.
+func validateSourceURL(raw string) error {
+	if raw == "" {
+		return nil // emptiness is checked separately where required
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f || r == ' ' || r == '\t' || r == '!' || r == '"' || r == '\\' {
+			return fmt.Errorf("url contains an illegal character")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("url is not parseable")
+	}
+	switch u.Scheme {
+	case "rtsp", "rtsps", "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("url scheme must be rtsp, rtsps, http, or https")
+	}
+}
+
 // redactURLUserinfo strips embedded credentials (user:pass@) from a
 // URL so RTSP camera passwords aren't disclosed. Non-URL / bare values
 // pass through unchanged.
@@ -600,6 +626,14 @@ func (s *Server) handleCreateCamera(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and url required", http.StatusBadRequest)
 		return
 	}
+	if err := validateSourceURL(c.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateSourceURL(c.Substream); err != nil {
+		http.Error(w, "substream "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	created, err := s.cameras.Create(r.Context(), c)
 	if err != nil {
@@ -667,6 +701,18 @@ func (s *Server) handleUpdateCameraBasics(w http.ResponseWriter, r *http.Request
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
+	}
+	if body.URL != nil {
+		if err := validateSourceURL(*body.URL); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if body.Substream != nil {
+		if err := validateSourceURL(*body.Substream); err != nil {
+			http.Error(w, "substream "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	id := r.PathValue("id")
 	err := s.cameras.UpdateBasics(r.Context(), id, body.Name, body.URL, body.Substream)

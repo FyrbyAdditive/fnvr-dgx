@@ -27,6 +27,7 @@ import base64
 import json
 import logging
 import os
+import re
 
 import cv2
 import numpy as np
@@ -71,6 +72,14 @@ def _enrich(detection: dict, crop_jpeg: bytes) -> dict:
     return detection
 
 
+_PENDING_PREFIX = "fnvr.faces.pending."
+# The pipeline sets reply_subject; validate it against a strict allowlist
+# so a forged bus message can't make ml-worker publish arbitrary JSON to
+# an arbitrary subject (confused-deputy). Only the normal/retro detection
+# subjects are permitted.
+_REPLY_RE = re.compile(r"^fnvr\.events\.(detection|retro_detection)\.[A-Za-z0-9_-]+$")
+
+
 async def _process(nc, msg) -> None:
     try:
         payload = json.loads(msg.data)
@@ -81,6 +90,15 @@ async def _process(nc, msg) -> None:
         log.exception("malformed pending face message — dropping")
         await msg.ack()
         return
+
+    if not isinstance(reply, str) or not _REPLY_RE.match(reply):
+        log.warning("rejected pending face reply_subject %r — dropping", reply)
+        await msg.ack()
+        return
+    # Re-derive camera_id from the trusted inbound subject rather than
+    # trusting the payload's copy.
+    if isinstance(detection, dict) and msg.subject.startswith(_PENDING_PREFIX):
+        detection["camera_id"] = msg.subject[len(_PENDING_PREFIX):]
 
     try:
         # ~100-300 ms of ORT CPU per face — keep it off the event loop

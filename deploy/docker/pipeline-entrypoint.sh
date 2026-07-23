@@ -405,11 +405,22 @@ if [ "$MODEL_FAMILY" = "rfdetr" ]; then
     RFDETR_MODEL="rfdetr-${RFDETR_VARIANT}"
     META="$RFDETR_DEST/${RFDETR_MODEL}.meta.json"
     if [ -f "$META" ] && [ -f "$RFDETR_DEST/${RFDETR_MODEL}.onnx" ]; then
-        RFDETR_W=$(python3 -c "import json;print(json.load(open('$META'))['input_w'])")
-        RFDETR_H=$(python3 -c "import json;print(json.load(open('$META'))['input_h'])")
-        RF_CLASSES=$(python3 -c "import json;print(json.load(open('$META'))['num_classes'])")
-        python3 -c "import json;print('\n'.join(json.load(open('$META'))['labels']))" \
-            > "$RFDETR_DEST/labels.txt"
+        # Pass $META as argv (not interpolated into the Python source) so
+        # a settings-derived path can't inject code into python3 -c.
+        read -r RFDETR_W RFDETR_H RF_CLASSES <<EOF_META
+$(python3 - "$META" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(m["input_w"], m["input_h"], m["num_classes"])
+PYEOF
+)
+EOF_META
+        python3 - "$META" "$RFDETR_DEST/labels.txt" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+with open(sys.argv[2], "w") as f:
+    f.write("\n".join(m["labels"]))
+PYEOF
         # (Person/vehicle class ids for the SGIE chains are computed
         # from this labels file in the family-aware SGIE render below.)
         RFDETR_CFG="$RFDETR_DEST/rfdetr.effective.txt"

@@ -28,6 +28,7 @@ import socketserver
 import subprocess
 import threading
 import urllib.parse
+from datetime import datetime
 
 MTX = os.environ.get("FNVR_MTX_PLAYBACK", "http://mediamtx:9996")
 PORT = int(os.environ.get("FNVR_TRANSCODER_PORT", "9995"))
@@ -56,6 +57,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not path.replace("_", "").replace("-", "").isalnum() or not start:
             self.send_error(400, "bad path/start")
             return
+        # start is an ISO-8601 instant; duration a bounded positive number
+        # of seconds. Validate before forwarding to MediaMTX so only
+        # well-formed values reach the upstream /get.
+        try:
+            datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except ValueError:
+            self.send_error(400, "bad start (want ISO-8601)")
+            return
+        if duration:
+            try:
+                d = float(duration)
+            except ValueError:
+                self.send_error(400, "bad duration")
+                return
+            if d <= 0 or d > 3600:
+                self.send_error(400, "duration out of range")
+                return
 
         src_q = urllib.parse.urlencode(
             {"path": path, "start": start, "duration": duration,
