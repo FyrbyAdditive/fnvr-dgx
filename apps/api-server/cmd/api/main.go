@@ -85,12 +85,13 @@ func runSeed() error {
 	defer pool.Close()
 	a := auth.NewStore(pool, 24*time.Hour)
 	defer a.Close()
-	created, err := a.BootstrapAdmin(ctx)
+	created, pw, err := a.BootstrapAdmin(ctx)
 	if err != nil {
 		return err
 	}
 	if created {
-		slog.Warn("bootstrapped default admin user — change the password immediately", "user", "admin")
+		slog.Warn("bootstrapped admin user with a random password — you must change it on first login",
+			"user", "admin", "password", pw)
 	} else {
 		slog.Info("users already exist — nothing to seed")
 	}
@@ -119,10 +120,11 @@ func runServe() error {
 
 	authStore := auth.NewStore(pool, 24*time.Hour)
 	defer authStore.Close()
-	if created, err := authStore.BootstrapAdmin(ctx); err != nil {
+	if created, pw, err := authStore.BootstrapAdmin(ctx); err != nil {
 		return fmt.Errorf("bootstrap admin: %w", err)
 	} else if created {
-		slog.Warn("bootstrapped default admin user admin/admin — change it immediately")
+		slog.Warn("bootstrapped admin user with a random password — you must change it on first login",
+			"user", "admin", "password", pw)
 	}
 
 	bus, err := events.NewBus(cfg.NATSURL)
@@ -211,6 +213,11 @@ func runServe() error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound slow-body / idle connections. No WriteTimeout: the SSE
+		// stream (events/bus.go) is a long-lived response.
+		ReadTimeout:    30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	errCh := make(chan error, 1)

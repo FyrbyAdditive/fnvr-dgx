@@ -3,6 +3,7 @@ package mtxproxy
 import (
 	"context"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -13,6 +14,15 @@ import (
 // MediaMTX might have configured via env vars (test, usb0, etc.). The
 // reconciler only touches paths starting with this.
 const pathPrefix = "proxy_"
+
+// redactSourceURL strips embedded credentials so RTSP passwords aren't logged.
+func redactSourceURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.User != nil {
+		u.User = url.User("***")
+		return u.String()
+	}
+	return raw
+}
 
 // Reconciler keeps MediaMTX's live path config in sync with the set of
 // cameras that have mtx_proxy=true. Single-flighted via an internal
@@ -90,7 +100,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) {
 			slog.Warn("mtxproxy: add", "path", name, "err", err)
 			continue
 		}
-		slog.Info("mtxproxy: up", "path", name, "source", d.url,
+		slog.Info("mtxproxy: up", "path", name, "source", redactSourceURL(d.url),
 			"pinned_cert", d.fingerprint != "")
 	}
 }

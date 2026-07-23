@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -152,6 +153,7 @@ func (s *Server) Handler() http.Handler {
 	if s.auth != nil {
 		protected := http.NewServeMux()
 		protected.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+		protected.HandleFunc("POST /api/v1/auth/change-password", s.handleChangePassword)
 		protected.HandleFunc("GET /api/v1/me", s.handleMe)
 
 		protected.HandleFunc("GET /api/v1/system/local-devices", s.handleLocalDevices)
@@ -267,7 +269,9 @@ func (s *Server) Handler() http.Handler {
 		}
 
 		if s.notifs != nil {
-			protected.HandleFunc("GET /api/v1/notifications/channels", s.handleListChannels)
+			// Admin-only: channel config holds outbound secrets (webhook
+			// auth headers, ntfy tokens, MQTT passwords) returned verbatim.
+			protected.Handle("GET /api/v1/notifications/channels", auth.AdminFunc(s.handleListChannels))
 			protected.Handle("POST /api/v1/notifications/channels", auth.AdminFunc(s.handleCreateChannel))
 			protected.Handle("DELETE /api/v1/notifications/channels/{id}", auth.AdminFunc(s.handleDeleteChannel))
 			protected.Handle("POST /api/v1/notifications/channels/{id}/enable", auth.AdminFunc(s.handleEnableChannel))
@@ -317,8 +321,9 @@ func (s *Server) Handler() http.Handler {
 		protected.Handle("POST /api/v1/users/{id}/tokens", auth.AdminFunc(s.handleCreateToken))
 		protected.Handle("DELETE /api/v1/users/{id}/tokens/{token_id}", auth.AdminFunc(s.handleRevokeToken))
 
-		guarded := s.auth.Middleware(protected)
+		guarded := s.auth.Middleware(s.mustChangeGate(protected))
 		mux.Handle("/api/v1/auth/logout", guarded)
+		mux.Handle("/api/v1/auth/change-password", guarded)
 		mux.Handle("/api/v1/me", guarded)
 		mux.Handle("/api/v1/system/local-devices", guarded)
 		mux.Handle("/api/v1/system/storage", guarded)
@@ -428,12 +433,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	// Brute-force throttle, keyed on (client-ip, username).
+	now := time.Now()
+	key := clientIP(r) + "|" + req.Username
+	if secs := loginLimiter.retryAfter(key, now); secs > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		http.Error(w, "too many attempts, try again later", http.StatusTooManyRequests)
 		return
 	}
 	sess, err := s.auth.Login(r.Context(), req.Username, req.Password)
 	if errors.Is(err, auth.ErrInvalidCredentials) {
+		loginLimiter.recordFailure(key, now)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -442,20 +456,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "fnvr_session",
-		Value:    sess.Token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true, // served only behind nginx TLS
-		SameSite: http.SameSiteLaxMode,
-		Expires:  sess.ExpiresAt,
-	})
+	loginLimiter.clear(key)
+	setSessionCookie(w, sess)
+	// Note: the session token is intentionally NOT in the body — the
+	// HttpOnly cookie is the only place it lives (the SPA uses cookie
+	// auth). must_change_password lets the UI show the forced-change
+	// screen immediately.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"token":      sess.Token,
-		"username":   sess.Username,
-		"role":       sess.Role,
-		"expires_at": sess.ExpiresAt,
+		"username":             sess.Username,
+		"role":                 sess.Role,
+		"expires_at":           sess.ExpiresAt,
+		"must_change_password": sess.MustChange,
 	})
 }
 
@@ -474,11 +485,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":  sess.UserID,
-		"username": sess.Username,
-		"role":     sess.Role,
-		"is_admin": auth.IsAdmin(sess),
-		"api_only": sess.APIOnly,
+		"user_id":              sess.UserID,
+		"username":             sess.Username,
+		"role":                 sess.Role,
+		"is_admin":             auth.IsAdmin(sess),
+		"api_only":             sess.APIOnly,
+		"must_change_password": sess.MustChange,
 	})
 }
 
@@ -505,7 +517,7 @@ func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, decorateCameras(cams, s.camStates))
+	writeJSON(w, http.StatusOK, decorateCameras(cams, s.camStates, s.isAdmin(r)))
 }
 
 // decorateCameras attaches the latest-known pipeline state to each camera
@@ -516,7 +528,24 @@ func (s *Server) handleListCameras(w http.ResponseWriter, r *http.Request) {
 // from the camera) so the UI can distinguish "never reported" from
 // "heartbeat went stale X minutes ago" — the latter is the diagnostic
 // we kept missing.
-func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[string]any {
+// redactURLUserinfo strips embedded credentials (user:pass@) from a
+// URL so RTSP camera passwords aren't disclosed. Non-URL / bare values
+// pass through unchanged.
+func redactURLUserinfo(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	if u, err := url.Parse(raw); err == nil && u.User != nil {
+		u.User = url.User("***")
+		return u.String()
+	}
+	return raw
+}
+
+// decorateCameras renders the camera list. Non-admins get camera URLs
+// with credentials redacted — a viewer must not be able to read the
+// RTSP username/password (often the device admin login).
+func decorateCameras(cams []camera.Camera, states *camera.StateTracker, admin bool) []map[string]any {
 	out := make([]map[string]any, 0, len(cams))
 	for _, c := range cams {
 		state := "unknown"
@@ -530,11 +559,16 @@ func decorateCameras(cams []camera.Camera, states *camera.StateTracker) []map[st
 				lastHeartbeat = &t
 			}
 		}
+		camURL, sub := c.URL, c.Substream
+		if !admin {
+			camURL = redactURLUserinfo(camURL)
+			sub = redactURLUserinfo(sub)
+		}
 		out = append(out, map[string]any{
 			"id":                       c.ID,
 			"name":                     c.Name,
-			"url":                      c.URL,
-			"substream":                c.Substream,
+			"url":                      camURL,
+			"substream":                sub,
 			"record_mode":              c.RecordMode,
 			"enabled":                  c.Enabled,
 			"retention_days":           c.RetentionDays,
@@ -599,6 +633,10 @@ func (s *Server) handleGetCamera(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	if !s.isAdmin(r) {
+		c.URL = redactURLUserinfo(c.URL)
+		c.Substream = redactURLUserinfo(c.Substream)
 	}
 	writeJSON(w, http.StatusOK, c)
 }

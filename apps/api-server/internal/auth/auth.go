@@ -51,6 +51,10 @@ type Session struct {
 	Role      Role
 	APIOnly   bool
 	ExpiresAt time.Time
+	// MustChange is set when the account still carries a
+	// bootstrap/admin-assigned password; the mustChange gate blocks
+	// everything except logout + change-password until it's cleared.
+	MustChange bool
 }
 
 // APIToken is the metadata shape surfaced to the UI; the raw token
@@ -82,33 +86,82 @@ func NewStore(pool *pgxpool.Pool, ttl time.Duration) *Store {
 	return s
 }
 
-// BootstrapAdmin creates the default admin/admin user if no users exist.
-// Returns true if it created one — the caller should log a warning so the
-// operator knows to change the password.
-func (s *Store) BootstrapAdmin(ctx context.Context) (bool, error) {
+// BootstrapAdmin creates the first admin user if no users exist, with a
+// RANDOM password (returned so the caller can log it once) and
+// must_change_password set — the operator is forced to change it on
+// first login. Never a guessable default like "admin". Returns
+// (created, generatedPassword, error).
+func (s *Store) BootstrapAdmin(ctx context.Context) (bool, string, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
-		return false, err
+		return false, "", err
 	}
 	if n > 0 {
-		return false, nil
+		return false, "", nil
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("admin"), 12)
+	pw, err := randomToken() // 32 bytes of crypto/rand, base64url
 	if err != nil {
-		return false, err
+		return false, "", err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pw), 12)
+	if err != nil {
+		return false, "", err
 	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO users (username, password_hash, role) VALUES ('admin', $1, 'superadmin')`,
+		INSERT INTO users (username, password_hash, role, must_change_password)
+		VALUES ('admin', $1, 'superadmin', true)`,
 		string(hash))
-	return err == nil, err
+	if err != nil {
+		return false, "", err
+	}
+	return true, pw, nil
+}
+
+// ChangeOwnPassword verifies the caller's current password, sets a new
+// one (min 12 chars), clears the must-change flag, drops the account's
+// other sessions, and returns a fresh session so the caller stays
+// logged in.
+func (s *Store) ChangeOwnPassword(ctx context.Context, userID, current, next string) (Session, error) {
+	if len(next) < 12 {
+		return Session{}, fmt.Errorf("new password must be at least 12 characters")
+	}
+	var u User
+	var hash string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT id, username, role, disabled, api_only, password_hash FROM users WHERE id=$1`,
+		userID).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.APIOnly, &hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Session{}, ErrNotFound
+		}
+		return Session{}, err
+	}
+	if u.APIOnly {
+		return Session{}, ErrAPIOnlyPassword
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(current)) != nil {
+		return Session{}, ErrInvalidCredentials
+	}
+	nh, err := bcrypt.GenerateFromPassword([]byte(next), 12)
+	if err != nil {
+		return Session{}, err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE users SET password_hash=$2, must_change_password=false, updated_at=NOW() WHERE id=$1`,
+		userID, string(nh)); err != nil {
+		return Session{}, err
+	}
+	// Invalidate every existing session for the user, then mint a new one.
+	s.dropSessions(func(sess Session) bool { return sess.UserID == userID })
+	return s.issueSession(u, false)
 }
 
 func (s *Store) Login(ctx context.Context, username, password string) (Session, error) {
 	var u User
 	var hash string
+	var mustChange bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, role, disabled, api_only, password_hash FROM users WHERE username=$1`,
-		username).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.APIOnly, &hash)
+		`SELECT id, username, role, disabled, api_only, password_hash, must_change_password FROM users WHERE username=$1`,
+		username).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.APIOnly, &hash, &mustChange)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrInvalidCredentials
 	}
@@ -128,18 +181,24 @@ func (s *Store) Login(ctx context.Context, username, password string) (Session, 
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return Session{}, ErrInvalidCredentials
 	}
+	return s.issueSession(u, mustChange)
+}
 
+// issueSession mints and stores a fresh session for an authenticated
+// user. Shared by Login and ChangeOwnPassword.
+func (s *Store) issueSession(u User, mustChange bool) (Session, error) {
 	tok, err := randomToken()
 	if err != nil {
 		return Session{}, err
 	}
 	sess := Session{
-		Token:     tok,
-		UserID:    u.ID,
-		Username:  u.Username,
-		Role:      u.Role,
-		APIOnly:   u.APIOnly,
-		ExpiresAt: time.Now().Add(s.ttl),
+		Token:      tok,
+		UserID:     u.ID,
+		Username:   u.Username,
+		Role:       u.Role,
+		APIOnly:    u.APIOnly,
+		ExpiresAt:  time.Now().Add(s.ttl),
+		MustChange: mustChange,
 	}
 	s.mu.Lock()
 	s.sessions[tok] = sess

@@ -224,6 +224,7 @@ export type Me = {
   role: string;
   is_admin: boolean;
   api_only: boolean;
+  must_change_password?: boolean;
 };
 
 export type User = {
@@ -263,6 +264,11 @@ function browserPlaysH265(): boolean {
 export const api = {
   systemInfo: () => req<{ version: string; milestone: string; time: string }>("/system/info"),
   me: () => req<Me>("/me"),
+  changePassword: (current_password: string, new_password: string) =>
+    req<{ username: string; role: string; expires_at: string }>("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
 
   listLocalDevices: () => req<LocalDevice[]>("/system/local-devices"),
 

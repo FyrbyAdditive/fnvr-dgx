@@ -409,7 +409,10 @@ func (s *Server) handleAddPersonEmbeddingsBulk(w http.ResponseWriter, r *http.Re
 			DetectionID int64     `json:"detection_id"`
 		} `json:"items"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// Cap the bulk-embeddings body (arrays of 512-float vectors) so a
+	// client can't force a huge allocation. 16 MiB ≈ thousands of
+	// vectors — well beyond any real enrol batch.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20)).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}

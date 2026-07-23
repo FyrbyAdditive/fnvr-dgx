@@ -8,7 +8,17 @@ package pipeline
 import (
 	"context"
 	"log/slog"
+	"net/url"
 )
+
+// redactURL strips embedded credentials so RTSP passwords aren't logged.
+func redactURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.User != nil {
+		u.User = url.User("***")
+		return u.String()
+	}
+	return raw
+}
 
 type AddCameraArgs struct {
 	ID            string
@@ -35,7 +45,7 @@ type Client interface {
 type LoggingClient struct{}
 
 func (LoggingClient) AddCamera(_ context.Context, args AddCameraArgs) (CameraStatus, error) {
-	slog.Info("pipeline(stub): AddCamera", "id", args.ID, "url", args.URL)
+	slog.Info("pipeline(stub): AddCamera", "id", args.ID, "url", redactURL(args.URL))
 	return CameraStatus{ID: args.ID, State: "connecting"}, nil
 }
 func (LoggingClient) RemoveCamera(_ context.Context, id string) (CameraStatus, error) {

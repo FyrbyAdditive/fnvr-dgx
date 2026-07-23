@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { api, AlarmStateValue } from "@/lib/api";
 import { useMe, isAdmin as isAdminFn } from "@/lib/me";
+import { ChangePassword } from "@/routes/login/ChangePassword";
 
 const tabs = [
   { to: "/live", label: "Live" },
@@ -18,6 +19,16 @@ const tabs = [
 ];
 
 export function Layout() {
+  const { data: me } = useMe();
+  // Forced password change: the server blocks all other endpoints while
+  // must_change_password is set, so render only the change screen.
+  if (me?.must_change_password) {
+    return <ChangePassword />;
+  }
+  return <AppShell />;
+}
+
+function AppShell() {
   const { data: info } = useQuery({
     queryKey: ["info"],
     queryFn: api.systemInfo,
