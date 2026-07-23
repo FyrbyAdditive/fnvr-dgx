@@ -447,6 +447,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    sess.Token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true, // served only behind nginx TLS
 		SameSite: http.SameSiteLaxMode,
 		Expires:  sess.ExpiresAt,
 	})

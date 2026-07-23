@@ -375,13 +375,12 @@ export const api = {
   // is built server-side from camera + start time + codec.
   segmentDownloadUrl: (id: number) => `${base}/segments/${id}/file?download=1`,
   // MediaMTX `/get` playback URL. MediaMTX's recorder writes
-  // fragmented MP4 (moof+mdat) to disk per camera path; the
-  // playback HTTP server (port 9996, exposed on the host) stitches
-  // an arbitrary [start, start+duration) window into a single fMP4
-  // (or progressive MP4 if format=mp4) and streams it to the
-  // browser. fMP4 seeks correctly even mid-write — the qtmux
-  // progressive-MP4 we used to write didn't, which broke
-  // click-through to the current hour.
+  // fragmented MP4 (moof+mdat) to disk per camera path; the playback
+  // HTTP server stitches an arbitrary [start, start+duration) window
+  // into a single fMP4 (or progressive MP4 if format=mp4). Both the
+  // MediaMTX playback server and the transcoder are now reached
+  // same-origin through nginx (/playback, /transcode) so the browser
+  // stays on the one TLS origin — no direct host ports.
   //
   // Path naming follows pipeline.cpp's rtspclientsink target —
   // `live_<camera_id>` per camera.
@@ -392,19 +391,18 @@ export const api = {
     opts: { download?: boolean } = {},
   ) => {
     // Browsers without H.265 decode (Firefox; some remote clients) get
-    // the NVDEC→NVENC transcoder on :9995 instead of raw MediaMTX
-    // playback on :9996 — same query contract, H.264 out. Downloads
-    // always fetch the untouched original.
+    // the NVDEC→NVENC transcoder instead of raw MediaMTX playback —
+    // same query contract, H.264 out. Downloads always fetch the
+    // untouched original.
     const transcode = !opts.download && !browserPlaysH265();
-    const port = transcode ? 9995 : 9996;
-    const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
+    const base = transcode ? "/transcode/get" : "/playback/get";
     const p = new URLSearchParams({
       path: `live_${cameraId}`,
       start: start.toISOString(),
       duration: String(durationSec),
       ...(transcode ? {} : { format: opts.download ? "mp4" : "fmp4" }),
     });
-    return `${origin}/get?${p}`;
+    return `${window.location.origin}${base}?${p}`;
   },
 
   listDetectionsHistoric: (opts: { cameraId?: string; from?: Date; to?: Date; limit?: number; kind?: string; plate?: string } = {}) => {

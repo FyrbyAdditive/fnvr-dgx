@@ -238,6 +238,19 @@ inline void appendG(std::string& s, double v) {
     s += b;
 }
 
+// Userinfo prefix ("user:pass@") for authenticating rtspclientsink
+// publishes to MediaMTX. Read once from FNVR_MTX_PUBLISH_CREDS; empty
+// when unset (dev / no-auth broker). Only publishes carry this — the
+// pipeline's proxy_ pulls are reads, which stay credential-less.
+static const std::string& mtxPubPrefix() {
+    static const std::string v = [] {
+        const char* e = std::getenv("FNVR_MTX_PUBLISH_CREDS");
+        std::string s = (e && *e) ? std::string(e) : std::string();
+        return s.empty() ? std::string() : s + "@";
+    }();
+    return v;
+}
+
 // finalizeSourceViews computes the per-camera constant strings after
 // subject_prefix is final. Call once per ProbeCtx, before attach.
 void finalizeSourceViews(ProbeCtx* ctx) {
@@ -1201,7 +1214,7 @@ GstElement* GroupPipeline::BuildPipeline() {
         // Push branch.
         p << "t_0. ! queue name=qp_0 max-size-buffers=200 leaky=downstream ! "
              "h264parse name=pp_0 config-interval=-1 ! "
-             "rtspclientsink name=push_0 latency=200 location=rtsp://mediamtx:8554/live_"
+             "rtspclientsink name=push_0 latency=200 location=rtsp://" << mtxPubPrefix() << "mediamtx:8554/live_"
           << c0.id << " protocols=tcp ";
     } else if (solo_none) {
         // Record-only: no decode, no inference — parse + push only.
@@ -1214,7 +1227,7 @@ GstElement* GroupPipeline::BuildPipeline() {
         p << (sources_[0]->codec == "h265"
                   ? "h265parse name=pp_0 config-interval=-1 ! "
                   : "h264parse name=pp_0 config-interval=-1 ! ");
-        p << "rtspclientsink name=push_0 latency=200 location=rtsp://mediamtx:8554/live_"
+        p << "rtspclientsink name=push_0 latency=200 location=rtsp://" << mtxPubPrefix() << "mediamtx:8554/live_"
           << c0.id << " protocols=tcp ";
     } else {
         // --- Batched shape (N ≥ 1, no transcode) ---------------------------
@@ -1262,7 +1275,7 @@ GstElement* GroupPipeline::BuildPipeline() {
                  " iframeinterval=30 ! "
               << "h264parse name=ppp_" << idx << " config-interval=-1 ! "
               << "rtspclientsink name=ppush_" << idx
-              << " latency=200 location=rtsp://mediamtx:8554/lp_" << cam_id
+              << " latency=200 location=rtsp://" << mtxPubPrefix() << "mediamtx:8554/lp_" << cam_id
               << " protocols=tcp ";
         };
 
@@ -1287,7 +1300,7 @@ GstElement* GroupPipeline::BuildPipeline() {
                   << " max-size-buffers=200 leaky=downstream ! "
                   << parse << " name=pp_" << i << " config-interval=-1 ! "
                   << "rtspclientsink name=push_" << i
-                  << " latency=200 location=rtsp://mediamtx:8554/live_" << s->cam.id
+                  << " latency=200 location=rtsp://" << mtxPubPrefix() << "mediamtx:8554/live_" << s->cam.id
                   << " protocols=tcp ";
                 const char* sdepay =
                     s->sub_codec == "h265" ? "rtph265depay" : "rtph264depay";
@@ -1331,7 +1344,7 @@ GstElement* GroupPipeline::BuildPipeline() {
               << " max-size-buffers=200 leaky=downstream ! "
               << parse << " name=pp_" << i << " config-interval=-1 ! "
               << "rtspclientsink name=push_" << i
-              << " latency=200 location=rtsp://mediamtx:8554/live_" << s->cam.id
+              << " latency=200 location=rtsp://" << mtxPubPrefix() << "mediamtx:8554/live_" << s->cam.id
               << " protocols=tcp ";
         }
     }

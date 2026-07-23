@@ -21,17 +21,33 @@ api: yes
 apiAddress: :9997
 
 authInternalUsers:
-  # Default catch-all: anyone can publish/read/playback (LAN-internal
-  # deployment; parity with the stock config + previous env setup).
-  - user: any
-    pass:
+  # PUBLISH requires credentials — this is the control that stops any
+  # LAN/peer host from injecting a forged `live_<cam>` stream (which the
+  # recorder would then persist). The pipeline's rtspclientsink URLs
+  # carry these creds via FNVR_MTX_PUBLISH_CREDS (secrets.env); keep the
+  # user/pass here in sync with that value.
+  # pass is injected at runtime via MTX_AUTHINTERNALUSERS_0_PASS (from
+  # secrets.env) so the real value never lives in the repo. Empty here =
+  # fail-closed if the override is ever missing (publish just breaks;
+  # nothing becomes open).
+  - user: fnvrpub
+    pass: ""
     ips: []
     permissions:
       - action: publish
+  # READ + PLAYBACK stay credential-less but are constrained to private
+  # ranges. Read auth for <video>/WHEP can't carry headers cleanly, so
+  # confidentiality on read is enforced by the host firewall (ufw) +
+  # these ranges; nginx is the only external reach (media ports are not
+  # host-published). Do NOT grant publish here.
+  - user: any
+    pass:
+    ips: ['172.16.0.0/12', '10.0.0.0/8', '192.168.0.0/16', '127.0.0.1']
+    permissions:
       - action: read
       - action: playback
-  # Config API from private ranges (api-server lives on the docker
-  # bridge; 9997 has no host binding so this stays internal-only).
+  # Config API from private ranges (api-server on the docker bridge;
+  # 9997 has no host binding so this stays internal-only).
   - user: any
     pass:
     ips: ['172.16.0.0/12', '10.0.0.0/8', '192.168.0.0/16', '127.0.0.1']

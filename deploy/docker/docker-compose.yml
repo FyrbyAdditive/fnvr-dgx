@@ -79,10 +79,14 @@ services:
     logging: *fnvr-logging
     image: nats:2-alpine
     restart: unless-stopped
-    command: ["-js", "-m", "8222"]
-    ports:
-      - "4222:4222" # client
-      - "8222:8222" # monitoring
+    # Token auth (from secrets.env → NATS_TOKEN, expanded in the conf).
+    # Bus + monitoring are docker-internal only — no host publish.
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    env_file: [secrets.env]
+    volumes:
+      - ../config/nats-server.conf:/etc/nats/nats-server.conf:ro
+    expose:
+      - "4222"
 
   # Optional MQTT broker for Home Assistant bridge + mqtt notification
   # channels. Anonymous access allowed so a local dev can `up --profile
@@ -94,8 +98,11 @@ services:
     image: eclipse-mosquitto:2
     restart: unless-stopped
     command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
-    ports:
-      - "1883:1883" # MQTT
+    # Internal only — the HA bridge reaches it over the docker network.
+    # (Anonymous broker: do not host-publish. Use an external authed
+    # broker for real HA integrations.)
+    expose:
+      - "1883"
     volumes:
       - mosquitto-data:/mosquitto/data
 
@@ -110,10 +117,11 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    # secrets.env supplies FNVR_NATS_URL (with token) + FNVR_ML_SHARED_SECRET.
+    env_file: [secrets.env]
     environment:
       FNVR_HTTP_ADDR: ":8081"
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
-      FNVR_NATS_URL: "nats://nats:4222"
       FNVR_DATA_DIR: "/var/lib/fnvr"
       # MediaMTX runtime config API — api-server syncs per-camera
       # re-muxer paths here when mtx_proxy is toggled. Empty/unset
@@ -133,10 +141,11 @@ services:
       # an empty list without the mounts; re-add them if you attach USB
       # cameras directly to the Spark (the usb-bridge profile is the
       # supported route anyway).
-    ports:
-      # Public: web UI + JSON API (+ unauthenticated /metrics scrape
-      # endpoint for Prometheus).
-      - "8081:8081"
+    # No host publish: nginx (web) proxies /api to api:8081 over the
+    # docker network. Keeping 8081 off the host closes the raw API,
+    # /metrics, and /api/v1/internal/* to the LAN.
+    expose:
+      - "8081"
 
   events:
     logging: *fnvr-logging
@@ -149,9 +158,9 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    env_file: [secrets.env]
     environment:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
-      FNVR_NATS_URL: "nats://nats:4222"
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
     # Prometheus scrape endpoint at :9091 on the compose network.
     # Internal only — no external publish. When adding a `prometheus`
@@ -175,9 +184,9 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    env_file: [secrets.env]
     environment:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
-      FNVR_NATS_URL: "nats://nats:4222"
 
   storage:
     logging: *fnvr-logging
@@ -212,9 +221,11 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    # secrets.env supplies FNVR_NATS_URL (with token) + FNVR_ML_SHARED_SECRET
+    # (the api-server presents this on mutating ml-worker calls).
+    env_file: [secrets.env]
     environment:
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
-      FNVR_NATS_URL: "nats://nats:4222"
       FNVR_MODELS_DIR: "/var/lib/fnvr/models/faceid"
       FNVR_TZ: "Europe/London"
     volumes:
@@ -233,8 +244,14 @@ services:
       - api
     environment:
       FNVR_API_UPSTREAM: "http://api:8081"
+    volumes:
+      # TLS material generated on the host (gitignored); nginx terminates
+      # HTTPS and reverse-proxies api/whep/playback/transcode so the
+      # browser talks to exactly one origin.
+      - ./certs:/etc/nginx/certs:ro
     ports:
-      - "8080:80"
+      - "443:443"
+      - "80:80" # redirects to https
 
   # Pipeline — runs on the DGX Spark host. GPU access via a compose
   # device reservation (nvidia-container-toolkit + CDI on DGX OS) —
@@ -259,12 +276,14 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    # secrets.env supplies FNVR_NATS_URL (with token) + FNVR_MTX_PUBLISH_CREDS
+    # (userinfo the rtspclientsink push URLs use to authenticate to MediaMTX).
+    env_file: [secrets.env]
     environment:
       NVIDIA_VISIBLE_DEVICES: "all"
       # compute = CUDA/TensorRT, video = NVDEC/NVENC, utility = nvidia-smi.
       NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
       FNVR_DATABASE_URL: "postgres://fnvr:fnvr@postgres:5432/fnvr?sslmode=disable"
-      FNVR_NATS_URL: "nats://nats:4222"
       FNVR_RECORDINGS_DIR: "/var/lib/fnvr/recordings"
       FNVR_USE_DEEPSTREAM: "${FNVR_USE_DEEPSTREAM:-1}"
       FNVR_RECONCILE_SEC: "${FNVR_RECONCILE_SEC:-5}"
@@ -291,6 +310,9 @@ services:
     logging: *fnvr-logging
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
+    # secrets.env supplies MTX_AUTHINTERNALUSERS_0_PASS — MediaMTX
+    # overrides authInternalUsers[0].pass (the publish user) from it.
+    env_file: [secrets.env]
     environment:
       # Static config lives in deploy/config/mediamtx.yml (mounted
       # below) — path-pattern rules (record live_* only, never the
@@ -304,11 +326,16 @@ services:
       # MediaMTX writes recordings here; storage-manager + api-server
       # read from the same path via the same volume.
       - fnvr-data:/var/lib/fnvr
+    # RTSP (8554), WHEP (8889) and playback (9996) are NOT host-published:
+    # internal publishers reach 8554 over docker DNS, and nginx proxies
+    # WHEP + playback. Only the WebRTC ICE UDP mux must be reachable by
+    # the browser (media is DTLS-SRTP encrypted).
+    expose:
+      - "8554"
+      - "8889"
+      - "9996"
     ports:
-      - "8554:8554" # rtsp
-      - "8889:8889" # webrtc (whep on /<path>/whep)
       - "8189:8189/udp" # webrtc ICE (single-port UDP mux)
-      - "9996:9996" # playback API (timeline /get clips)
 
   # Shared Triton inference server (detector.inference_backend=triton):
   # serves the RF-DETR engine to every worker over gRPC — one engine
@@ -364,8 +391,10 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    ports:
-      - "9995:9995"
+    # Not host-published: nginx proxies /transcode to transcoder:9995
+    # over the docker network.
+    expose:
+      - "9995"
 
   # USB→RTSP bridge. When /dev/video0 exists on the host, reads MJPEG and
   # publishes H.264 to rtsp://mediamtx:8554/fnvr-usb0. Camera entries in the
@@ -392,7 +421,10 @@ services:
           -framerate 30 -i /dev/video0 \
           -c:v libx264 -preset veryfast -tune zerolatency \
           -g 60 -b:v 4M -pix_fmt yuv420p \
-          -f rtsp -rtsp_transport tcp rtsp://mediamtx:8554/usb0
+          -f rtsp -rtsp_transport tcp rtsp://${FNVR_MTX_PUB_USERINFO:-}mediamtx:8554/usb0
+    # MediaMTX now requires auth to publish. Set FNVR_MTX_PUB_USERINFO in
+    # your compose env to "user:pass@" (matching mediamtx.yml) when using
+    # this profile.
 
   # Companion that pushes a synthetic looped stream into mediamtx.
   testsrc:
@@ -410,7 +442,8 @@ services:
           -f lavfi -i "sine=frequency=440" \
           -c:v libx264 -preset veryfast -tune zerolatency -g 60 -b:v 4M \
           -c:a aac -b:a 64k \
-          -f rtsp -rtsp_transport tcp rtsp://mediamtx:8554/test
+          -f rtsp -rtsp_transport tcp rtsp://${FNVR_MTX_PUB_USERINFO:-}mediamtx:8554/test
+    # See usb-bridge: set FNVR_MTX_PUB_USERINFO="user:pass@" for publish auth.
 
 volumes:
   postgres-data:

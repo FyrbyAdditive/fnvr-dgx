@@ -29,6 +29,9 @@ deploy/config/fnvr.yaml
 .env
 .env.*
 !.env.example
+# Deploy-time secrets + TLS material — generated on the host, never committed.
+deploy/docker/secrets.env
+deploy/docker/certs/
 
 # Data / runtime
 data/
